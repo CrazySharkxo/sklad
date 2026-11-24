@@ -460,6 +460,23 @@ def main() -> int:
         dp.reload()
         dp.locator(".row").first.wait_for()
         dp.screenshot(path=str(SHOTS / "10_dark.png"))
+
+        # --- смужка «Є оновлення»: без нової версії її нема, з новою — є, кнопка перезавантажує ---
+        page.wait_for_timeout(3500)
+        expect(page.locator("#upd")).to_be_hidden()
+        up = browser.new_context(viewport={"width": 400, "height": 860})
+        up.route(re.compile(r".*/js/config\.js$"), DEMO_CONFIG)
+        up.route(re.compile(r".*/version\.js\?check=.*"),
+                 lambda r: r.fulfill(content_type="text/javascript", body="self.APP_VERSION = '9999-01-01.1';"))
+        upg = up.new_page()
+        upg.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
+        upg.goto(url + "#/more")
+        expect(upg.locator("main")).to_contain_text("версія 2026-")
+        expect(upg.locator("#upd")).to_be_visible(timeout=10000)
+        upg.screenshot(path=str(SHOTS / "23_update.png"))
+        with upg.expect_navigation():
+            upg.locator("#upd-go").click()
+        expect(upg.locator("#upd")).to_be_hidden()  # після перезавантаження — доки не перевірить знову
         browser.close()
     httpd.shutdown()
 

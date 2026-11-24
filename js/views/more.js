@@ -30,7 +30,7 @@ ${can('stock.view') ? '' : '-->'}
         : `<button class="menu-item" data-x="pw"><b>Змінити пароль</b><span class="muted"></span></button>
            <button class="menu-item" data-x="out"><b>Вийти</b><span class="muted" id="em"></span></button>`}
     </div>
-    <p class="muted center small">Склад · ${isDemo ? 'демо-режим (дані лише в цьому браузері)' : 'спільна база'}</p>`;
+    <p class="muted center small">Склад · версія ${esc(window.APP_VERSION || '?')} · ${isDemo ? 'демо-режим (дані лише в цьому браузері)' : 'спільна база'}</p>`;
   if (!isDemo) api.email().then((e) => { const el = ctx.main.querySelector('#em'); if (el) el.textContent = e; });
 
   ctx.main.querySelector('.menu').addEventListener('click', async (e) => {

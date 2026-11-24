@@ -445,3 +445,12 @@ h3 .count { font-weight: 600; margin-left: 6px; }
 .row-meta.wrap { white-space: normal; }
 @media (max-width: 480px) { .perm-tbl th:not(:first-child), .perm-tbl td:not(:first-child) { width: 64px; } }
 .user-row .row-meta { white-space: normal; }
+
+/* ---------- смужка «Є оновлення» ---------- */
+.banner.update {
+  position: sticky; top: 0; z-index: 21;
+  display: flex; gap: 12px; align-items: center; justify-content: center; flex-wrap: wrap;
+  background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 14px;
+}
+.banner.update .btn { background: var(--on-accent); color: var(--accent); border-color: var(--on-accent); min-height: 32px; }
+@media (min-width: 900px) { .banner.update { margin-left: 220px; } }

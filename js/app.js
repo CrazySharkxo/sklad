@@ -78,6 +78,8 @@ let token = 0;
 function shell() {
   app.innerHTML = `
     ${isDemo ? '<div class="banner demo">Демо-режим: дані зберігаються лише в цьому браузері. Спільна база підключається в js/config.js (див. README).</div>' : ''}
+    <div class="banner update" id="upd" hidden>Є нова версія програми
+      <button type="button" class="btn sm" id="upd-go">Оновити</button></div>
     <div class="banner offline" id="offline" hidden>Немає інтернету — зміни не збережуться, доки зʼєднання не повернеться</div>
     <div class="layout">
       <nav class="nav" id="nav"></nav>
@@ -87,6 +89,8 @@ function shell() {
       </div>
     </div>`;
   renderNav();
+  document.getElementById('upd-go').addEventListener('click', applyUpdate);
+  if (updateFound) document.getElementById('upd').hidden = false;
   const off = document.getElementById('offline');
   const upd = () => { off.hidden = navigator.onLine; };
   addEventListener('online', upd);
@@ -182,6 +186,31 @@ function loginView() {
   });
 }
 
+// ------------------------------------------------------------------
+// Оновлення програми: порівнюємо свою версію з тією, що на сервері
+// ------------------------------------------------------------------
+let updateFound = false;
+async function checkUpdate() {
+  if (!navigator.onLine || !window.APP_VERSION) return;
+  try {
+    const r = await fetch(`version.js?check=${Date.now()}`, { cache: 'no-store' });
+    if (!r.ok) return;
+    const m = (await r.text()).match(/APP_VERSION\s*=\s*'([^']+)'/);
+    if (m && m[1] !== window.APP_VERSION) {
+      updateFound = true;
+      const el = document.getElementById('upd');
+      if (el) el.hidden = false;
+    }
+  } catch { /* без мережі — перевіримо пізніше */ }
+}
+async function applyUpdate() {
+  try {
+    const reg = await navigator.serviceWorker?.getRegistration();
+    await reg?.update();
+  } catch { /* не страшно: сторінка й так візьме файли з сервера */ }
+  location.reload();
+}
+
 let started = false;
 async function start() {
   state.me = await api.userId();
@@ -200,6 +229,11 @@ async function start() {
   updateBadge();
   if (!started) {
     started = true;
+    // при запуску, коли програма знову на екрані, з появою мережі і раз на 10 хвилин
+    setTimeout(checkUpdate, 3000);
+    setInterval(checkUpdate, 10 * 60e3);
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkUpdate(); });
+    addEventListener('online', checkUpdate);
     addEventListener('hashchange', route);
     api.subscribe(onRemoteChange);
     api.onAuth((uid) => { if (!uid && state.me) location.reload(); });
