@@ -1,44 +1,49 @@
 // Точка входу: вхід, маршрутизація, макет, живе оновлення
 import { api, isDemo } from './api.js';
 import { esc, toast, debounce } from './util.js';
-import { state, reloadData, waitingForMe, ICON_BACK } from './core.js';
+import { state, reloadData, waitingForMe, can, ICON_BACK } from './core.js';
 import { viewStock, viewItem, viewItemEdit } from './views/stock.js';
 import { viewOp, viewJournal } from './views/ops.js';
 import { viewKits, viewKit, viewKitEdit } from './views/kits.js';
 import { viewInventory } from './views/inventory.js';
 import { viewMore, viewReorder, viewLabels, viewImport } from './views/more.js';
 import { viewOrders, viewOrder, viewOrderEdit, viewDepartments } from './views/orders.js';
+import { viewUsers, viewUserEdit, viewRoles, viewRoleEdit } from './views/users.js';
 
 const ROUTES = [
-  // [шаблон, екран, вкладка меню, чи перемальовувати при змінах від інших]
-  [/^\/(stock)?$/, (c) => viewStock(c), 'stock', true],
-  [/^\/orders$/, (c) => viewOrders(c), 'orders', true],
-  [/^\/order\/([\w-]+)$/, (c, m) => viewOrder(c, m[1]), 'orders', true],
-  [/^\/order-edit\/([\w-]+)$/, (c, m) => viewOrderEdit(c, m[1]), 'orders', false],
-  [/^\/departments$/, (c) => viewDepartments(c), 'more', true],
-  [/^\/item\/([\w-]+)$/, (c, m) => viewItem(c, m[1]), 'stock', true],
-  [/^\/item-edit\/([\w-]+)$/, (c, m, q) => viewItemEdit(c, m[1], q), 'stock', false],
-  [/^\/op\/(in|out)$/, (c, m, q) => viewOp(c, m[1], q), 'stock', false],
-  [/^\/journal$/, (c) => viewJournal(c), 'journal', 'reload'],
-  [/^\/kits$/, (c) => viewKits(c), 'kits', true],
-  [/^\/kit\/([\w-]+)$/, (c, m) => viewKit(c, m[1]), 'kits', true],
-  [/^\/kit-edit\/([\w-]+)$/, (c, m) => viewKitEdit(c, m[1]), 'kits', false],
-  [/^\/inventory$/, (c) => viewInventory(c), 'inventory', false],
-  [/^\/reorder$/, (c) => viewReorder(c), 'more', true],
-  [/^\/labels$/, (c) => viewLabels(c), 'more', false],
-  [/^\/import$/, (c) => viewImport(c), 'more', false],
-  [/^\/more$/, (c) => viewMore(c), 'more', false],
+  // [шаблон, екран, вкладка меню, чи перемальовувати при змінах від інших, потрібне право]
+  [/^\/stock$/, (c) => viewStock(c), 'stock', true, 'stock.view'],
+  [/^\/orders$/, (c) => viewOrders(c), 'orders', true, 'orders.view'],
+  [/^\/order\/([\w-]+)$/, (c, m) => viewOrder(c, m[1]), 'orders', true, 'orders.view'],
+  [/^\/order-edit\/([\w-]+)$/, (c, m) => viewOrderEdit(c, m[1]), 'orders', false, 'orders.edit'],
+  [/^\/departments$/, (c) => viewDepartments(c), 'more', true, null],
+  [/^\/item\/([\w-]+)$/, (c, m) => viewItem(c, m[1]), 'stock', true, 'stock.view'],
+  [/^\/item-edit\/([\w-]+)$/, (c, m, q) => viewItemEdit(c, m[1], q), 'stock', false, 'stock.edit'],
+  [/^\/op\/(in|out)$/, (c, m, q) => viewOp(c, m[1], q), 'stock', false, 'ops.edit'],
+  [/^\/journal$/, (c) => viewJournal(c), 'journal', 'reload', 'ops.view'],
+  [/^\/kits$/, (c) => viewKits(c), 'kits', true, 'kits.view'],
+  [/^\/kit\/([\w-]+)$/, (c, m) => viewKit(c, m[1]), 'kits', true, 'kits.view'],
+  [/^\/kit-edit\/([\w-]+)$/, (c, m) => viewKitEdit(c, m[1]), 'kits', false, 'kits.edit'],
+  [/^\/inventory$/, (c) => viewInventory(c), 'inventory', false, 'ops.edit'],
+  [/^\/reorder$/, (c) => viewReorder(c), 'more', true, 'stock.view'],
+  [/^\/labels$/, (c) => viewLabels(c), 'more', false, 'stock.view'],
+  [/^\/import$/, (c) => viewImport(c), 'more', false, 'stock.edit'],
+  [/^\/users$/, (c) => viewUsers(c), 'more', false, 'admin'],
+  [/^\/user\/([\w-]+)$/, (c, m) => viewUserEdit(c, m[1]), 'more', false, 'admin'],
+  [/^\/roles$/, (c) => viewRoles(c), 'more', false, 'admin'],
+  [/^\/role\/([\w-]+)$/, (c, m) => viewRoleEdit(c, m[1]), 'more', false, 'admin'],
+  [/^\/more$/, (c) => viewMore(c), 'more', false, null],
 ];
 
 // [вкладка, адреса, назва, іконка, лише на широкому екрані]
 const NAV = [
-  ['orders', '#/orders', 'Замовлення', '<path d="M9 3h6v4H9zM9 5H5v16h14V5h-4M8 12h8M8 16h5"/>'],
-  ['stock', '#/stock', 'Залишки', '<path d="M21 8l-9-5-9 5v8l9 5 9-5V8zM12 13L3.5 8.3M12 13l8.5-4.7M12 13v8"/>'],
-  ['journal', '#/journal', 'Журнал', '<path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>'],
-  ['kits', '#/kits', 'Комплекти', '<path d="M4 7h7v7H4zM13 4h7v7h-7zM13 13h7v7h-7zM4 16h7v4H4z"/>'],
+  ['orders', '#/orders', 'Замовлення', '<path d="M9 3h6v4H9zM9 5H5v16h14V5h-4M8 12h8M8 16h5"/>', false, 'orders.view'],
+  ['stock', '#/stock', 'Залишки', '<path d="M21 8l-9-5-9 5v8l9 5 9-5V8zM12 13L3.5 8.3M12 13l8.5-4.7M12 13v8"/>', false, 'stock.view'],
+  ['journal', '#/journal', 'Журнал', '<path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>', false, 'ops.view'],
+  ['kits', '#/kits', 'Комплекти', '<path d="M4 7h7v7H4zM13 4h7v7h-7zM13 13h7v7h-7zM4 16h7v4H4z"/>', false, 'kits.view'],
   // на телефоні інвентаризація — у «Ще», щоб нижнє меню не тіснилося
-  ['inventory', '#/inventory', 'Інвентар', '<path d="M9 5h10M9 12h10M9 19h10M4 5l1 1 2-2M4 12l1 1 2-2M4 19l1 1 2-2"/>', true],
-  ['more', '#/more', 'Ще', '<path d="M5 12h.01M12 12h.01M19 12h.01"/>'],
+  ['inventory', '#/inventory', 'Інвентар', '<path d="M9 5h10M9 12h10M9 19h10M4 5l1 1 2-2M4 12l1 1 2-2M4 19l1 1 2-2"/>', true, 'ops.edit'],
+  ['more', '#/more', 'Ще', '<path d="M5 12h.01M12 12h.01M19 12h.01"/>', false, null],
 ];
 
 // скільки замовлень чекає на мій відділ — число на вкладці
@@ -49,7 +54,22 @@ function updateBadge() {
   el.textContent = n > 99 ? '99+' : String(n);
   el.hidden = !n;
 }
-document.addEventListener('sklad:data', updateBadge);
+
+const allowedNav = () => NAV.filter(([, , , , , perm]) => !perm || can(perm));
+// перша дозволена вкладка — туди ведемо замість порожньої адреси
+const homeHash = () => (can('stock.view') ? '#/stock' : allowedNav()[0]?.[1] || '#/more');
+
+let currentTab = null;
+function renderNav() {
+  const nav = document.getElementById('nav');
+  if (!nav) return;
+  nav.innerHTML = `<div class="brand"><svg viewBox="0 0 24 24"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8zM12 13L3.5 8.3M12 13l8.5-4.7M12 13v8"/></svg>Склад</div>
+    ${allowedNav().map(([k, href, label, icon, wide]) => `<a href="${href}" data-tab="${k}"${wide ? ' class="nav-wide"' : ''}><svg viewBox="0 0 24 24" aria-hidden="true">${icon}</svg><span>${label}</span>${k === 'orders' ? '<b class="nav-badge" hidden></b>' : ''}</a>`).join('')}`;
+  nav.querySelectorAll('a').forEach((a) => a.classList.toggle('on', a.dataset.tab === currentTab));
+  updateBadge();
+}
+// права могли змінитися (адміністратор щойно змінив) — меню перебудовуємо разом із даними
+document.addEventListener('sklad:data', renderNav);
 
 const app = document.getElementById('app');
 let current = null; // { token, route, ctx }
@@ -60,15 +80,13 @@ function shell() {
     ${isDemo ? '<div class="banner demo">Демо-режим: дані зберігаються лише в цьому браузері. Спільна база підключається в js/config.js (див. README).</div>' : ''}
     <div class="banner offline" id="offline" hidden>Немає інтернету — зміни не збережуться, доки зʼєднання не повернеться</div>
     <div class="layout">
-      <nav class="nav" id="nav">
-        <div class="brand"><svg viewBox="0 0 24 24"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8zM12 13L3.5 8.3M12 13l8.5-4.7M12 13v8"/></svg>Склад</div>
-        ${NAV.map(([k, href, label, icon, wide]) => `<a href="${href}" data-tab="${k}"${wide ? ' class="nav-wide"' : ''}><svg viewBox="0 0 24 24" aria-hidden="true">${icon}</svg><span>${label}</span>${k === 'orders' ? '<b class="nav-badge" hidden></b>' : ''}</a>`).join('')}
-      </nav>
+      <nav class="nav" id="nav"></nav>
       <div class="page">
         <header class="top" id="top"></header>
         <main id="main"></main>
       </div>
     </div>`;
+  renderNav();
   const off = document.getElementById('offline');
   const upd = () => { off.hidden = navigator.onLine; };
   addEventListener('online', upd);
@@ -77,7 +95,8 @@ function shell() {
 }
 
 function route() {
-  const raw = location.hash.replace(/^#/, '') || '/stock';
+  const raw = location.hash.replace(/^#/, '');
+  if (!raw || raw === '/') { location.replace(homeHash()); return; }
   const [path, qs] = raw.split('?');
   const query = new URLSearchParams(qs || '');
   const main = document.getElementById('main');
@@ -92,13 +111,24 @@ function route() {
       document.title = `${title} — Склад`;
     },
     notFound() {
-      this.header({ title: 'Не знайдено', back: '#/stock' });
-      main.innerHTML = '<div class="empty-state"><p>Запис не знайдено — можливо, його видалили.</p><p><a class="btn" href="#/stock">До залишків</a></p></div>';
+      this.header({ title: 'Не знайдено', back: homeHash() });
+      main.innerHTML = `<div class="empty-state"><p>Запис не знайдено — можливо, його видалили.</p><p><a class="btn" href="${homeHash()}">На головну</a></p></div>`;
     },
   };
-  let found = ROUTES.find(([re]) => re.test(path));
-  if (!found) found = ROUTES[0];
-  const [re, fn, tab, live] = found;
+  const found = ROUTES.find(([re]) => re.test(path));
+  if (!found) { location.replace(homeHash()); return; }
+  const [re, , tab, , perm] = found;
+  let [, fn, , live] = found;
+  if (perm && !can(perm)) {
+    fn = (c) => {
+      c.header({ title: 'Немає доступу' });
+      c.main.innerHTML = `<div class="empty-state"><p>У вас немає доступу до цього розділу.</p>
+        <p class="muted">Права видає адміністратор складу.</p>
+        <p><a class="btn" href="${homeHash()}">На головну</a></p></div>`;
+    };
+    live = false;
+  }
+  currentTab = tab;
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab));
   current = { token: my, live, ctx, rerender: () => fn(ctx, path.match(re), query) };
   main.innerHTML = '';
@@ -134,7 +164,7 @@ function loginView() {
         <label class="field"><span>Email</span><input name="email" type="email" autocomplete="username" required></label>
         <label class="field"><span>Пароль</span><input name="password" type="password" autocomplete="current-password" required></label>
         <button class="btn primary wide">Увійти</button>
-        <p class="muted small">Акаунт створює адміністратор складу в Supabase.</p>
+        <p class="muted small">Акаунт створює адміністратор складу: Ще → Користувачі.</p>
       </form>
     </div>`;
   const f = document.getElementById('lf');

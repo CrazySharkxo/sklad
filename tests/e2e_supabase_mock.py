@@ -58,6 +58,12 @@ def main() -> int:
             return route.fulfill(json=[])
         if path.startswith("/rest/v1/departments"):
             return route.fulfill(json=[{"id": "dddddddd-0000-0000-0000-000000000001", "name": "Тестування"}])
+        if path.startswith("/rest/v1/rpc/my_perms"):
+            return route.fulfill(json=["admin"])
+        if path.startswith("/rest/v1/roles"):
+            return route.fulfill(json=[{"id": "r1", "name": "Адміністратор", "perms": ["admin"]}])
+        if path.startswith("/rest/v1/rpc/purge_trash"):
+            return route.fulfill(json=[])
         if path.startswith("/rest/v1/profiles"):
             return route.fulfill(json=[{"id": UID, "display_name": "ivan", "department_id": None}])
         if path.startswith("/rest/v1/items") and req.method == "POST":

@@ -4,7 +4,7 @@ import { esc, fmtQty, fmtSigned, fmtDate, parseNum, compressImage, toast, confir
 import { scanCode } from '../scanner.js';
 import {
   state, go, reloadData, activeItems, isLow, categories, locations, units, searchItems, findByCode,
-  hydratePhotos, thumb, userName, ICON_SCAN, ICON_PLUS, trashRow, bindTrash, trashNote, TRASH_EMPTY,
+  hydratePhotos, thumb, userName, ICON_SCAN, ICON_PLUS, trashRow, bindTrash, trashNote, TRASH_EMPTY, can,
 } from '../core.js';
 
 // пошук і фільтр запамʼятовуються в межах сесії
@@ -13,11 +13,11 @@ const ui = { q: '', cat: '', low: false, archived: false, trash: false };
 export function viewStock(ctx) {
   ctx.header({
     title: 'Залишки',
-    actions: `<button class="btn primary sm" data-new>${ICON_PLUS}<span>Позиція</span></button>`,
+    actions: can('stock.edit') ? `<button class="btn primary sm" data-new>${ICON_PLUS}<span>Позиція</span></button>` : '',
   });
   const cats = categories();
   const lowCount = activeItems().filter(isLow).length;
-  if (!state.trashItems.length) ui.trash = false;
+  if (!state.trashItems.length || !can('stock.delete')) ui.trash = false;
   const plain = !ui.cat && !ui.low && !ui.trash;
   ctx.main.innerHTML = `
     <div class="toolbar">
@@ -28,13 +28,13 @@ export function viewStock(ctx) {
       <button class="chip${plain ? ' on' : ''}" data-cat="">Усі</button>
       ${lowCount ? `<button class="chip warn${ui.low ? ' on' : ''}" data-low>Мало: ${lowCount}</button>` : ''}
       ${cats.map((c) => `<button class="chip${ui.cat === c ? ' on' : ''}" data-cat="${esc(c)}">${esc(c)}</button>`).join('')}
-      ${state.trashItems.length ? `<button class="chip trash-chip${ui.trash ? ' on' : ''}" data-trash>Кошик · ${state.trashItems.length}</button>` : ''}
+      ${state.trashItems.length && can('stock.delete') ? `<button class="chip trash-chip${ui.trash ? ' on' : ''}" data-trash>Кошик · ${state.trashItems.length}</button>` : ''}
     </div>
     <div id="list" class="list"></div>
-    <div class="bottom-actions">
+    ${can('ops.edit') ? `<div class="bottom-actions">
       <a class="btn in" href="#/op/in">＋ Прихід</a>
       <a class="btn out" href="#/op/out">− Видаток</a>
-    </div>`;
+    </div>` : ''}`;
 
   const listEl = ctx.main.querySelector('#list');
   const renderList = () => {
@@ -54,9 +54,9 @@ export function viewStock(ctx) {
     if (ui.low) list = list.filter(isLow);
     list = searchItems(ui.q, list);
     if (!state.items.length) {
-      listEl.innerHTML = `<div class="empty-state"><p>Склад порожній.</p>
+      listEl.innerHTML = `<div class="empty-state"><p>Склад порожній.</p>${can('stock.edit') ? `
         <p><a class="btn primary" href="#/item-edit/new">Додати першу позицію</a></p>
-        <p class="muted">Або завантажте список з Excel: <a href="#/import">Імпорт</a></p></div>`;
+        <p class="muted">Або завантажте список з Excel: <a href="#/import">Імпорт</a></p>` : ''}</div>`;
       return;
     }
     if (!list.length) { listEl.innerHTML = '<div class="empty-state"><p>Нічого не знайдено</p></div>'; return; }
@@ -104,7 +104,7 @@ export function viewStock(ctx) {
     renderList();
   });
   ctx.main.querySelector('#scan').addEventListener('click', () => scanAndOpen());
-  ctx.headerEl.querySelector('[data-new]').addEventListener('click', () => go('#/item-edit/new'));
+  ctx.headerEl.querySelector('[data-new]')?.addEventListener('click', () => go('#/item-edit/new'));
   if (!matchMedia('(pointer: coarse)').matches) q.focus();
 }
 
@@ -141,17 +141,17 @@ export async function viewItem(ctx, id) {
           ${inKits.length ? `<dt>У комплектах</dt><dd>${inKits.map((k) => `<a href="#/kit/${k.id}">${esc(k.name)}</a>`).join(', ')}</dd>` : ''}
         </dl>
         ${item.note ? `<p class="note">${esc(item.note)}</p>` : ''}
-        ${item.photo_path ? '' : `<a class="muted small" href="#/item-edit/${id}">+ додати фото</a>`}
+        ${item.photo_path || !can('stock.edit') ? '' : `<a class="muted small" href="#/item-edit/${id}">+ додати фото</a>`}
       </div>
     </div>
-    <div class="action-grid">${trashed ? `
+    <div class="action-grid">${trashed ? (can('stock.delete') ? `
       <button class="btn primary" data-restore>Відновити з кошика</button>
-      <button class="btn ghost del-btn" data-purge>Видалити назавжди</button>` : `
-      <a class="btn in" href="#/op/in?item=${id}">＋ Прихід</a>
-      <a class="btn out" href="#/op/out?item=${id}">− Видаток</a>
-      <a class="btn ghost" href="#/item-edit/${id}">Редагувати</a>
+      <button class="btn ghost del-btn" data-purge>Видалити назавжди</button>` : '') : `
+      ${can('ops.edit') ? `<a class="btn in" href="#/op/in?item=${id}">＋ Прихід</a>
+      <a class="btn out" href="#/op/out?item=${id}">− Видаток</a>` : ''}
+      ${can('stock.edit') ? `<a class="btn ghost" href="#/item-edit/${id}">Редагувати</a>` : ''}
       <button class="btn ghost" data-label>Етикетка</button>
-      <button class="btn ghost del-btn" data-del>Видалити</button>`}
+      ${can('stock.delete') ? '<button class="btn ghost del-btn" data-del>Видалити</button>' : ''}`}
     </div>
     <h3>Історія руху</h3>
     <div id="hist" class="hist"><div class="muted pad">Завантаження…</div></div>`;
@@ -217,7 +217,7 @@ export function viewItemEdit(ctx, id, query) {
         <label class="field"><span>Одиниця виміру</span><input name="unit" list="dl-unit" value="${esc(item.unit)}"></label>
         <label class="field"><span>Місце зберігання</span><input name="location" list="dl-loc" value="${esc(item.location)}" placeholder="Стелаж 2, коробка 5"></label>
         <label class="field"><span>Мінімальний залишок</span><input name="min_qty" inputmode="decimal" value="${item.min_qty ? fmtQty(item.min_qty) : ''}" placeholder="0 — не стежити"></label>
-        ${isNew ? '<label class="field"><span>Початкова кількість</span><input name="init_qty" inputmode="decimal" placeholder="скільки зараз є на складі"></label>' : ''}
+        ${isNew && can('ops.edit') ? '<label class="field"><span>Початкова кількість</span><input name="init_qty" inputmode="decimal" placeholder="скільки зараз є на складі"></label>' : ''}
       </div>
       <label class="field"><span>Примітка</span><textarea name="note" rows="2">${esc(item.note)}</textarea></label>
       ${!isNew ? `<label class="check"><input type="checkbox" name="archived" ${item.archived ? 'checked' : ''}> В архіві (сховати зі списку)</label>` : ''}
@@ -225,7 +225,7 @@ export function viewItemEdit(ctx, id, query) {
       <datalist id="dl-loc">${locations().map((c) => `<option value="${esc(c)}">`).join('')}</datalist>
       <datalist id="dl-unit">${units().map((c) => `<option value="${esc(c)}">`).join('')}</datalist>
       <div class="form-actions">
-        ${!isNew ? '<button type="button" class="btn danger ghost" id="del">Видалити</button>' : ''}
+        ${!isNew && can('stock.delete') ? '<button type="button" class="btn danger ghost" id="del">Видалити</button>' : ''}
         <span class="grow"></span>
         <a class="btn ghost" href="${isNew ? '#/stock' : `#/item/${id}`}">Скасувати</a>
         <button class="btn primary" id="save">Зберегти</button>
@@ -256,7 +256,7 @@ export function viewItemEdit(ctx, id, query) {
   f.addEventListener('submit', async (e) => {
     e.preventDefault();
     const min = parseNum(f.min_qty.value);
-    const init = isNew ? parseNum(f.init_qty.value) : null;
+    const init = isNew && f.init_qty ? parseNum(f.init_qty.value) : null;
     if (Number.isNaN(min) || (min !== null && min < 0)) return toast('Мінімальний залишок — невідʼємне число', 'err');
     if (Number.isNaN(init) || (init !== null && init < 0)) return toast('Початкова кількість — невідʼємне число', 'err');
     const btn = f.querySelector('#save');

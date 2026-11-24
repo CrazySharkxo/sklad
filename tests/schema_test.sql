@@ -8,7 +8,14 @@ insert into auth.users (id, email) values
 do $$ begin
   assert (select count(*) from public.profiles) = 2, 'профілі не створено';
   assert (select display_name from public.profiles where id = '11111111-1111-1111-1111-111111111111') = 'ivan';
+  -- перший користувач стає адміністратором, наступні — «Лише перегляд»
+  assert (select r.name from public.profiles p join public.roles r on r.id = p.role_id
+           where p.id = '11111111-1111-1111-1111-111111111111') = 'Адміністратор';
+  assert (select r.name from public.profiles p join public.roles r on r.id = p.role_id
+           where p.id = '22222222-2222-2222-2222-222222222222') = 'Лише перегляд';
 end $$;
+-- для перевірок складу обидва — адміністратори (обмежені права — окремо, в кінці)
+update public.profiles set role_id = (select id from public.roles where name = 'Адміністратор');
 
 set role authenticated;
 select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
@@ -143,8 +150,7 @@ end $$;
 
 -- свій відділ у профілі
 select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
-update public.profiles set department_id = (select id from public.departments where name = 'Прийом замовлень')
- where id = auth.uid();
+select public.set_my_department((select id from public.departments where name = 'Прийом замовлень'));
 
 insert into public.orders (id, title, customer, qty, description, department_id) values
   ('cccccccc-0000-0000-0000-000000000001', 'Дрон 7"', 'Екіпаж 5', 2, 'Камера денна, антена 5.8',
@@ -399,6 +405,213 @@ do $$ begin
   assert exists (select 1 from public.orders where id = 'cccccccc-0000-0000-0000-000000000001'), 'зачеплено живе замовлення';
 end $$;
 
+-- =====================================================================
+--  Ролі та права
+-- =====================================================================
+reset role;
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);  -- ivan, адмін
+set role authenticated;
+
+select public.admin_create_user('Prod@Example.com', 'secret1', 'Петро',
+  (select id from public.roles where name = 'Виробництво'), (select id from public.departments where name = 'Тестування'));
+select public.admin_create_user('view@example.com', 'secret1', '',
+  (select id from public.roles where name = 'Лише перегляд'), null);
+do $$ begin
+  assert (select count(*) from public.admin_users()) = 4, 'admin_users';
+  assert (select display_name from public.admin_users() where email = 'prod@example.com') = 'Петро', 'імʼя';
+  assert (select display_name from public.admin_users() where email = 'view@example.com') = 'view', 'імʼя з email';
+  begin
+    perform public.admin_create_user('prod@example.com', 'secret1');
+    raise exception 'дубль email пройшов';
+  exception when raise_exception then assert sqlerrm = 'Користувач з таким email уже є', sqlerrm;
+  end;
+  begin
+    perform public.admin_create_user('x@example.com', '123');
+    raise exception 'короткий пароль пройшов';
+  exception when raise_exception then assert sqlerrm like 'Пароль%', sqlerrm;
+  end;
+  begin
+    perform public.admin_create_user('без-собачки', 'secret1');
+    raise exception 'кривий email пройшов';
+  exception when raise_exception then assert sqlerrm = 'Неправильний email', sqlerrm;
+  end;
+end $$;
+reset role;
+do $$ begin
+  assert (select email_confirmed_at from auth.users where email = 'prod@example.com') is not null, 'не підтверджено';
+  assert (select count(*) from auth.identities i join auth.users u on u.id = i.user_id where u.email = 'prod@example.com') = 1, 'identity';
+end $$;
+
+-- ---- Петро: Виробництво, відділ «Тестування» ----
+select set_config('request.jwt.claim.sub', (select id::text from auth.users where email = 'prod@example.com'), false);
+set role authenticated;
+select public.post_operation('in', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000003","qty":1}]', 'Петро');  -- ops.edit — можна
+do $$ begin
+  assert public.has_perm('ops.edit') and not public.has_perm('ops.delete'), 'my perms';
+  begin
+    insert into public.items (name) values ('без права');
+    raise exception 'позицію створено без stock.edit';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    perform public.cancel_operation((select id from public.operations where comment = 'Петро'));
+    raise exception 'операцію видалено без ops.delete';
+  exception when raise_exception then assert sqlerrm = 'Немає права видаляти операції', sqlerrm;
+  end;
+  begin
+    perform public.trash_item('aaaaaaaa-0000-0000-0000-000000000003');
+    raise exception 'позицію видалено без stock.delete';
+  exception when raise_exception then assert sqlerrm = 'Немає права видаляти позиції складу', sqlerrm;
+  end;
+  begin
+    perform * from public.admin_users();
+    raise exception 'не-адмін побачив користувачів';
+  exception when raise_exception then assert sqlerrm = 'Немає права адміністрування', sqlerrm;
+  end;
+  begin
+    insert into public.departments (name) values ('Самочинний');
+    raise exception 'відділ створено без адміна';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    insert into public.roles (name, perms) values ('Самочинна', array['admin']);
+    raise exception 'роль створено без адміна';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    update public.profiles set role_id = null where id = auth.uid();
+    raise exception 'роль змінено самому собі';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    perform public.set_my_department(null);
+    raise exception 'відділ змінено без orders.all';
+  exception when raise_exception then assert sqlerrm = 'Відділ вам призначає адміністратор', sqlerrm;
+  end;
+  -- замовлення: лише свого відділу
+  assert not exists (select 1 from public.orders where department_id is distinct from public.my_department()), 'видно чужий відділ';
+  begin
+    insert into public.orders (title, department_id) values ('у чужий відділ', (select id from public.departments where name = 'Прийом замовлень'));
+    raise exception 'замовлення в чужий відділ пройшло';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+update public.profiles set display_name = 'Петро І.' where id = auth.uid();  -- своє імʼя — можна
+insert into public.orders (id, title, department_id)
+  values ('cccccccc-0000-0000-0000-000000000005', 'Своє', (select id from public.departments where name = 'Тестування'));
+insert into public.order_tasks (order_id, position, text) values ('cccccccc-0000-0000-0000-000000000005', 0, 'пункт');
+do $$ begin
+  assert (select count(*) from public.orders where id = 'cccccccc-0000-0000-0000-000000000005') = 1, 'своє не видно';
+  begin
+    perform public.delete_order('cccccccc-0000-0000-0000-000000000005');
+    raise exception 'замовлення видалено без orders.delete';
+  exception when raise_exception then assert sqlerrm = 'Немає права видаляти замовлення', sqlerrm;
+  end;
+  -- передав у чужий відділ — далі вже не бачить і не змінює
+  perform public.move_order('cccccccc-0000-0000-0000-000000000005', 'in_work', (select id from public.departments where name = 'Прийом замовлень'));
+  assert not exists (select 1 from public.orders where id = 'cccccccc-0000-0000-0000-000000000005'), 'після передачі видно';
+  begin
+    perform public.move_order('cccccccc-0000-0000-0000-000000000005', 'testing');
+    raise exception 'передано чуже замовлення';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+end $$;
+
+-- ---- «Лише перегляд» ----
+reset role;
+select set_config('request.jwt.claim.sub', (select id::text from auth.users where email = 'view@example.com'), false);
+set role authenticated;
+do $$ begin
+  assert (select count(*) from public.orders) > 0, 'orders.all: не видно замовлень';
+  assert (select count(*) from public.stock) > 0, 'не видно залишків';
+  begin
+    perform public.post_operation('in', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000003","qty":1}]');
+    raise exception 'перегляд провів прихід';
+  exception when raise_exception then assert sqlerrm = 'Немає права проводити прихід і видаток', sqlerrm;
+  end;
+end $$;
+
+-- ---- адмін: свої галочки замість ролі, блокування, пароль, захист від самоблокування ----
+reset role;
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+select public.admin_update_user((select id from public.admin_users() where email = 'view@example.com'), 'Оля',
+  (select id from public.roles where name = 'Лише перегляд'), null, array['stock.view', 'stock.edit'], true);
+do $$ begin
+  begin
+    perform public.admin_update_user('11111111-1111-1111-1111-111111111111', 'ivan',
+      (select id from public.roles where name = 'Комірник'), null, null, true);
+    raise exception 'адмін забрав собі адмінку';
+  exception when raise_exception then assert sqlerrm like 'Не можна забрати права адміністратора%', sqlerrm;
+  end;
+  begin
+    perform public.admin_update_user('11111111-1111-1111-1111-111111111111', 'ivan', null, null, array['admin'], false);
+    raise exception 'адмін заблокував себе';
+  exception when raise_exception then assert sqlerrm = 'Не можна заблокувати самого себе', sqlerrm;
+  end;
+  begin
+    perform public.admin_delete_user('11111111-1111-1111-1111-111111111111');
+    raise exception 'адмін видалив себе';
+  exception when raise_exception then assert sqlerrm = 'Не можна видалити самого себе', sqlerrm;
+  end;
+  begin
+    update public.roles set perms = '{}' where name = 'Адміністратор';
+    raise exception 'роль адміна спорожнено';
+  exception when raise_exception then assert sqlerrm like 'Має лишитися хоча б один%', sqlerrm;
+  end;
+  begin
+    insert into public.roles (name, perms) values ('Крива', array['fly']);
+    raise exception 'невідоме право пройшло';
+  exception when check_violation then null;
+  end;
+  begin
+    perform public.admin_set_password((select id from public.admin_users() where email = 'prod@example.com'), '123');
+    raise exception 'короткий пароль пройшов';
+  exception when raise_exception then null;
+  end;
+  perform public.admin_set_password((select id from public.admin_users() where email = 'prod@example.com'), 'newpass1');
+  perform public.admin_update_user((select id from public.admin_users() where email = 'prod@example.com'), 'Петро',
+    (select id from public.roles where name = 'Виробництво'), null, null, false);   -- заблокувати
+end $$;
+insert into public.roles (name, perms) values ('Склад-плюс', array['stock.view', 'stock.edit']);
+reset role;
+do $$ begin
+  assert (select banned_until from auth.users where email = 'prod@example.com') = 'infinity', 'не заблоковано в auth';
+  assert (select encrypted_password from auth.users where email = 'prod@example.com') = md5('newpass1' || 'bf$salt'), 'пароль';
+end $$;
+
+-- Оля зі своїми галочками: позиції створює, а замовлень не бачить
+select set_config('request.jwt.claim.sub', (select id::text from auth.users where email = 'view@example.com'), false);
+set role authenticated;
+insert into public.items (name) values ('Створила Оля');
+do $$ begin
+  assert (select count(*) from public.orders) = 0, 'без orders.view видно замовлення';
+end $$;
+
+-- заблокований Петро не бачить нічого й нічого не проводить
+reset role;
+select set_config('request.jwt.claim.sub', (select id::text from auth.users where email = 'prod@example.com'), false);
+set role authenticated;
+do $$ begin
+  assert (select count(*) from public.items) = 0, 'заблокований бачить позиції';
+  assert public.my_perms() = '{}', 'заблокований має права';
+  begin
+    perform public.post_operation('in', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000003","qty":1}]');
+    raise exception 'заблокований провів операцію';
+  exception when raise_exception then null;
+  end;
+end $$;
+
+-- видалення користувача: його операції лишаються, автор — порожній
+reset role;
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+select public.admin_delete_user((select id from public.admin_users() where email = 'prod@example.com'));
+do $$ begin
+  assert not exists (select 1 from public.admin_users() where email = 'prod@example.com'), 'не видалено';
+  assert (select created_by from public.operations where comment = 'Петро') is null, 'автор лишився';
+end $$;
+
 -- без входу — нічого не видно і нічого не провести
 reset role;
 set role anon;
@@ -432,12 +645,17 @@ do $$ begin
     raise exception 'анонім почистив кошик';
   exception when insufficient_privilege then null;
   end;
+  begin
+    perform * from public.admin_users();
+    raise exception 'анонім побачив користувачів';
+  exception when insufficient_privilege then null;
+  end;
 end $$;
 reset role;
 
 -- realtime підключено
 do $$ begin
-  assert (select count(*) from pg_publication_tables where pubname = 'supabase_realtime') = 11;
+  assert (select count(*) from pg_publication_tables where pubname = 'supabase_realtime') = 12;
 end $$;
 
 \echo ALL SCHEMA TESTS PASSED

@@ -7,7 +7,7 @@ import {
 } from '../util.js';
 import {
   state, go, reloadData, itemPicker, userName, depName, myDepartment, ACTIVE_ORDER, ICON_PLUS,
-  trashRow, bindTrash, TRASH_EMPTY,
+  trashRow, bindTrash, TRASH_EMPTY, can,
 } from '../core.js';
 
 const findOrder = (id) => state.orders.find((o) => o.id === id);
@@ -45,7 +45,8 @@ function orderRow(o) {
 }
 
 export function viewOrders(ctx) {
-  ctx.header({ title: 'Замовлення', actions: `<a class="btn primary sm" href="#/order-edit/new">${ICON_PLUS}<span>Замовлення</span></a>` });
+  ctx.header({ title: 'Замовлення', actions: can('orders.edit') ? `<a class="btn primary sm" href="#/order-edit/new">${ICON_PLUS}<span>Замовлення</span></a>` : '' });
+  if (ui.f === 'trash' && !can('orders.delete')) ui.f = null;
   const mine = myDepartment();
   if (!ui.f) ui.f = mine ? 'mine' : 'active';
   const counts = Object.fromEntries(FILTERS.map(([k, , fn]) => [k, state.orders.filter(fn).length]));
@@ -53,7 +54,7 @@ export function viewOrders(ctx) {
     <div class="toolbar"><div class="search">
       <input type="search" id="q" placeholder="Пошук: номер, виріб, замовник" value="${esc(ui.q)}" autocomplete="off"></div></div>
     <div class="chips" id="chips">${FILTERS.map(([k, label]) => `<button class="chip${ui.f === k ? ' on' : ''}" data-f="${k}">${label}${k !== 'archive' && counts[k] ? ` · ${counts[k]}` : ''}</button>`).join('')}
-      ${state.trashOrders.length || ui.f === 'trash' ? `<button class="chip trash-chip${ui.f === 'trash' ? ' on' : ''}" data-f="trash">Кошик${state.trashOrders.length ? ` · ${state.trashOrders.length}` : ''}</button>` : ''}</div>
+      ${can('orders.delete') && (state.trashOrders.length || ui.f === 'trash') ? `<button class="chip trash-chip${ui.f === 'trash' ? ' on' : ''}" data-f="trash">Кошик${state.trashOrders.length ? ` · ${state.trashOrders.length}` : ''}</button>` : ''}</div>
     <div id="list" class="list"></div>`;
   const listEl = ctx.main.querySelector('#list');
 
@@ -80,12 +81,12 @@ export function viewOrders(ctx) {
         <p>Замовлень ще немає.</p>
         <p>Прийміть замовлення: опишіть продукт, складіть список того, що треба зробити, вкажіть деталі зі складу.
            Далі передавайте його між відділами — напр. на тестування — і вся історія лишиться в картці.</p>
-        <p><a class="btn primary" href="#/order-edit/new">Прийняти перше замовлення</a></p></div>`;
+        ${can('orders.edit') ? '<p><a class="btn primary" href="#/order-edit/new">Прийняти перше замовлення</a></p>' : ''}</div>`;
       return;
     }
     if (ui.f === 'mine' && !mine) {
       listEl.innerHTML = `<div class="empty-state"><p>Ви ще не вказали свій відділ.</p>
-        <p><a class="btn primary" href="#/departments">Вибрати відділ</a></p></div>`;
+        <p>${can('orders.all') ? '<a class="btn primary" href="#/departments">Вибрати відділ</a>' : 'Відділ вам призначає адміністратор.'}</p></div>`;
       return;
     }
     const fn = FILTERS.find(([k]) => k === ui.f)[2];
@@ -142,12 +143,14 @@ const MOVE_TITLE = {
 };
 
 function actionButtons(o) {
+  const del = can('orders.delete') ? '<button type="button" class="btn ghost sm del-btn" data-delete>Видалити</button>' : '';
+  if (!can('orders.edit')) return `<span class="grow"></span>${del}`;
   const main = (ACTIONS[o.status] || []).map(([to, label, cls]) => `<button type="button" class="btn ${cls}" data-to="${to}">${label}</button>`).join('');
   const extra = isActive(o) ? `<span class="grow"></span>
     <button type="button" class="link-btn plain" data-to="${o.status}" data-handoff>Передати в інший відділ</button>
     <button type="button" class="link-btn" data-to="cancelled">Скасувати замовлення</button>`
     : '<span class="grow"></span>';
-  return `${main}${extra}<button type="button" class="btn ghost sm del-btn" data-delete>Видалити</button>`;
+  return `${main}${extra}${del}`;
 }
 
 // у який відділ найімовірніше піде замовлення — підставляємо, але людина може змінити
@@ -205,7 +208,7 @@ function moveDialog({ o, to, handoff, dep, warn }) {
 }
 
 const taskRow = (t) => `<label class="task${t.done ? ' done' : ''}">
-  <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''}>
+  <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''}${can('orders.edit') ? '' : ' disabled'}>
   <span class="task-text"><span class="tt">${esc(t.text)}</span>${t.done ? `<small>${esc(userName(t.done_by))}, ${fmtDate(t.done_at)}</small>` : ''}</span></label>`;
 
 function partsHtml(o, issued) {
@@ -226,7 +229,7 @@ function partsHtml(o, issued) {
   return `<table class="tbl"><thead><tr><th>Деталь</th><th>потрібно</th><th>видано</th><th>на складі</th></tr></thead><tbody>${rows}</tbody></table>
     <div class="form-actions">${left
     ? `<span class="muted">${short ? `Бракує на складі: ${short} поз.` : 'Усе потрібне є на складі'}</span><span class="grow"></span>
-       <a class="btn out" href="#/op/out?order=${o.id}">Видати зі складу</a>`
+       ${can('ops.edit') ? `<a class="btn out" href="#/op/out?order=${o.id}">Видати зі складу</a>` : ''}`
     : '<span class="pos">Усі деталі видано</span>'}</div>`;
 }
 
@@ -248,7 +251,7 @@ function eventHtml(e) {
 export async function viewOrder(ctx, id) {
   const o = findOrder(id);
   if (!o) { ctx.notFound(); return; }
-  ctx.header({ title: `№${o.number} · ${o.title}`, back: '#/orders', actions: `<a class="btn ghost sm" href="#/order-edit/${id}">Редагувати</a>` });
+  ctx.header({ title: `№${o.number} · ${o.title}`, back: '#/orders', actions: can('orders.edit') ? `<a class="btn ghost sm" href="#/order-edit/${id}">Редагувати</a>` : '' });
   const n = doneCount(o);
   const mineHere = isActive(o) && o.department_id && o.department_id === myDepartment();
   let events = [];
@@ -265,7 +268,7 @@ export async function viewOrder(ctx, id) {
         <dt>Прийняв</dt><dd>${esc(userName(o.created_by))}, ${fmtDate(o.created_at)}</dd>
       </dl>
       <div class="section-title">Опис продукту</div>
-      ${o.description ? `<p class="note">${esc(o.description)}</p>` : `<p class="muted">Не заповнено — <a href="#/order-edit/${id}">додати опис</a></p>`}
+      ${o.description ? `<p class="note">${esc(o.description)}</p>` : `<p class="muted">Не заповнено${can('orders.edit') ? ` — <a href="#/order-edit/${id}">додати опис</a>` : ''}</p>`}
       <div class="order-actions" id="acts">${actionButtons(o)}</div>
     </div>
 
@@ -273,20 +276,20 @@ export async function viewOrder(ctx, id) {
     <div class="card">
       ${o.tasks.length ? `<div class="progress"><i style="width:${Math.round((100 * n) / o.tasks.length)}%"></i></div>` : ''}
       <div class="tasks" id="tasks">${o.tasks.map(taskRow).join('') || '<div class="muted pad">Пунктів ще немає</div>'}</div>
-      <form class="add-task" id="addtask" autocomplete="off">
-        <input name="t" placeholder="Додати пункт…"><button class="btn ghost sm">Додати</button></form>
+      ${can('orders.edit') ? `<form class="add-task" id="addtask" autocomplete="off">
+        <input name="t" placeholder="Додати пункт…"><button class="btn ghost sm">Додати</button></form>` : ''}
     </div>
 
     <h3>Деталі зі складу</h3>
     <div class="card" id="parts">${o.parts.length ? '<div class="muted">Завантаження…</div>'
-      : `<p class="muted">Деталі не вказані. <a href="#/order-edit/${id}">Додати</a> — тоді буде видно, чого бракує на складі, а видача спишеться під це замовлення.</p>`}</div>
+      : `<p class="muted">Деталі не вказані.${can('orders.edit') ? ` <a href="#/order-edit/${id}">Додати</a> — тоді буде видно, чого бракує на складі, а видача спишеться під це замовлення.` : ''}</p>`}</div>
 
     <h3>Історія</h3>
     <div class="card">
-      <form class="comment-form" id="cmt" autocomplete="off">
+      ${can('orders.edit') ? `<form class="comment-form" id="cmt" autocomplete="off">
         <textarea name="t" rows="2" placeholder="Коментар до замовлення…"></textarea>
         <div class="form-actions"><span class="grow"></span><button class="btn ghost sm">Додати коментар</button></div>
-      </form>
+      </form>` : ''}
       <div class="timeline" id="events"><div class="muted pad">Завантаження…</div></div>
     </div>`;
 
@@ -340,7 +343,7 @@ export async function viewOrder(ctx, id) {
     } catch (err) { toast(err.message, 'err'); e.target.disabled = false; }
   });
 
-  ctx.main.querySelector('#addtask').addEventListener('submit', async (e) => {
+  ctx.main.querySelector('#addtask')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const t = e.target.t.value.trim();
     if (!t) return;
@@ -351,7 +354,7 @@ export async function viewOrder(ctx, id) {
     } catch (err) { toast(err.message, 'err'); }
   });
 
-  ctx.main.querySelector('#cmt').addEventListener('submit', async (e) => {
+  ctx.main.querySelector('#cmt')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const t = e.target.t.value.trim();
     if (!t) return toast('Порожній коментар', 'err');
@@ -395,7 +398,7 @@ export function viewOrderEdit(ctx, id) {
         <label class="field"><span>Кількість</span><input name="qty" inputmode="decimal" value="${fmtQty(o.qty)}"></label>
         <label class="field"><span>Термін</span><input name="due_date" type="date" value="${esc(o.due_date || '')}"></label>
         ${isNew && state.departments.length ? `<label class="field"><span>Відділ, де буде замовлення</span><select name="dep">
-          ${state.departments.map((d) => `<option value="${d.id}"${d.id === o.department_id ? ' selected' : ''}>${esc(d.name)}</option>`).join('')}</select></label>` : ''}
+          ${state.departments.filter((d) => can('orders.all') || d.id === myDepartment()).map((d) => `<option value="${d.id}"${d.id === o.department_id ? ' selected' : ''}>${esc(d.name)}</option>`).join('')}</select></label>` : ''}
       </div>
       <label class="field"><span>Опис продукту</span>
         <textarea name="description" rows="5" placeholder="Характеристики, комплектація, побажання замовника…">${esc(o.description)}</textarea></label>
@@ -529,21 +532,22 @@ export function viewDepartments(ctx) {
   ctx.header({ title: 'Відділи', back: '#/more' });
   const mine = myDepartment();
   ctx.main.innerHTML = `
-    <div class="card hint">Замовлення передаються між відділами. Позначте свій відділ — тоді в
-      «Замовлення → Мій відділ» буде видно, що чекає саме на вас.</div>
+    <div class="card hint">Замовлення передаються між відділами. ${can('orders.all')
+    ? 'Позначте свій відділ — тоді в «Замовлення → Мій відділ» буде видно, що чекає саме на вас.'
+    : 'Ваш відділ призначає адміністратор.'}</div>
     <div class="list" id="deps">${state.departments.map((d) => {
       const n = state.orders.filter((o) => o.department_id === d.id && isActive(o)).length;
       const people = Object.entries(state.depOf).filter(([, dep]) => dep === d.id).map(([u]) => userName(u));
       return `<div class="row dep-row" data-id="${d.id}">
         <div class="row-main"><div class="row-title">${esc(d.name)}${d.id === mine ? ' <span class="tag st-done">мій</span>' : ''}</div>
           <div class="row-meta">активних замовлень: ${n}${people.length ? ` · ${esc(people.join(', '))}` : ''}</div></div>
-        ${d.id === mine ? '' : '<button class="btn ghost sm" data-mine>Мій відділ</button>'}
-        <button class="icon-btn" data-ren title="Перейменувати" aria-label="Перейменувати">✎</button>
-        <button class="icon-btn" data-del title="Видалити" aria-label="Видалити">✕</button>
+        ${d.id === mine || !can('orders.all') ? '' : '<button class="btn ghost sm" data-mine>Мій відділ</button>'}
+        ${can('admin') ? `<button class="icon-btn" data-ren title="Перейменувати" aria-label="Перейменувати">✎</button>
+        <button class="icon-btn" data-del title="Видалити" aria-label="Видалити">✕</button>` : ''}
       </div>`;
     }).join('') || '<div class="muted pad">Відділів немає — додайте нижче</div>'}</div>
-    <form class="add-task card" id="add" autocomplete="off">
-      <input name="n" placeholder="Новий відділ, напр. «Пакування»"><button class="btn primary sm">Додати</button></form>`;
+    ${can('admin') ? `<form class="add-task card" id="add" autocomplete="off">
+      <input name="n" placeholder="Новий відділ, напр. «Пакування»"><button class="btn primary sm">Додати</button></form>` : ''}`;
 
   const done = async (msg) => {
     await reloadData();
@@ -568,7 +572,7 @@ export function viewDepartments(ctx) {
       }
     } catch (err) { toast(err.message, 'err', 6000); }
   });
-  ctx.main.querySelector('#add').addEventListener('submit', async (e) => {
+  ctx.main.querySelector('#add')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const name = e.target.n.value.trim();
     if (!name) return;

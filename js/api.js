@@ -56,6 +56,8 @@ function issuedMap(ops) {
 function friendly(error) {
   const msg = error?.message || String(error);
   if (error?.code === '23505' && /departments/.test(msg)) return new Error('Такий відділ уже є');
+  if (error?.code === '23505' && /roles/.test(msg)) return new Error('Така роль уже є');
+  if (error?.code === '42501' || /row-level security/i.test(msg)) return new Error('Немає права на цю дію — зверніться до адміністратора');
   if (error?.code === '23505') return new Error('Такий код уже є в іншої позиції');
   if (error?.code === '23503' && /departments|department_id/.test(msg)) return new Error('У відділі є замовлення — його можна лише перейменувати');
   if (error?.code === '23503') return new Error('Позиція має історію руху або є в комплекті чи замовленні — її можна лише архівувати');
@@ -120,12 +122,33 @@ class SupaApi {
   }
   async setMyName(name) {
     const id = await this.userId();
-    await this.q(this.sb.from('profiles').upsert({ id, display_name: name }));
+    await this.q(this.sb.from('profiles').update({ display_name: name }).eq('id', id));
   }
-  async setMyDepartment(depId) {
-    const id = await this.userId();
-    await this.q(this.sb.from('profiles').update({ department_id: depId || null }).eq('id', id));
+  async setMyDepartment(depId) { await this.q(this.sb.rpc('set_my_department', { p_dep: depId || null })); }
+
+  // ---------- права, ролі, користувачі ----------
+  async myPerms() { return (await this.q(this.sb.rpc('my_perms'))) || []; }
+  async roles() { return await this.q(this.sb.from('roles').select('id, name, perms').order('name')); }
+  async saveRole({ id, name, perms }) {
+    const row = { name: String(name || '').trim(), perms };
+    if (id) { await this.q(this.sb.from('roles').update(row).eq('id', id)); return id; }
+    return (await this.q(this.sb.from('roles').insert(row).select('id').single())).id;
   }
+  async deleteRole(id) { await this.q(this.sb.from('roles').delete().eq('id', id)); }
+  async users() { return await this.q(this.sb.rpc('admin_users')); }
+  async createUser({ email, password, name, role_id, department_id }) {
+    return await this.q(this.sb.rpc('admin_create_user', {
+      p_email: email, p_password: password, p_name: name || '', p_role: role_id || null, p_department: department_id || null,
+    }));
+  }
+  // perms: null — як у ролі, масив — свої галочки
+  async updateUser({ id, name, role_id, department_id, perms, active }) {
+    await this.q(this.sb.rpc('admin_update_user', {
+      p_user: id, p_name: name || '', p_role: role_id || null, p_department: department_id || null, p_perms: perms, p_active: active,
+    }));
+  }
+  async setUserPassword(id, password) { await this.q(this.sb.rpc('admin_set_password', { p_user: id, p_password: password })); }
+  async deleteUser(id) { await this.q(this.sb.rpc('admin_delete_user', { p_user: id })); }
 
   // ---------- відділи ----------
   async departments() {
@@ -306,6 +329,13 @@ function normOps(ops) {
 //  Демо: localStorage, та сама логіка, що й у supabase/schema.sql
 // =====================================================================
 const KEY = 'sklad-demo-v1';
+// ті самі стартові ролі, що й у supabase/schema.sql
+const DEMO_ROLES = [
+  ['Адміністратор', ['admin']],
+  ['Комірник', ['stock.view', 'stock.edit', 'stock.delete', 'ops.view', 'ops.edit', 'ops.delete', 'kits.view', 'kits.edit', 'kits.delete', 'orders.view', 'orders.all']],
+  ['Виробництво', ['stock.view', 'ops.view', 'ops.edit', 'kits.view', 'orders.view', 'orders.edit']],
+  ['Лише перегляд', ['stock.view', 'ops.view', 'kits.view', 'orders.view', 'orders.all']],
+];
 const DEMO_USER = '00000000-0000-0000-0000-00000000demo';
 
 class LocalApi {
@@ -321,6 +351,11 @@ class LocalApi {
     if (!d || !d.items) d = { items: [], kits: [], kit_components: [], operations: [], movements: [], profiles: { [DEMO_USER]: 'Демо' } };
     // демо-дані, збережені до появи замовлень, доповнюємо — і одразу зберігаємо,
     // інакше кожне читання давало б відділам нові id
+    if (!d.roles) {
+      d.roles = DEMO_ROLES.map(([name, perms]) => ({ id: crypto.randomUUID(), name, perms }));
+      d.users = { [DEMO_USER]: { email: 'demo@example.com', role_id: d.roles[0].id, perms: null, active: true, created_at: new Date().toISOString() } };
+      try { this.save(d); } catch { /* */ }
+    }
     if (!d.departments) {
       d.departments = ['Прийом замовлень', 'Виробництво', 'Тестування']
         .map((name) => ({ id: crypto.randomUUID(), name, created_at: new Date().toISOString() }));
@@ -353,7 +388,85 @@ class LocalApi {
     return Object.entries(d.profiles).map(([id, display_name]) => ({ id, display_name, department_id: d.profileDeps[id] || null }));
   }
   async setMyName(name) { const d = this.load(); d.profiles[DEMO_USER] = name; this.save(d); }
-  async setMyDepartment(depId) { const d = this.load(); d.profileDeps[DEMO_USER] = depId || null; this.save(d); }
+  async setMyDepartment(depId) {
+    if (!(await this.myPerms()).some((x) => x === 'admin' || x === 'orders.all')) throw new Error('Відділ вам призначає адміністратор');
+    const d = this.load(); d.profileDeps[DEMO_USER] = depId || null; this.save(d);
+  }
+
+  // ---------- права, ролі, «користувачі» (у демо — лише записи, без входу) ----------
+  permsOf(d, id) {
+    const u = d.users[id];
+    if (!u || !u.active) return [];
+    return u.perms || d.roles.find((r) => r.id === u.role_id)?.perms || [];
+  }
+  assertAdminLeft(d) {
+    if (!Object.keys(d.users).some((id) => d.users[id].active && this.permsOf(d, id).includes('admin'))) {
+      throw new Error('Має лишитися хоча б один активний адміністратор');
+    }
+  }
+  async myPerms() { return this.permsOf(this.load(), DEMO_USER); }
+  async roles() { return this.load().roles.slice().sort((a, b) => a.name.localeCompare(b.name, 'uk')); }
+  async saveRole({ id, name, perms }) {
+    const d = this.load();
+    const n = String(name || '').trim();
+    if (!n) throw new Error('Вкажіть назву ролі');
+    if (d.roles.some((r) => r.id !== id && r.name.toLowerCase() === n.toLowerCase())) throw new Error('Така роль уже є');
+    if (id) Object.assign(d.roles.find((r) => r.id === id), { name: n, perms });
+    else { id = crypto.randomUUID(); d.roles.push({ id, name: n, perms }); }
+    this.assertAdminLeft(d);
+    this.save(d);
+    return id;
+  }
+  async deleteRole(id) {
+    const d = this.load();
+    d.roles = d.roles.filter((r) => r.id !== id);
+    for (const u of Object.values(d.users)) if (u.role_id === id) u.role_id = null;
+    this.assertAdminLeft(d);
+    this.save(d);
+  }
+  async users() {
+    const d = this.load();
+    return Object.entries(d.users).map(([id, u]) => ({
+      id, email: u.email, display_name: d.profiles[id] || '', role_id: u.role_id, department_id: d.profileDeps[id] || null,
+      perms: u.perms, active: u.active, last_sign_in_at: id === DEMO_USER ? new Date().toISOString() : null, created_at: u.created_at,
+    })).sort((a, b) => a.display_name.localeCompare(b.display_name, 'uk'));
+  }
+  async createUser({ email, password, name, role_id, department_id }) {
+    const d = this.load();
+    const e = String(email || '').trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)) throw new Error('Неправильний email');
+    if (String(password || '').length < 6) throw new Error('Пароль — мінімум 6 символів');
+    if (Object.values(d.users).some((u) => u.email === e)) throw new Error('Користувач з таким email уже є');
+    const id = crypto.randomUUID();
+    d.users[id] = { email: e, role_id: role_id || null, perms: null, active: true, created_at: new Date().toISOString() };
+    d.profiles[id] = String(name || '').trim() || e.split('@')[0];
+    d.profileDeps[id] = department_id || null;
+    this.save(d);
+    return id;
+  }
+  async updateUser({ id, name, role_id, department_id, perms, active }) {
+    const d = this.load();
+    const u = d.users[id];
+    if (!u) throw new Error('Користувача не знайдено');
+    if (id === DEMO_USER && !active) throw new Error('Не можна заблокувати самого себе');
+    Object.assign(u, { role_id: role_id || null, perms, active });
+    if (String(name || '').trim()) d.profiles[id] = name.trim();
+    d.profileDeps[id] = department_id || null;
+    if (id === DEMO_USER && !this.permsOf(d, id).includes('admin')) throw new Error('Не можна забрати права адміністратора в самого себе');
+    this.assertAdminLeft(d);
+    this.save(d);
+  }
+  async setUserPassword(id, password) {
+    if (String(password || '').length < 6) throw new Error('Пароль — мінімум 6 символів');
+  }
+  async deleteUser(id) {
+    const d = this.load();
+    if (id === DEMO_USER) throw new Error('Не можна видалити самого себе');
+    delete d.users[id];
+    delete d.profiles[id];
+    delete d.profileDeps[id];
+    this.save(d);
+  }
 
   // ---------- відділи ----------
   async departments() {

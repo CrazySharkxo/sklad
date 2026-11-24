@@ -1,7 +1,7 @@
 // Дозамовити, етикетки, імпорт/експорт Excel, профіль
 import { api, isDemo } from '../api.js';
 import { esc, fmtQty, parseNum, norm, toast, confirmDialog, promptDialog, downloadXlsx, readSheet, todayIso } from '../util.js';
-import { state, go, reloadData, activeItems, isLow, searchItems, hydratePhotos, thumb, myDepartment, depName } from '../core.js';
+import { state, go, reloadData, activeItems, isLow, searchItems, hydratePhotos, thumb, myDepartment, depName, can } from '../core.js';
 import { printLabels } from './stock.js';
 import { exportJournal } from './ops.js';
 import { exportOrders } from './orders.js';
@@ -12,15 +12,19 @@ export function viewMore(ctx) {
   const low = activeItems().filter(isLow).length;
   const dep = myDepartment();
   ctx.main.innerHTML = `
+    ${state.perms.size ? '' : `<div class="card hint">Вам ще не надали прав. Зверніться до адміністратора складу —
+      він відкриє потрібні розділи в «Ще → Користувачі».</div>`}
     <div class="menu">
+      ${can('admin') ? `<a href="#/users" class="menu-item"><b>Користувачі та ролі</b><span class="muted">додати людей, права доступу, блокування</span></a>` : ''}
       <a href="#/departments" class="menu-item"><b>Відділи</b><span class="muted">${dep ? `мій відділ: ${esc(depName(dep))}` : 'свій відділ ще не вибрано'}</span></a>
-      <a href="#/reorder" class="menu-item"><b>Дозамовити</b><span class="muted">${low ? `${low} позицій нижче мінімуму` : 'усе в нормі'}</span></a>
-      <a href="#/inventory" class="menu-item only-wide"><b>Інвентаризація</b><span class="muted">перерахунок фактичної кількості</span></a>
-      <a href="#/labels" class="menu-item"><b>Етикетки з QR-кодом</b><span class="muted">друк наліпок для полиць і коробок</span></a>
-      <a href="#/import" class="menu-item"><b>Імпорт з Excel</b><span class="muted">завантажити список позицій і залишків</span></a>
-      <button class="menu-item" data-x="stock"><b>Залишки в Excel</b><span class="muted">поточний стан складу</span></button>
-      <button class="menu-item" data-x="journal"><b>Журнал в Excel</b><span class="muted">усі операції (з фільтром журналу)</span></button>
-      <button class="menu-item" data-x="orders"><b>Замовлення в Excel</b><span class="muted">усі замовлення зі статусами</span></button>
+      ${can('stock.view') ? '' : '<!--'}<a href="#/reorder" class="menu-item"><b>Дозамовити</b><span class="muted">${low ? `${low} позицій нижче мінімуму` : 'усе в нормі'}</span></a>
+${can('stock.view') ? '' : '-->'}
+      ${can('ops.edit') ? '<a href="#/inventory" class="menu-item only-wide"><b>Інвентаризація</b><span class="muted">перерахунок фактичної кількості</span></a>' : ''}
+      ${can('stock.view') ? '<a href="#/labels" class="menu-item"><b>Етикетки з QR-кодом</b><span class="muted">друк наліпок для полиць і коробок</span></a>' : ''}
+      ${can('stock.edit') ? '<a href="#/import" class="menu-item"><b>Імпорт з Excel</b><span class="muted">завантажити список позицій і залишків</span></a>' : ''}
+      ${can('stock.view') ? '<button class="menu-item" data-x="stock"><b>Залишки в Excel</b><span class="muted">поточний стан складу</span></button>' : ''}
+      ${can('ops.view') ? '<button class="menu-item" data-x="journal"><b>Журнал в Excel</b><span class="muted">усі операції (з фільтром журналу)</span></button>' : ''}
+      ${can('orders.view') ? '<button class="menu-item" data-x="orders"><b>Замовлення в Excel</b><span class="muted">усі замовлення зі статусами</span></button>' : ''}
       <button class="menu-item" data-x="name"><b>Моє імʼя</b><span class="muted">${esc(me || 'не вказано')} — так вас видно в журналі</span></button>
       ${isDemo ? `<button class="menu-item" data-x="reset"><b>Очистити демо-дані</b><span class="muted">стерти все, що введено в цьому браузері</span></button>`
         : `<button class="menu-item" data-x="pw"><b>Змінити пароль</b><span class="muted"></span></button>

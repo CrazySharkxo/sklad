@@ -13,14 +13,18 @@ export const state = {
   departments: [],
   orders: [],
   trashOrders: [],
+  perms: new Set(),  // права поточного користувача
+  roles: [],
   me: null,
   loaded: false,
 };
 
 export async function reloadData() {
-  const [items, kits, profiles, departments, orders] = await Promise.all([
-    api.items(), api.kits(), api.profiles(), api.departments(), api.orders(),
+  const [items, kits, profiles, departments, orders, perms, roles] = await Promise.all([
+    api.items(), api.kits(), api.profiles(), api.departments(), api.orders(), api.myPerms(), api.roles(),
   ]);
+  state.perms = new Set(perms);
+  state.roles = roles;
   state.items = items.filter((i) => !i.deleted_at);
   state.trashItems = items.filter((i) => inTrash(i.deleted_at));
   state.byId = new Map(items.map((i) => [i.id, i]));
@@ -35,6 +39,23 @@ export async function reloadData() {
 }
 
 export const go = (hash) => { location.hash = hash; };
+
+// ------------------------------------------------------------------
+// Права: розділ × дія + окремі. Адміністратор може все.
+// ------------------------------------------------------------------
+export const PERM_SECTIONS = [
+  ['stock', 'Склад', 'позиції й залишки'],
+  ['ops', 'Прихід / видаток', 'журнал, інвентаризація'],
+  ['kits', 'Комплекти', ''],
+  ['orders', 'Замовлення', ''],
+];
+export const PERM_ACTIONS = [['view', 'Перегляд'], ['edit', 'Зміна'], ['delete', 'Видалення']];
+export const PERM_EXTRA = [
+  ['orders.all', 'Замовлення всіх відділів', 'без цього людина бачить лише замовлення свого відділу'],
+  ['admin', 'Адміністратор', 'користувачі, ролі, відділи — і всі інші права'],
+];
+export const can = (p) => state.perms.has('admin') || state.perms.has(p);
+export const roleName = (id) => state.roles.find((r) => r.id === id)?.name || 'без ролі';
 
 // ------------------------------------------------------------------
 // Кошик: видалене лежить TRASH_DAYS днів, потім прибирається (purge_trash)

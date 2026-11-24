@@ -428,3 +428,20 @@ h3 .count { font-weight: 600; margin-left: 6px; }
 @media (max-width: 599px) { .op-foot small.grow { flex-basis: 100%; } }
 .op.in-trash { opacity: .85; }
 .op-foot { gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* ---------- користувачі та права ---------- */
+.perm-tbl td:first-child { display: flex; flex-direction: column; }
+.perm-tbl td:first-child small { font-size: 12px; }
+.perm-tbl th:not(:first-child), .perm-tbl td:not(:first-child) { text-align: center; width: 90px; }
+.perm-tbl input[type=checkbox], .perm-extra input[type=checkbox] { width: 22px; height: 22px; min-height: 0; }
+.perm-extra { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.perm-extra .check { align-items: flex-start; }
+.perm-extra .check span { display: flex; flex-direction: column; }
+.perm-extra small { font-size: 12px; }
+.seg { display: flex; gap: 18px; flex-wrap: wrap; padding: 4px 0; }
+.seg label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+.seg input { width: 18px; height: 18px; min-height: 0; }
+.field .static { padding: 10px 0; font-weight: 600; }
+.row-meta.wrap { white-space: normal; }
+@media (max-width: 480px) { .perm-tbl th:not(:first-child), .perm-tbl td:not(:first-child) { width: 64px; } }
+.user-row .row-meta { white-space: normal; }

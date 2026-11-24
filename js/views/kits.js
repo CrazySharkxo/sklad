@@ -1,10 +1,10 @@
 // Комплекти (специфікації): «1 виріб = N компонентів», видача списує все разом
 import { api } from '../api.js';
 import { esc, fmtQty, parseNum, round, toast, confirmDialog, compressImage } from '../util.js';
-import { state, go, reloadData, itemPicker, kitCapacity, hydratePhotos, thumb, ICON_PLUS } from '../core.js';
+import { state, go, reloadData, itemPicker, kitCapacity, hydratePhotos, thumb, ICON_PLUS, can } from '../core.js';
 
 export function viewKits(ctx) {
-  ctx.header({ title: 'Комплекти', actions: `<a class="btn primary sm" href="#/kit-edit/new">${ICON_PLUS}<span>Комплект</span></a>` });
+  ctx.header({ title: 'Комплекти', actions: can('kits.edit') ? `<a class="btn primary sm" href="#/kit-edit/new">${ICON_PLUS}<span>Комплект</span></a>` : '' });
   const kits = state.kits.filter((k) => !k.archived);
   ctx.main.innerHTML = kits.length ? `<div class="list">${kits.map((k) => {
     const cap = kitCapacity(k);
@@ -17,14 +17,14 @@ export function viewKits(ctx) {
   }).join('')}</div>` : `<div class="empty-state">
       <p>Комплект — це виріб зі складових, напр. «Дрон 7"» = 4 мотори + 1 польотник + 1 камера…</p>
       <p>Видача комплекту одним рухом списує всі компоненти, а тут видно, скільки виробів можна зібрати із залишків.</p>
-      <p><a class="btn primary" href="#/kit-edit/new">Створити комплект</a></p></div>`;
+      ${can('kits.edit') ? '<p><a class="btn primary" href="#/kit-edit/new">Створити комплект</a></p>' : ''}</div>`;
   hydratePhotos(ctx.main);
 }
 
 export function viewKit(ctx, id) {
   const kit = state.kits.find((k) => k.id === id);
   if (!kit) { ctx.notFound(); return; }
-  ctx.header({ title: kit.name, back: '#/kits', actions: `<a class="btn ghost sm" href="#/kit-edit/${id}">Редагувати</a>` });
+  ctx.header({ title: kit.name, back: '#/kits', actions: can('kits.edit') ? `<a class="btn ghost sm" href="#/kit-edit/${id}">Редагувати</a>` : '' });
   const cap = kitCapacity(kit);
 
   ctx.main.innerHTML = `
@@ -35,8 +35,8 @@ export function viewKit(ctx, id) {
         <div>Із залишків можна видати: <b class="${cap ? 'pos' : 'neg'}">${cap}</b></div>
         <form id="issue" class="issue-form" autocomplete="off">
           <input name="n" inputmode="numeric" value="1" aria-label="Скільки комплектів">
-          <input name="counterparty" placeholder="Кому / для чого">
-          <button class="btn out">Видати комплекти</button>
+          ${can('ops.edit') ? `<input name="counterparty" placeholder="Кому / для чого">
+          <button class="btn out">Видати комплекти</button>` : ''}
         </form>
       </div>
       <table class="tbl" id="tbl"></table>
@@ -61,6 +61,7 @@ export function viewKit(ctx, id) {
   form.n.addEventListener('input', renderTable);
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
+    if (!can('ops.edit')) return;
     const n = parseNum(form.n.value);
     if (!(n > 0)) return toast('Вкажіть кількість комплектів', 'err');
     if (!await confirmDialog(`Видати ${fmtQty(n)} × «${kit.name}»? Буде списано всі компоненти.`, { ok: 'Видати' })) return;
@@ -100,7 +101,7 @@ export function viewKitEdit(ctx, id) {
       <div id="lines" class="lines"></div>
       ${!isNew ? `<label class="check"><input type="checkbox" name="archived" ${kit.archived ? 'checked' : ''}> В архіві</label>` : ''}
       <div class="form-actions">
-        ${!isNew ? '<button type="button" class="btn danger ghost" id="del">Видалити</button>' : ''}
+        ${!isNew && can('kits.delete') ? '<button type="button" class="btn danger ghost" id="del">Видалити</button>' : ''}
         <span class="grow"></span>
         <a class="btn ghost" href="${isNew ? '#/kits' : `#/kit/${id}`}">Скасувати</a>
         <button class="btn primary" id="save">Зберегти</button>

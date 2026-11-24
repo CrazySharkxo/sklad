@@ -1,7 +1,7 @@
 // Прихід / видаток і журнал операцій
 import { api, TRASH_DAYS } from '../api.js';
 import { esc, fmtQty, fmtSigned, fmtDate, parseNum, round, toast, confirmDialog, OP_TYPES, downloadXlsx, todayIso } from '../util.js';
-import { state, go, reloadData, itemPicker, userName, bindTrash, trashNote, TRASH_EMPTY } from '../core.js';
+import { state, go, reloadData, itemPicker, userName, bindTrash, trashNote, TRASH_EMPTY, can } from '../core.js';
 
 // контрагенти з недавніх операцій — підказки в полі
 let recentCounterparties = null;
@@ -183,17 +183,18 @@ function opCard(op, trash = false) {
       ? `<small class="muted grow">${trashNote(op.cancelled_at, op.cancelled_by)}</small>
          <button type="button" class="btn ghost sm" data-restore>Відновити</button>
          <button type="button" class="btn ghost sm del-btn" data-purge>Видалити назавжди</button>`
-      : '<button type="button" class="btn ghost sm del-btn" data-cancel>Видалити</button>'}</div>
+      : can('ops.delete') ? '<button type="button" class="btn ghost sm del-btn" data-cancel>Видалити</button>' : ''}</div>
   </div>`;
 }
 
 export async function viewJournal(ctx) {
+  if (!can('ops.delete')) journalTrash = false;
   ctx.header({ title: 'Журнал', actions: '<button class="btn ghost sm" data-xls>Excel</button>' });
   ctx.main.innerHTML = `
     <div class="chips" id="types">
       ${[['', 'Усі'], ['in', 'Прихід'], ['out', 'Видаток'], ['kit_out', 'Комплекти'], ['adjust', 'Інвентаризація']]
         .map(([v, l]) => `<button class="chip${!journalTrash && jf.type === v ? ' on' : ''}" data-t="${v}">${l}</button>`).join('')}
-      <button class="chip trash-chip${journalTrash ? ' on' : ''}" data-trash>Кошик</button>
+      ${can('ops.delete') ? `<button class="chip trash-chip${journalTrash ? ' on' : ''}" data-trash>Кошик</button>` : ''}
     </div>
     <div class="toolbar dates" id="dates"${journalTrash ? ' hidden' : ''}>
       <label>з <input type="date" id="from" value="${jf.from}"></label>

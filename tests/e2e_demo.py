@@ -353,6 +353,86 @@ def main() -> int:
         expect(page.locator("#chips [data-trash]")).to_have_count(0)
         page.goto(url + "#/stock")
 
+        # --- користувачі та ролі (у демо — записи без входу) ---
+        page.goto(url + "#/more")
+        page.locator("a[href='#/users']").click()
+        expect(page.locator(".user-row")).to_have_count(1)
+        page.locator("a[href='#/user/new']").click()
+        f = page.locator("#f")
+        f.locator("[name=name]").fill("Петро")
+        f.locator("[name=email]").fill("petro@example.com")
+        assert len(f.locator("[name=password]").input_value()) == 10  # пароль згенеровано
+        f.locator("[name=role]").select_option(label="Виробництво")
+        f.locator("[name=dep]").select_option(label="Тестування")
+        expect(page.locator("[data-p='ops.edit']")).to_be_checked()      # галочки ролі
+        expect(page.locator("[data-p='ops.edit']")).to_be_disabled()     # «як у ролі» — не редагуються
+        page.screenshot(path=str(SHOTS / "19_user_new.png"), full_page=True)
+        page.locator("#save").click()
+        assert "Користувача створено" in toast_text()
+        expect(page.locator(".user-row")).to_have_count(2)
+        expect(page.locator(".user-row", has_text="Петро")).to_contain_text("Виробництво · Тестування")
+
+        page.locator(".user-row", has_text="Петро").click()
+        page.locator("[name=mode][value=own]").check()
+        page.locator("[data-p='stock.delete']").check()
+        expect(page.locator("[data-p='stock.view']")).to_be_checked()    # видалення тягне перегляд
+        page.locator("[data-p='orders.view']").uncheck()
+        expect(page.locator("[data-p='orders.edit']")).not_to_be_checked()  # без перегляду — без зміни
+        page.locator("#save").click()
+        assert "Збережено" in toast_text()
+        expect(page.locator(".user-row", has_text="Петро")).to_contain_text("свої права")
+        page.screenshot(path=str(SHOTS / "20_users.png"))
+
+        page.locator(".user-row", has_text="ви").click()
+        expect(page.locator("[name=active]")).to_be_disabled()           # себе не заблокувати
+        expect(page.locator("#del")).to_have_count(0)                     # і не видалити
+
+        page.goto(url + "#/roles")
+        expect(page.locator(".list .row")).to_have_count(4)
+        page.locator("a[href='#/role/new']").click()
+        page.locator("#f [name=name]").fill("Тестувальник")
+        page.locator("[data-p='orders.edit']").check()
+        page.locator("#save").click()
+        assert "Роль збережено" in toast_text()
+        expect(page.locator(".list .row")).to_have_count(5)
+        expect(page.locator(".list .row", has_text="Тестувальник")).to_contain_text("Замовлення: перегляд, зміна")
+        page.screenshot(path=str(SHOTS / "21_roles.png"))
+
+        # --- обмежені права: робимо демо-користувача «Лише перегляд» ---
+        set_role = """(name) => {
+            const d = JSON.parse(localStorage.getItem('sklad-demo-v1'));
+            d.users['00000000-0000-0000-0000-00000000demo'].role_id = d.roles.find((r) => r.name === name).id;
+            localStorage.setItem('sklad-demo-v1', JSON.stringify(d));
+        }"""
+        page.evaluate(set_role, "Лише перегляд")
+        page.goto(url + "#/stock")
+        page.reload()
+        expect(page.locator(".row").first).to_be_visible()
+        expect(page.locator("#nav [data-tab=inventory]")).to_have_count(0)
+        expect(page.locator("[data-new]")).to_have_count(0)
+        expect(page.locator(".bottom-actions")).to_have_count(0)
+        page.locator(".row").first.click()
+        expect(page.locator("[data-del]")).to_have_count(0)
+        expect(page.locator(".action-grid .btn.in")).to_have_count(0)
+        page.goto(url + "#/journal")
+        expect(page.locator(".op").first).to_be_visible()
+        expect(page.locator("[data-cancel]")).to_have_count(0)
+        expect(page.locator("#types [data-trash]")).to_have_count(0)
+        page.goto(url + "#/orders")
+        expect(page.locator(".top-actions a")).to_have_count(0)
+        page.locator(".order-row").first.click()
+        expect(page.locator("#acts [data-to]")).to_have_count(0)
+        expect(page.locator("#cmt")).to_have_count(0)
+        page.goto(url + "#/item-edit/new")
+        expect(page.locator("h1")).to_have_text("Немає доступу")
+        page.goto(url + "#/more")
+        expect(page.locator("a[href='#/users']")).to_have_count(0)
+        page.screenshot(path=str(SHOTS / "22_viewer.png"), full_page=True)
+        page.evaluate(set_role, "Адміністратор")
+        page.reload()
+        expect(page.locator("a[href='#/users']")).to_have_count(1)
+        page.goto(url + "#/stock")
+
         # --- скан-модалка відкривається і приймає ручний код (камери в headless нема) ---
         page.locator("#scan").click()
         page.locator(".scan-manual input").fill("4820000000017")

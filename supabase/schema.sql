@@ -2,6 +2,7 @@
 --  Склад — схема бази для Supabase (Postgres 15+)
 --  Виконати один раз: Supabase → SQL Editor → New query → вставити → Run.
 --  Скрипт можна запускати повторно: він нічого не видаляє.
+--  Права: ролі й галочки — розділ «Ролі та права» нижче.
 -- =====================================================================
 
 -- ---------------------------------------------------------------------
@@ -16,8 +17,12 @@ create table if not exists public.profiles (
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
-  insert into public.profiles (id, display_name)
-  values (new.id, split_part(coalesce(new.email, ''), '@', 1))
+  insert into public.profiles (id, display_name, role_id)
+  values (new.id, split_part(coalesce(new.email, ''), '@', 1),
+          (select id from public.roles
+            where name = case when exists (select 1 from public.profiles p join public.roles r on r.id = p.role_id
+                                            where p.active and 'admin' = any(coalesce(p.perms, r.perms)))
+                              then 'Лише перегляд' else 'Адміністратор' end))
   on conflict (id) do nothing;
   return new;
 end $$;
@@ -253,13 +258,12 @@ declare
   v_del   timestamptz;
   v_n     int := 0;
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
+  perform public.require('ops.edit');
   if p_type not in ('in', 'out', 'adjust', 'kit_out') then
     raise exception 'Невідомий тип операції: %', p_type;
   end if;
-  if p_order_id is not null and not exists (select 1 from public.orders where id = p_order_id and deleted_at is null) then
+  if p_order_id is not null and not exists (select 1 from public.orders
+                                              where id = p_order_id and deleted_at is null and public.can_see_order(department_id)) then
     raise exception 'Замовлення не знайдено (можливо, воно в кошику)';
   end if;
 
@@ -349,9 +353,7 @@ declare
   r record;
   v_have numeric;
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
+  perform public.require('ops.delete');
 
   perform 1 from public.operations where id = p_id and cancelled_at is null for update;
   if not found then
@@ -389,9 +391,7 @@ declare
   r record;
   v_have numeric;
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
+  perform public.require('ops.delete');
   perform 1 from public.operations where id = p_id and cancelled_at is not null for update;
   if not found then
     raise exception 'Операцію не знайдено в кошику';
@@ -420,9 +420,7 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
+  perform public.require('ops.delete');
   delete from public.operations where id = p_id and cancelled_at is not null;
   if not found then
     raise exception 'Операцію не знайдено в кошику';
@@ -438,9 +436,7 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
+  perform public.require('stock.delete');
   update public.items set deleted_at = now(), deleted_by = auth.uid() where id = p_id and deleted_at is null;
   if not found then
     raise exception 'Позицію не знайдено або вона вже в кошику';
@@ -453,9 +449,7 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
+  perform public.require('stock.delete');
   update public.items set deleted_at = null, deleted_by = null where id = p_id and deleted_at is not null;
   if not found then
     raise exception 'Позицію не знайдено в кошику';
@@ -471,9 +465,7 @@ as $$
 declare
   v_photo text;
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
+  perform public.require('stock.delete');
   if not exists (select 1 from public.items where id = p_id and deleted_at is not null) then
     raise exception 'Позицію не знайдено в кошику';
   end if;
@@ -549,14 +541,12 @@ declare
   v_dep uuid;
   v_txt text := trim(coalesce(p_comment, ''));
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
+  perform public.require('orders.edit');
   if p_status not in ('new', 'in_work', 'testing', 'rework', 'done', 'shipped', 'cancelled') then
     raise exception 'Невідомий статус: %', p_status;
   end if;
   select * into v from public.orders where id = p_id and deleted_at is null for update;
-  if not found then
+  if not found or not public.can_see_order(v.department_id) then
     raise exception 'Замовлення не знайдено';
   end if;
   v_dep := coalesce(p_department, v.department_id);
@@ -585,10 +575,9 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
-  update public.orders set deleted_at = now(), deleted_by = auth.uid() where id = p_id and deleted_at is null;
+  perform public.require('orders.delete');
+  update public.orders set deleted_at = now(), deleted_by = auth.uid()
+   where id = p_id and deleted_at is null and public.can_see_order(department_id);
   if not found then
     raise exception 'Замовлення не знайдено або воно вже в кошику';
   end if;
@@ -600,10 +589,9 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
-  update public.orders set deleted_at = null, deleted_by = null where id = p_id and deleted_at is not null;
+  perform public.require('orders.delete');
+  update public.orders set deleted_at = null, deleted_by = null
+   where id = p_id and deleted_at is not null and public.can_see_order(department_id);
   if not found then
     raise exception 'Замовлення не знайдено в кошику';
   end if;
@@ -615,10 +603,8 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
-  end if;
-  delete from public.orders where id = p_id and deleted_at is not null;
+  perform public.require('orders.delete');
+  delete from public.orders where id = p_id and deleted_at is not null and public.can_see_order(department_id);
   if not found then
     raise exception 'Замовлення не знайдено в кошику';
   end if;
@@ -635,8 +621,8 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  if auth.uid() is null then
-    raise exception 'Потрібно увійти';
+  if not public.is_active() then
+    raise exception 'Немає доступу';
   end if;
   delete from public.orders where deleted_at < now() - interval '30 days';
   delete from public.operations where cancelled_at < now() - interval '30 days';
@@ -652,8 +638,280 @@ begin
 end $$;
 
 -- ---------------------------------------------------------------------
---  Доступ: усі увійшлі користувачі рівні. Анонім не бачить нічого.
---  Операції не видаляються — лише скасовуються (історія не губиться).
+--  Ролі та права
+--    розділи: stock  — позиції й залишки
+--             ops    — прихід / видаток, журнал, інвентаризація
+--             kits   — комплекти
+--             orders — замовлення
+--    дії:     .view (перегляд) .edit (зміна) .delete (видалення, кошик)
+--    orders.all — замовлення всіх відділів (без нього — лише свого відділу)
+--    admin      — користувачі, ролі, відділи і всі інші права
+--  Права людини = власні галочки (profiles.perms), а якщо їх нема — права ролі.
+-- ---------------------------------------------------------------------
+create or replace function public.all_perms()
+returns text[] language sql immutable as $$
+  select array['stock.view', 'stock.edit', 'stock.delete',
+               'ops.view', 'ops.edit', 'ops.delete',
+               'kits.view', 'kits.edit', 'kits.delete',
+               'orders.view', 'orders.edit', 'orders.delete', 'orders.all',
+               'admin']
+$$;
+
+create table if not exists public.roles (
+  id          uuid primary key default gen_random_uuid(),
+  name        text not null check (length(trim(name)) > 0),
+  perms       text[] not null default '{}',
+  created_at  timestamptz not null default now()
+);
+create unique index if not exists roles_name_uq on public.roles (lower(name));
+alter table public.roles drop constraint if exists roles_perms_chk;
+alter table public.roles add constraint roles_perms_chk check (perms <@ public.all_perms());
+
+-- стартові ролі — лише в порожню таблицю, щоб змінені адміністратором не поверталися
+insert into public.roles (name, perms)
+select v.name, v.perms from (values
+  ('Адміністратор', array['admin']),
+  ('Комірник',      array['stock.view', 'stock.edit', 'stock.delete', 'ops.view', 'ops.edit', 'ops.delete',
+                          'kits.view', 'kits.edit', 'kits.delete', 'orders.view', 'orders.all']),
+  ('Виробництво',   array['stock.view', 'ops.view', 'ops.edit', 'kits.view', 'orders.view', 'orders.edit']),
+  ('Лише перегляд', array['stock.view', 'ops.view', 'kits.view', 'orders.view', 'orders.all'])
+) as v(name, perms)
+where not exists (select 1 from public.roles);
+
+alter table public.profiles
+  add column if not exists role_id uuid references public.roles(id) on delete set null,
+  add column if not exists perms   text[],                          -- null = як у ролі
+  add column if not exists active  boolean not null default true;  -- false = заблокований
+alter table public.profiles drop constraint if exists profiles_perms_chk;
+alter table public.profiles add constraint profiles_perms_chk check (perms is null or perms <@ public.all_perms());
+
+-- перший запуск: до появи ролей усі були рівні — тож усі наявні стають адміністраторами
+update public.profiles
+   set role_id = (select id from public.roles where name = 'Адміністратор')
+ where role_id is null and perms is null
+   and not exists (select 1 from public.profiles p join public.roles r on r.id = p.role_id
+                    where 'admin' = any(coalesce(p.perms, r.perms)));
+
+-- права поточного користувача (заблокований — без прав)
+create or replace function public.my_perms()
+returns text[] language sql stable security definer set search_path = public as $$
+  select coalesce((
+    select case when p.active then coalesce(p.perms, r.perms, '{}') else '{}' end
+      from public.profiles p left join public.roles r on r.id = p.role_id
+     where p.id = auth.uid()), '{}')
+$$;
+
+create or replace function public.has_perm(p_perm text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select p_perm = any(x) or 'admin' = any(x) from (select public.my_perms() as x) s
+$$;
+
+create or replace function public.is_active()
+returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce((select active from public.profiles where id = auth.uid()), false)
+$$;
+
+create or replace function public.my_department()
+returns uuid language sql stable security definer set search_path = public as $$
+  select department_id from public.profiles where id = auth.uid()
+$$;
+
+-- чи бачить людина замовлення, що лежить у відділі p_dep
+create or replace function public.can_see_order(p_dep uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.has_perm('orders.view')
+     and (public.has_perm('orders.all') or p_dep is not distinct from public.my_department())
+$$;
+
+create or replace function public.can_see_order_id(p_order uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce((select public.can_see_order(department_id) from public.orders where id = p_order), false)
+$$;
+
+create or replace function public.perm_label(p_perm text)
+returns text language sql immutable as $$
+  select case p_perm
+    when 'stock.view'    then 'переглядати склад'
+    when 'stock.edit'    then 'змінювати позиції складу'
+    when 'stock.delete'  then 'видаляти позиції складу'
+    when 'ops.view'      then 'переглядати журнал'
+    when 'ops.edit'      then 'проводити прихід і видаток'
+    when 'ops.delete'    then 'видаляти операції'
+    when 'kits.view'     then 'переглядати комплекти'
+    when 'kits.edit'     then 'змінювати комплекти'
+    when 'kits.delete'   then 'видаляти комплекти'
+    when 'orders.view'   then 'переглядати замовлення'
+    when 'orders.edit'   then 'змінювати замовлення'
+    when 'orders.delete' then 'видаляти замовлення'
+    when 'orders.all'    then 'бачити замовлення всіх відділів'
+    when 'admin'         then 'адміністрування'
+    else p_perm end
+$$;
+
+-- перевірка на початку кожної функції, що щось змінює
+create or replace function public.require(p_perm text)
+returns void language plpgsql stable security definer set search_path = public as $$
+begin
+  if auth.uid() is null then
+    raise exception 'Потрібно увійти';
+  end if;
+  if not public.has_perm(p_perm) then
+    raise exception 'Немає права %', public.perm_label(p_perm);
+  end if;
+end $$;
+
+-- хоч один активний адміністратор має лишитися завжди
+create or replace function public.assert_admin_left()
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if exists (select 1 from public.profiles) and not exists (
+       select 1 from public.profiles p left join public.roles r on r.id = p.role_id
+        where p.active and 'admin' = any(coalesce(p.perms, r.perms, '{}'))) then
+    raise exception 'Має лишитися хоча б один активний адміністратор';
+  end if;
+end $$;
+
+create or replace function public.roles_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  perform public.assert_admin_left();
+  return null;
+end $$;
+drop trigger if exists roles_guard on public.roles;
+create trigger roles_guard after update or delete on public.roles
+  for each statement execute function public.roles_guard();
+
+-- ---------------------------------------------------------------------
+--  Керування користувачами — лише адміністратор
+-- ---------------------------------------------------------------------
+create or replace function public.admin_users()
+returns table (id uuid, email text, display_name text, role_id uuid, department_id uuid,
+               perms text[], active boolean, last_sign_in_at timestamptz, created_at timestamptz)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  perform public.require('admin');
+  return query
+    select p.id, u.email::text, p.display_name, p.role_id, p.department_id, p.perms, p.active,
+           u.last_sign_in_at, u.created_at
+      from public.profiles p join auth.users u on u.id = p.id
+     order by lower(p.display_name);
+end $$;
+
+create or replace function public.admin_create_user(
+  p_email text, p_password text, p_name text default '', p_role uuid default null, p_department uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v       uuid := gen_random_uuid();
+  v_email text := lower(trim(coalesce(p_email, '')));
+begin
+  perform public.require('admin');
+  if v_email !~ '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$' then
+    raise exception 'Неправильний email';
+  end if;
+  if length(coalesce(p_password, '')) < 6 then
+    raise exception 'Пароль — мінімум 6 символів';
+  end if;
+  if exists (select 1 from auth.users where lower(email) = v_email) then
+    raise exception 'Користувач з таким email уже є';
+  end if;
+  insert into auth.users (instance_id, id, aud, role, email, encrypted_password, email_confirmed_at,
+                          raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
+                          confirmation_token, email_change, email_change_token_new, recovery_token)
+  values ('00000000-0000-0000-0000-000000000000', v, 'authenticated', 'authenticated', v_email,
+          extensions.crypt(p_password, extensions.gen_salt('bf')), now(),
+          '{"provider":"email","providers":["email"]}', '{}', now(), now(), '', '', '', '');
+  insert into auth.identities (id, user_id, provider_id, identity_data, provider, last_sign_in_at, created_at, updated_at)
+  values (gen_random_uuid(), v, v::text,
+          jsonb_build_object('sub', v::text, 'email', v_email, 'email_verified', true),
+          'email', now(), now(), now());
+  -- профіль створив тригер; доводимо до потрібного вигляду
+  update public.profiles
+     set display_name  = coalesce(nullif(trim(p_name), ''), split_part(v_email, '@', 1)),
+         role_id       = p_role,
+         department_id = p_department
+   where id = v;
+  return v;
+end $$;
+
+create or replace function public.admin_update_user(
+  p_user uuid, p_name text, p_role uuid, p_department uuid, p_perms text[], p_active boolean
+) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public.require('admin');
+  if p_user = auth.uid() and not p_active then
+    raise exception 'Не можна заблокувати самого себе';
+  end if;
+  if p_perms is not null and not (p_perms <@ public.all_perms()) then
+    raise exception 'Невідоме право';
+  end if;
+  update public.profiles
+     set display_name  = coalesce(nullif(trim(p_name), ''), display_name),
+         role_id       = p_role,
+         department_id = p_department,
+         perms         = p_perms,
+         active        = p_active
+   where id = p_user;
+  if not found then
+    raise exception 'Користувача не знайдено';
+  end if;
+  if p_user = auth.uid() and not public.has_perm('admin') then
+    raise exception 'Не можна забрати права адміністратора в самого себе';
+  end if;
+  perform public.assert_admin_left();
+  -- заблокований не зможе й увійти
+  update auth.users set banned_until = case when p_active then null else 'infinity'::timestamptz end
+   where id = p_user;
+end $$;
+
+create or replace function public.admin_set_password(p_user uuid, p_password text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  perform public.require('admin');
+  if length(coalesce(p_password, '')) < 6 then
+    raise exception 'Пароль — мінімум 6 символів';
+  end if;
+  update auth.users set encrypted_password = extensions.crypt(p_password, extensions.gen_salt('bf')), updated_at = now()
+   where id = p_user;
+  if not found then
+    raise exception 'Користувача не знайдено';
+  end if;
+end $$;
+
+-- журнал і замовлення лишаються: у них автор просто стає «—»
+create or replace function public.admin_delete_user(p_user uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  perform public.require('admin');
+  if p_user = auth.uid() then
+    raise exception 'Не можна видалити самого себе';
+  end if;
+  delete from auth.users where id = p_user;
+  if not found then
+    raise exception 'Користувача не знайдено';
+  end if;
+  perform public.assert_admin_left();
+end $$;
+
+-- свій відділ людина обирає сама лише коли бачить усі відділи; інакше його призначає адміністратор
+create or replace function public.set_my_department(p_dep uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then
+    raise exception 'Потрібно увійти';
+  end if;
+  if not public.has_perm('orders.all') then
+    raise exception 'Відділ вам призначає адміністратор';
+  end if;
+  update public.profiles set department_id = p_dep where id = auth.uid();
+end $$;
+
+-- ---------------------------------------------------------------------
+--  Доступ за правами (has_perm). Анонім і заблокований не бачать нічого.
+--  Читати довідники (позиції, залишки, журнал) може кожен активний — назви
+--  потрібні всюди; розділи без права перегляду застосунок просто не показує.
+--  Замовлення — лише свого відділу, якщо немає orders.all.
 -- ---------------------------------------------------------------------
 alter table public.profiles       enable row level security;
 alter table public.items          enable row level security;
@@ -667,61 +925,114 @@ alter table public.order_tasks    enable row level security;
 alter table public.order_parts    enable row level security;
 alter table public.order_events   enable row level security;
 
+alter table public.roles enable row level security;
+
 drop policy if exists profiles_read  on public.profiles;
 drop policy if exists profiles_write on public.profiles;
 drop policy if exists profiles_upd   on public.profiles;
-create policy profiles_read  on public.profiles for select to authenticated using (true);
-create policy profiles_write on public.profiles for insert to authenticated with check (id = auth.uid());
-create policy profiles_upd   on public.profiles for update to authenticated using (id = auth.uid()) with check (id = auth.uid());
+create policy profiles_read on public.profiles for select to authenticated using ((select public.is_active()));
+create policy profiles_upd  on public.profiles for update to authenticated using (id = auth.uid()) with check (id = auth.uid());
 
-drop policy if exists items_all on public.items;
-create policy items_all on public.items for all to authenticated using (true) with check (true);
+drop policy if exists roles_read  on public.roles;
+drop policy if exists roles_admin on public.roles;
+create policy roles_read  on public.roles for select to authenticated using ((select public.is_active()));
+create policy roles_admin on public.roles for all to authenticated
+  using ((select public.has_perm('admin'))) with check ((select public.has_perm('admin')));
 
-drop policy if exists kits_all on public.kits;
-create policy kits_all on public.kits for all to authenticated using (true) with check (true);
+drop policy if exists items_all    on public.items;
+drop policy if exists items_read   on public.items;
+drop policy if exists items_insert on public.items;
+drop policy if exists items_update on public.items;
+drop policy if exists items_delete on public.items;
+create policy items_read   on public.items for select to authenticated using ((select public.is_active()));
+create policy items_insert on public.items for insert to authenticated with check ((select public.has_perm('stock.edit')));
+create policy items_update on public.items for update to authenticated
+  using ((select public.has_perm('stock.edit'))) with check ((select public.has_perm('stock.edit')));
+create policy items_delete on public.items for delete to authenticated using ((select public.has_perm('stock.delete')));
 
-drop policy if exists kit_components_all on public.kit_components;
-create policy kit_components_all on public.kit_components for all to authenticated using (true) with check (true);
+drop policy if exists kits_all    on public.kits;
+drop policy if exists kits_read   on public.kits;
+drop policy if exists kits_insert on public.kits;
+drop policy if exists kits_update on public.kits;
+drop policy if exists kits_delete on public.kits;
+create policy kits_read   on public.kits for select to authenticated using ((select public.is_active()));
+create policy kits_insert on public.kits for insert to authenticated with check ((select public.has_perm('kits.edit')));
+create policy kits_update on public.kits for update to authenticated
+  using ((select public.has_perm('kits.edit'))) with check ((select public.has_perm('kits.edit')));
+create policy kits_delete on public.kits for delete to authenticated using ((select public.has_perm('kits.delete')));
+
+drop policy if exists kit_components_all   on public.kit_components;
+drop policy if exists kit_components_read  on public.kit_components;
+drop policy if exists kit_components_write on public.kit_components;
+create policy kit_components_read  on public.kit_components for select to authenticated using ((select public.is_active()));
+create policy kit_components_write on public.kit_components for all to authenticated
+  using ((select public.has_perm('kits.edit'))) with check ((select public.has_perm('kits.edit')));
 
 drop policy if exists operations_read   on public.operations;
 drop policy if exists operations_insert on public.operations;
 drop policy if exists operations_update on public.operations;
-create policy operations_read   on public.operations for select to authenticated using (true);
-create policy operations_insert on public.operations for insert to authenticated with check (created_by = auth.uid());
-create policy operations_update on public.operations for update to authenticated using (true) with check (true);
+create policy operations_read on public.operations for select to authenticated using ((select public.is_active()));
 
 drop policy if exists movements_read   on public.movements;
 drop policy if exists movements_insert on public.movements;
-create policy movements_read   on public.movements for select to authenticated using (true);
-create policy movements_insert on public.movements for insert to authenticated with check (true);
+create policy movements_read on public.movements for select to authenticated using ((select public.is_active()));
 
-drop policy if exists departments_all on public.departments;
-create policy departments_all on public.departments for all to authenticated using (true) with check (true);
+drop policy if exists departments_all   on public.departments;
+drop policy if exists departments_read  on public.departments;
+drop policy if exists departments_admin on public.departments;
+create policy departments_read  on public.departments for select to authenticated using ((select public.is_active()));
+create policy departments_admin on public.departments for all to authenticated
+  using ((select public.has_perm('admin'))) with check ((select public.has_perm('admin')));
 
 drop policy if exists orders_read   on public.orders;
 drop policy if exists orders_insert on public.orders;
 drop policy if exists orders_update on public.orders;
-create policy orders_read   on public.orders for select to authenticated using (true);
-create policy orders_insert on public.orders for insert to authenticated with check (created_by = auth.uid());
-create policy orders_update on public.orders for update to authenticated using (true) with check (true);
+create policy orders_read on public.orders for select to authenticated
+  using ((select public.has_perm('orders.view'))
+         and ((select public.has_perm('orders.all')) or department_id is not distinct from (select public.my_department())));
+create policy orders_insert on public.orders for insert to authenticated
+  with check (created_by = auth.uid() and (select public.has_perm('orders.edit'))
+              and ((select public.has_perm('orders.all')) or department_id is not distinct from (select public.my_department())));
+create policy orders_update on public.orders for update to authenticated
+  using ((select public.has_perm('orders.edit'))
+         and ((select public.has_perm('orders.all')) or department_id is not distinct from (select public.my_department())))
+  with check ((select public.has_perm('orders.edit')));
 
-drop policy if exists order_tasks_all on public.order_tasks;
-create policy order_tasks_all on public.order_tasks for all to authenticated using (true) with check (true);
+drop policy if exists order_tasks_all   on public.order_tasks;
+drop policy if exists order_tasks_read  on public.order_tasks;
+drop policy if exists order_tasks_write on public.order_tasks;
+create policy order_tasks_read  on public.order_tasks for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_tasks_write on public.order_tasks for all to authenticated
+  using ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id))
+  with check ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id));
 
-drop policy if exists order_parts_all on public.order_parts;
-create policy order_parts_all on public.order_parts for all to authenticated using (true) with check (true);
+drop policy if exists order_parts_all   on public.order_parts;
+drop policy if exists order_parts_read  on public.order_parts;
+drop policy if exists order_parts_write on public.order_parts;
+create policy order_parts_read  on public.order_parts for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_parts_write on public.order_parts for all to authenticated
+  using ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id))
+  with check ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id));
 
 -- історію напряму можна лише доповнити власним коментарем; передачі пише move_order
 drop policy if exists order_events_read    on public.order_events;
 drop policy if exists order_events_comment on public.order_events;
-create policy order_events_read    on public.order_events for select to authenticated using (true);
+create policy order_events_read    on public.order_events for select to authenticated using (public.can_see_order_id(order_id));
 create policy order_events_comment on public.order_events for insert to authenticated
-  with check (kind = 'comment' and created_by = auth.uid() and length(trim(text)) > 0);
+  with check (kind = 'comment' and created_by = auth.uid() and length(trim(text)) > 0
+              and (select public.has_perm('orders.edit')) and public.can_see_order_id(order_id));
 
 -- явні дозволи: не залежимо від галочки «Grant API access to new tables automatically»
 grant usage on schema public to authenticated;
-grant select, insert, update, delete on public.items, public.kits, public.kit_components to authenticated;
-grant select, insert, update on public.profiles to authenticated;
+revoke insert, update on public.items, public.profiles from authenticated;
+grant select, delete on public.items to authenticated;
+grant insert (id, name, code, category, unit, location, min_qty, note, photo_path, archived) on public.items to authenticated;
+grant update (name, code, category, unit, location, min_qty, note, photo_path, archived) on public.items to authenticated;
+grant select, insert, update, delete on public.kits, public.kit_components to authenticated;
+grant select on public.profiles to authenticated;
+grant update (display_name) on public.profiles to authenticated;
+revoke all on public.roles from anon;
+grant select, insert, update, delete on public.roles to authenticated;
 grant select on public.operations, public.movements to authenticated;
 revoke all on public.items, public.kits, public.kit_components, public.profiles from anon;
 
@@ -779,6 +1090,33 @@ grant  execute on function public.purge_item(uuid) to authenticated;
 grant  execute on function public.restore_order(uuid) to authenticated;
 grant  execute on function public.purge_order(uuid) to authenticated;
 grant  execute on function public.purge_trash() to authenticated;
+revoke execute on function public.my_perms() from public, anon;
+revoke execute on function public.has_perm(text) from public, anon;
+revoke execute on function public.is_active() from public, anon;
+revoke execute on function public.my_department() from public, anon;
+revoke execute on function public.can_see_order(uuid) from public, anon;
+revoke execute on function public.can_see_order_id(uuid) from public, anon;
+revoke execute on function public.require(text) from public, anon;
+revoke execute on function public.admin_users() from public, anon;
+revoke execute on function public.admin_create_user(text, text, text, uuid, uuid) from public, anon;
+revoke execute on function public.admin_update_user(uuid, text, uuid, uuid, text[], boolean) from public, anon;
+revoke execute on function public.admin_set_password(uuid, text) from public, anon;
+revoke execute on function public.admin_delete_user(uuid) from public, anon;
+revoke execute on function public.set_my_department(uuid) from public, anon;
+grant  execute on function public.my_perms() to authenticated;
+grant  execute on function public.has_perm(text) to authenticated;
+grant  execute on function public.is_active() to authenticated;
+grant  execute on function public.my_department() to authenticated;
+grant  execute on function public.can_see_order(uuid) to authenticated;
+grant  execute on function public.can_see_order_id(uuid) to authenticated;
+grant  execute on function public.require(text) to authenticated;
+grant  execute on function public.admin_users() to authenticated;
+grant  execute on function public.admin_create_user(text, text, text, uuid, uuid) to authenticated;
+grant  execute on function public.admin_update_user(uuid, text, uuid, uuid, text[], boolean) to authenticated;
+grant  execute on function public.admin_set_password(uuid, text) to authenticated;
+grant  execute on function public.admin_delete_user(uuid) to authenticated;
+grant  execute on function public.set_my_department(uuid) to authenticated;
+revoke execute on function public.assert_admin_left() from public, anon, authenticated;
 
 -- ---------------------------------------------------------------------
 --  Фото: приватне сховище «photos», доступ лише увійшлим
@@ -804,7 +1142,7 @@ declare t text;
 begin
   if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
     foreach t in array array['items', 'kits', 'kit_components', 'operations', 'movements',
-                             'departments', 'orders', 'order_tasks', 'order_parts', 'order_events', 'profiles'] loop
+                             'departments', 'orders', 'order_tasks', 'order_parts', 'order_events', 'profiles', 'roles'] loop
       if not exists (select 1 from pg_publication_tables
                       where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = t) then
         execute format('alter publication supabase_realtime add table public.%I', t);

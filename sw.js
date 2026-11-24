@@ -1,10 +1,10 @@
 // Service worker: програма відкривається без мережі (дані — лише з інтернетом).
 // Стратегія «спершу мережа»: оновлення застосунку доходять одразу, кеш — запасний варіант.
-const CACHE = 'sklad-v5';
+const CACHE = 'sklad-v6';
 const SHELL = [
   './', 'index.html', 'app.css', 'manifest.webmanifest',
   'js/app.js', 'js/api.js', 'js/core.js', 'js/util.js', 'js/scanner.js', 'js/config.js',
-  'js/views/stock.js', 'js/views/ops.js', 'js/views/kits.js', 'js/views/inventory.js', 'js/views/more.js', 'js/views/orders.js',
+  'js/views/stock.js', 'js/views/ops.js', 'js/views/kits.js', 'js/views/inventory.js', 'js/views/more.js', 'js/views/orders.js', 'js/views/users.js',
   'vendor/supabase.js', 'vendor/xlsx.full.min.js', 'vendor/qrcode.js', 'vendor/zxing.min.js',
   'icons/icon-192.png', 'icons/icon-512.png',
 ];
