@@ -5,17 +5,23 @@ import { state, go, reloadData, activeItems, isLow, searchItems, hydratePhotos, 
 import { printLabels } from './stock.js';
 import { exportJournal } from './ops.js';
 import { exportOrders } from './orders.js';
+import { pending, outboxBannerText } from '../outbox.js';
+import { lastBackupText } from './settings.js';
 
 export function viewMore(ctx) {
   ctx.header({ title: 'Ще' });
   const me = state.profiles[state.me] || '';
   const low = activeItems().filter(isLow).length;
   const dep = myDepartment();
+  const queued = pending().length;
   ctx.main.innerHTML = `
     ${state.perms.size ? '' : `<div class="card hint">Вам ще не надали прав. Зверніться до адміністратора складу —
       він відкриє потрібні розділи в «Ще → Користувачі».</div>`}
     <div class="menu">
-      ${can('admin') ? `<a href="#/users" class="menu-item"><b>Користувачі та ролі</b><span class="muted">додати людей, права доступу, блокування</span></a>` : ''}
+      ${queued ? `<a href="#/outbox" class="menu-item outbox-item"><b>Черга відправки</b><span class="muted">${esc(outboxBannerText())}</span></a>` : ''}
+      ${can('admin') ? `<a href="#/users" class="menu-item"><b>Користувачі та ролі</b><span class="muted">додати людей, права доступу, блокування</span></a>
+      <a href="#/notifications" class="menu-item"><b>Сповіщення Telegram</b><span class="muted">нові замовлення, передачі, мало на складі, прострочені</span></a>
+      <a href="#/backups" class="menu-item"><b>Резервні копії</b><span class="muted">${isDemo ? 'завантажити копію даних' : esc(lastBackupText(state.settings?.backup_at))}</span></a>` : ''}
       <a href="#/departments" class="menu-item"><b>Відділи</b><span class="muted">${dep ? `мій відділ: ${esc(depName(dep))}` : 'свій відділ ще не вибрано'}</span></a>
       ${can('stock.view') ? '' : '<!--'}<a href="#/reorder" class="menu-item"><b>Дозамовити</b><span class="muted">${low ? `${low} позицій нижче мінімуму` : 'усе в нормі'}</span></a>
 ${can('stock.view') ? '' : '-->'}
@@ -61,11 +67,11 @@ ${can('stock.view') ? '' : '-->'}
 }
 
 export function exportStock() {
-  const rows = [['Назва', 'Код', 'Категорія', 'Місце', 'Одиниця', 'Залишок', 'Мінімум', 'Дозамовити', 'Примітка']];
+  const rows = [['Назва', 'Код', 'Категорія', 'Місце', 'Одиниця', 'Залишок', 'Резерв', 'Мінімум', 'Дозамовити', 'Примітка']];
   for (const i of activeItems()) {
-    rows.push([i.name, i.code || '', i.category, i.location, i.unit, i.qty, i.min_qty || '', isLow(i) ? i.min_qty - i.qty : '', i.note]);
+    rows.push([i.name, i.code || '', i.category, i.location, i.unit, i.qty, i.reserved || '', i.min_qty || '', isLow(i) ? i.min_qty - i.qty : '', i.note]);
   }
-  downloadXlsx(`залишки_${todayIso()}.xlsx`, [{ name: 'Залишки', rows, widths: [36, 16, 16, 16, 8, 10, 9, 11, 30] }]);
+  downloadXlsx(`залишки_${todayIso()}.xlsx`, [{ name: 'Залишки', rows, widths: [36, 16, 16, 16, 8, 10, 8, 9, 11, 30] }]);
 }
 
 // ------------------------------------------------------------------

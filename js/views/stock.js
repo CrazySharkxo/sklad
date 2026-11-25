@@ -3,8 +3,9 @@ import { api, TRASH_DAYS } from '../api.js';
 import { esc, fmtQty, fmtSigned, fmtDate, parseNum, compressImage, toast, confirmDialog, OP_TYPES, qrSvg, labelPayload } from '../util.js';
 import { scanCode } from '../scanner.js';
 import {
-  state, go, reloadData, activeItems, isLow, categories, locations, units, searchItems, findByCode,
+  state, go, reloadData, activeItems, isLow, categories, locations, units, searchItems, findByCode, resolveCode,
   hydratePhotos, thumb, userName, ICON_SCAN, ICON_PLUS, trashRow, bindTrash, trashNote, TRASH_EMPTY, can,
+  reservedOf, freeQty, reservingOrders,
 } from '../core.js';
 
 // пошук і фільтр запамʼятовуються в межах сесії
@@ -70,7 +71,7 @@ export function viewStock(ctx) {
         </div>
         <div class="row-qty${isLow(i) ? ' low' : ''}${i.qty === 0 ? ' zero' : ''}">
           <b>${fmtQty(i.qty)}</b><small>${esc(i.unit)}</small>
-          ${isLow(i) ? `<em>мін ${fmtQty(i.min_qty)}</em>` : ''}
+          ${isLow(i) ? `<em>мін ${fmtQty(i.min_qty)}</em>` : reservedOf(i) ? `<em class="res">вільно ${fmtQty(freeQty(i))}</em>` : ''}
         </div>
       </a>`).join('') + (list.length > shown.length ? `<div class="muted center pad">Показано ${shown.length} з ${list.length} — уточніть пошук</div>` : '');
     hydratePhotos(listEl);
@@ -88,8 +89,9 @@ export function viewStock(ctx) {
   // USB-сканер друкує код + Enter: точний збіг коду відкриває позицію
   q.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
-    const item = findByCode(q.value);
-    if (item) { ui.q = ''; go(`#/item/${item.id}`); }
+    const r = resolveCode(q.value);
+    if (r?.kind === 'item') { ui.q = ''; go(`#/item/${r.item.id}`); }
+    else if (r?.kind === 'unit') { ui.q = ''; go(`#/order/${r.order.id}?unit=${r.unit.id}`); }
   });
   ctx.main.querySelector('#chips').addEventListener('click', (e) => {
     const b = e.target.closest('.chip');
@@ -108,14 +110,16 @@ export function viewStock(ctx) {
   if (!matchMedia('(pointer: coarse)').matches) q.focus();
 }
 
+// скан: позиція → її картка; серійний номер виробу → замовлення з підсвіченим виробом
 export async function scanAndOpen() {
   const code = await scanCode();
   if (!code) return;
-  const item = findByCode(code);
-  if (item) go(`#/item/${item.id}`);
-  else if (await confirmDialog(`Код «${code}» не знайдено. Створити нову позицію з цим кодом?`, { ok: 'Створити' })) {
+  const r = resolveCode(code);
+  if (r?.kind === 'item') go(`#/item/${r.item.id}`);
+  else if (r?.kind === 'unit') go(`#/order/${r.order.id}?unit=${r.unit.id}`);
+  else if (can('stock.edit') && await confirmDialog(`Код «${code}» не знайдено. Створити нову позицію з цим кодом?`, { ok: 'Створити' })) {
     go(`#/item-edit/new?code=${encodeURIComponent(code)}`);
-  }
+  } else if (!can('stock.edit')) toast(`Код «${code}» не знайдено`, 'err');
 }
 
 // ------------------------------------------------------------------
@@ -129,8 +133,11 @@ export async function viewItem(ctx, id) {
     <div class="card item-card${item.photo_path ? ' has-photo' : ''}">
       ${item.photo_path ? `<div class="item-photo">${thumb(item.photo_path, 'photo')}</div>` : ''}
       <div class="item-info">
-        <div class="big-qty${isLow(item) ? ' low' : ''}"><b>${fmtQty(item.qty)}</b> ${esc(item.unit)}</div>
+        <div class="big-qty${isLow(item) ? ' low' : ''}"><b>${fmtQty(item.qty)}</b> ${esc(item.unit)}
+          ${reservedOf(item) ? `<span class="free">· вільно <b>${fmtQty(freeQty(item))}</b></span>` : ''}</div>
         ${isLow(item) ? `<div class="badge warn">Нижче мінімуму (${fmtQty(item.min_qty)}) — дозамовити ${fmtQty(item.min_qty - item.qty)}</div>` : ''}
+        ${reservedOf(item) ? `<div class="badge res">Зарезервовано під замовлення: ${fmtQty(reservedOf(item))} ${esc(item.unit)} —
+          ${reservingOrders(id).map((o) => `<a href="#/order/${o.id}">№${o.number}</a>`).join(', ')}</div>` : ''}
         ${item.archived ? '<div class="badge">В архіві</div>' : ''}
         ${trashed ? `<div class="badge warn">У кошику: ${trashNote(item.deleted_at, item.deleted_by)}</div>` : ''}
         <dl class="props">

@@ -1,8 +1,8 @@
 // Інвентаризація: вводимо фактичну кількість, програма проводить різницю
-import { api } from '../api.js';
 import { esc, fmtQty, fmtSigned, parseNum, round, toast, confirmDialog } from '../util.js';
 import { state, reloadData, activeItems, categories, locations, searchItems, findByCode, ICON_SCAN } from '../core.js';
 import { scanCode } from '../scanner.js';
+import { postOrQueue } from '../outbox.js';
 
 // чернетка підрахунку живе в браузері, щоб довгий перерахунок пережив перезавантаження
 const DRAFT = 'sklad-inventory-draft';
@@ -124,11 +124,11 @@ export function viewInventory(ctx) {
     const diffs = lines.filter((l) => round(l.qty - state.byId.get(l.item_id).qty) !== 0).length;
     if (!await confirmDialog(`Провести інвентаризацію: ${lines.length} позицій, розбіжностей ${diffs}?`, { ok: 'Провести' })) return;
     try {
-      await api.postOperation({ type: 'adjust', lines, comment: 'Інвентаризація' });
+      const r = await postOrQueue({ type: 'adjust', lines, comment: 'Інвентаризація' });
       localStorage.removeItem(DRAFT);
       for (const k of Object.keys(draft)) delete draft[k];
-      await reloadData();
-      toast('Інвентаризацію проведено');
+      if (r.queued) toast('Немає інтернету — збережено на пристрої, відправиться з появою мережі', 'ok', 6000);
+      else { await reloadData(); toast('Інвентаризацію проведено'); }
       render();
     } catch (err) { toast(err.message, 'err', 6000); }
   });

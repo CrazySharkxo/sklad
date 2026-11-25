@@ -2,6 +2,7 @@
 import { api } from '../api.js';
 import { esc, fmtQty, parseNum, round, toast, confirmDialog, compressImage } from '../util.js';
 import { state, go, reloadData, itemPicker, kitCapacity, hydratePhotos, thumb, ICON_PLUS, can } from '../core.js';
+import { postOrQueue } from '../outbox.js';
 
 export function viewKits(ctx) {
   ctx.header({ title: 'Комплекти', actions: can('kits.edit') ? `<a class="btn primary sm" href="#/kit-edit/new">${ICON_PLUS}<span>Комплект</span></a>` : '' });
@@ -68,9 +69,9 @@ export function viewKit(ctx, id) {
     const btn = form.querySelector('button');
     btn.disabled = true;
     try {
-      await api.postOperation({ type: 'kit_out', kit_id: id, kit_qty: n, counterparty: form.counterparty.value.trim() });
-      await reloadData();
-      toast('Комплекти видано');
+      const r = await postOrQueue({ type: 'kit_out', kit_id: id, kit_qty: n, counterparty: form.counterparty.value.trim() });
+      if (r.queued) toast('Немає інтернету — збережено на пристрої, відправиться з появою мережі', 'ok', 6000);
+      else { await reloadData(); toast('Комплекти видано'); }
       viewKit(ctx, id);
     } catch (err) {
       toast(err.message, 'err', 6000);

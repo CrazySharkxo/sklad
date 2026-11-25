@@ -6,7 +6,9 @@ const CACHE = `sklad-${self.APP_VERSION}`;
 const SHELL = [
   './', 'index.html', 'app.css', 'manifest.webmanifest', 'version.js',
   'js/app.js', 'js/api.js', 'js/core.js', 'js/util.js', 'js/scanner.js', 'js/config.js',
+  'js/print.js', 'js/outbox.js', 'js/backup.js',
   'js/views/stock.js', 'js/views/ops.js', 'js/views/kits.js', 'js/views/inventory.js', 'js/views/more.js', 'js/views/orders.js', 'js/views/users.js',
+  'js/views/settings.js',
   'vendor/supabase.js', 'vendor/xlsx.full.min.js', 'vendor/qrcode.js', 'vendor/zxing.min.js',
   'icons/icon-192.png', 'icons/icon-512.png',
 ];

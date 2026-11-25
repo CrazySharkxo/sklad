@@ -204,16 +204,329 @@ create unique index items_code_uq
   on public.items (lower(code)) where code is not null and code <> '' and deleted_at is null;
 
 -- ---------------------------------------------------------------------
+--  Серійні номери готових виробів: у замовленні на N штук — N виробів,
+--  кожен зі своїм номером (друкується на QR-етикетці, скан відкриває
+--  замовлення), відмітками «зібрано» і «протестовано».
+-- ---------------------------------------------------------------------
+create table if not exists public.order_units (
+  id            uuid primary key default gen_random_uuid(),
+  order_id      uuid not null references public.orders(id) on delete cascade,
+  position      int not null default 0,
+  serial        text not null check (length(trim(serial)) > 0),
+  assembled     boolean not null default false,
+  assembled_by  uuid references auth.users(id) on delete set null,
+  assembled_at  timestamptz,
+  tested        boolean not null default false,
+  tested_by     uuid references auth.users(id) on delete set null,
+  tested_at     timestamptz,
+  note          text not null default '',
+  created_at    timestamptz not null default now()
+);
+create index if not exists order_units_order_idx on public.order_units (order_id, position);
+create unique index if not exists order_units_serial_uq on public.order_units (lower(trim(serial)));
+
+-- хто й коли зібрав / протестував — ставить сервер
+create or replace function public.order_unit_stamp()
+returns trigger language plpgsql as $$
+begin
+  new.serial := trim(new.serial);
+  if not new.assembled then
+    new.assembled_by := null; new.assembled_at := null;
+  elsif tg_op = 'INSERT' or not old.assembled then
+    new.assembled_by := auth.uid(); new.assembled_at := now();
+  else
+    new.assembled_by := old.assembled_by; new.assembled_at := old.assembled_at;
+  end if;
+  if not new.tested then
+    new.tested_by := null; new.tested_at := null;
+  elsif tg_op = 'INSERT' or not old.tested then
+    new.tested_by := auth.uid(); new.tested_at := now();
+  else
+    new.tested_by := old.tested_by; new.tested_at := old.tested_at;
+  end if;
+  return new;
+end $$;
+drop trigger if exists order_units_stamp on public.order_units;
+create trigger order_units_stamp before insert or update on public.order_units
+  for each row execute function public.order_unit_stamp();
+
+-- ---------------------------------------------------------------------
+--  Резерв: скільки кожної позиції обіцяно активним замовленням (деталі
+--  замовлення мінус уже видане під нього). Вільний залишок = qty − reserved.
+--  Представлення працює від імені власника, тож рахує всі відділи, навіть
+--  для людини, яка бачить лише свій.
+-- ---------------------------------------------------------------------
+create or replace view public.reserved_qty as
+select p.item_id,
+       sum(greatest(0, p.qty - coalesce((
+         select -sum(m.qty)
+           from public.movements m
+           join public.operations op on op.id = m.operation_id
+          where op.order_id = p.order_id and op.type = 'out' and op.cancelled_at is null and m.item_id = p.item_id), 0)))::numeric as reserved
+  from public.order_parts p
+  join public.orders o on o.id = p.order_id
+ where o.deleted_at is null and o.status in ('new', 'in_work', 'testing', 'rework', 'done')
+ group by p.item_id;
+
+-- ---------------------------------------------------------------------
 --  Залишки рахуються, а не зберігаються: сума руху без скасованих операцій
 -- ---------------------------------------------------------------------
 drop view if exists public.stock;
 create view public.stock with (security_invoker = true) as
 select i.*,
-       coalesce(sum(m.qty) filter (where o.cancelled_at is null), 0)::numeric as qty
+       coalesce(sum(m.qty) filter (where o.cancelled_at is null), 0)::numeric as qty,
+       coalesce(r.reserved, 0)::numeric as reserved
 from public.items i
-left join public.movements  m on m.item_id = i.id
-left join public.operations o on o.id = m.operation_id
-group by i.id;
+left join public.movements    m on m.item_id = i.id
+left join public.operations   o on o.id = m.operation_id
+left join public.reserved_qty r on r.item_id = i.id
+group by i.id, r.reserved;
+
+-- ---------------------------------------------------------------------
+--  Налаштування програми (один рядок) і сповіщення в Telegram.
+--  Токен бота читається лише функціями; застосунок бачить його маску.
+--  Відправка — через розширення pg_net (є в Supabase); без нього
+--  функції мовчки нічого не надсилають, решта програми працює.
+-- ---------------------------------------------------------------------
+create table if not exists public.app_settings (
+  id               int primary key default 1 check (id = 1),
+  org_name         text not null default '',      -- шапка друкованих документів
+  app_url          text not null default '',      -- адреса програми для посилань у повідомленнях
+  tg_token         text not null default '',      -- токен бота від @BotFather
+  tg_chat          text not null default '',      -- головний чат/група
+  tg_orders        boolean not null default true, -- нові замовлення, передачі, доопрацювання
+  tg_low           boolean not null default true, -- позиція впала нижче мінімуму
+  tg_overdue       boolean not null default true, -- щоденний список прострочених
+  overdue_sent_on  date,
+  backup_at        timestamptz,
+  updated_at       timestamptz not null default now()
+);
+insert into public.app_settings (id) values (1) on conflict (id) do nothing;
+
+-- у відділу може бути свій чат: туди йдуть замовлення, що приходять у цей відділ
+alter table public.departments add column if not exists tg_chat text not null default '';
+
+do $$ begin
+  create extension if not exists pg_net;
+exception when others then
+  raise notice 'pg_net недоступне (%): сповіщення Telegram не надсилатимуться', sqlerrm;
+end $$;
+
+create or replace function public.tg_esc(p text)
+returns text language sql immutable as $$
+  select replace(replace(replace(coalesce(p, ''), '&', '&amp;'), '<', '&lt;'), '>', '&gt;')
+$$;
+
+create or replace function public.order_status_label(p text)
+returns text language sql immutable as $$
+  select case p
+    when 'new' then 'Нове' when 'in_work' then 'В роботі' when 'testing' then 'На тестуванні'
+    when 'rework' then 'На доопрацюванні' when 'done' then 'Готово' when 'shipped' then 'Відвантажено'
+    when 'cancelled' then 'Скасовано' else coalesce(p, '') end
+$$;
+
+-- надіслати повідомлення; повертає id запиту pg_net або null, якщо нікуди/нічим
+create or replace function public.tg_send(p_chat text, p_text text)
+returns bigint language plpgsql security definer set search_path = public as $$
+declare
+  s    public.app_settings%rowtype;
+  v_id bigint;
+begin
+  select * into s from public.app_settings where id = 1;
+  if s.tg_token = '' or coalesce(trim(p_chat), '') = '' or coalesce(p_text, '') = '' then
+    return null;
+  end if;
+  if not exists (select 1 from pg_extension where extname = 'pg_net') then
+    return null;
+  end if;
+  execute format('select net.http_post(url := %L, body := %L::jsonb, headers := %L::jsonb)',
+                 'https://api.telegram.org/bot' || s.tg_token || '/sendMessage',
+                 jsonb_build_object('chat_id', trim(p_chat), 'text', p_text, 'parse_mode', 'HTML',
+                                    'disable_web_page_preview', true)::text,
+                 '{"Content-Type":"application/json"}')
+    into v_id;
+  return v_id;
+exception when others then
+  raise warning 'tg_send: %', sqlerrm;
+  return null;
+end $$;
+
+-- у головний чат і, якщо в відділу свій чат — ще й туди
+create or replace function public.tg_notify(p_text text, p_department uuid default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_main text;
+  v_dep  text;
+begin
+  select tg_chat into v_main from public.app_settings where id = 1;
+  if p_department is not null then
+    select tg_chat into v_dep from public.departments where id = p_department;
+  end if;
+  perform public.tg_send(v_main, p_text);
+  if coalesce(v_dep, '') <> '' and v_dep is distinct from v_main then
+    perform public.tg_send(v_dep, p_text);
+  end if;
+end $$;
+
+create or replace function public.order_link(p_id uuid)
+returns text language sql stable security definer set search_path = public as $$
+  select case when app_url <> '' then E'\n' || rtrim(app_url, '/') || '/#/order/' || p_id::text else '' end
+    from public.app_settings where id = 1
+$$;
+
+-- подія в історії замовлення → повідомлення
+create or replace function public.notify_order_event()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  s     public.app_settings%rowtype;
+  o     public.orders%rowtype;
+  v_who text;
+  v_txt text;
+  v_dep text;
+begin
+  select * into s from public.app_settings where id = 1;
+  if not s.tg_orders or s.tg_token = '' or new.kind = 'comment' then
+    return null;
+  end if;
+  select * into o from public.orders where id = new.order_id;
+  select display_name into v_who from public.profiles where id = new.created_by;
+  v_who := coalesce(nullif(v_who, ''), '—');
+  select name into v_dep from public.departments where id = new.to_department;
+  v_dep := coalesce(v_dep, 'без відділу');
+
+  if new.kind = 'created' then
+    v_txt := format(E'🆕 <b>Замовлення №%s</b> «%s»%s\n', o.number, public.tg_esc(o.title),
+                    case when o.qty <> 1 then ' × ' || trim_scale(o.qty) else '' end)
+          || case when o.customer <> '' then '👤 ' || public.tg_esc(o.customer) || E'\n' else '' end
+          || case when o.due_date is not null then '📅 термін ' || to_char(o.due_date, 'DD.MM.YYYY') || E'\n' else '' end
+          || format('➡️ %s · прийняв: %s', public.tg_esc(v_dep), public.tg_esc(v_who));
+  else
+    v_txt := format('%s <b>№%s</b> «%s»: ',
+                    case new.to_status when 'rework' then '🔁' when 'testing' then '🧪' when 'done' then '✅'
+                                       when 'shipped' then '📦' when 'cancelled' then '❌' when 'in_work' then '🔧' else '➡️' end,
+                    o.number, public.tg_esc(o.title))
+          || case when new.from_status is distinct from new.to_status
+                  then public.order_status_label(new.from_status) || ' → <b>' || public.order_status_label(new.to_status) || '</b>'
+                  else 'передано' end
+          || case when new.from_department is distinct from new.to_department then E'\n➡️ ' || public.tg_esc(v_dep) else '' end
+          || E'\n' || public.tg_esc(v_who)
+          || case when new.text <> '' then ': ' || public.tg_esc(new.text) else '' end;
+  end if;
+  perform public.tg_notify(v_txt || public.order_link(o.id), new.to_department);
+  return null;
+exception when others then
+  raise warning 'notify_order_event: %', sqlerrm;
+  return null;
+end $$;
+drop trigger if exists order_events_notify on public.order_events;
+create trigger order_events_notify after insert on public.order_events
+  for each row execute function public.notify_order_event();
+
+-- прострочені замовлення — раз на добу (викликає застосунок після входу, і pg_cron, якщо є)
+create or replace function public.notify_overdue()
+returns int language plpgsql security definer set search_path = public as $$
+declare
+  s     public.app_settings%rowtype;
+  v_txt text := '';
+  v_n   int := 0;
+  r     record;
+begin
+  if not public.is_active() then
+    raise exception 'Немає доступу';
+  end if;
+  select * into s from public.app_settings where id = 1 for update;
+  if not s.tg_overdue or s.tg_token = '' or s.overdue_sent_on is not distinct from current_date then
+    return 0;
+  end if;
+  for r in
+    select o.number, o.title, o.due_date, d.name as dep
+      from public.orders o left join public.departments d on d.id = o.department_id
+     where o.deleted_at is null and o.status in ('new', 'in_work', 'testing', 'rework', 'done')
+       and o.due_date < current_date
+     order by o.due_date, o.number
+  loop
+    v_n := v_n + 1;
+    if v_n <= 30 then
+      v_txt := v_txt || format(E'\n№%s «%s» — до %s (%s дн.)%s', r.number, public.tg_esc(r.title),
+                               to_char(r.due_date, 'DD.MM'), current_date - r.due_date,
+                               case when r.dep is not null then ' · ' || public.tg_esc(r.dep) else '' end);
+    end if;
+  end loop;
+  update public.app_settings set overdue_sent_on = current_date where id = 1;
+  if v_n = 0 then
+    return 0;
+  end if;
+  perform public.tg_send(s.tg_chat, format('⏰ <b>Прострочені замовлення: %s</b>', v_n) || v_txt
+                                    || case when v_n > 30 then E'\n…' else '' end);
+  return v_n;
+end $$;
+
+do $$ begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') then
+    execute $c$ select cron.unschedule(jobid) from cron.job where jobname = 'sklad-overdue' $c$;
+    execute $c$ select cron.schedule('sklad-overdue', '0 6 * * *', 'select public.notify_overdue()') $c$;
+  end if;
+exception when others then
+  raise notice 'pg_cron: % — прострочені перевіряє застосунок при вході', sqlerrm;
+end $$;
+
+-- налаштування для адміністратора (токен — лише маскою) і їх збереження
+create or replace function public.admin_settings()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare s public.app_settings%rowtype;
+begin
+  perform public.require('admin');
+  select * into s from public.app_settings where id = 1;
+  return jsonb_build_object(
+    'org_name', s.org_name, 'app_url', s.app_url, 'tg_chat', s.tg_chat,
+    'tg_orders', s.tg_orders, 'tg_low', s.tg_low, 'tg_overdue', s.tg_overdue,
+    'tg_token_set', s.tg_token <> '',
+    'tg_token_hint', case when length(s.tg_token) > 6 then '…' || right(s.tg_token, 4) else '' end,
+    'overdue_sent_on', s.overdue_sent_on, 'backup_at', s.backup_at,
+    'pg_net', exists (select 1 from pg_extension where extname = 'pg_net'),
+    'pg_cron', exists (select 1 from pg_extension where extname = 'pg_cron'));
+end $$;
+
+-- p: лише ті ключі, що треба змінити; "tg_token": "" — прибрати токен
+create or replace function public.admin_save_settings(p jsonb)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  perform public.require('admin');
+  update public.app_settings set
+    org_name   = coalesce(trim(p->>'org_name'), org_name),
+    app_url    = coalesce(trim(p->>'app_url'), app_url),
+    tg_token   = case when p ? 'tg_token' then trim(p->>'tg_token') else tg_token end,
+    tg_chat    = coalesce(trim(p->>'tg_chat'), tg_chat),
+    tg_orders  = coalesce((p->>'tg_orders')::boolean, tg_orders),
+    tg_low     = coalesce((p->>'tg_low')::boolean, tg_low),
+    tg_overdue = coalesce((p->>'tg_overdue')::boolean, tg_overdue),
+    backup_at  = coalesce((p->>'backup_at')::timestamptz, backup_at)
+  where id = 1;
+end $$;
+
+-- тестове повідомлення в головний чат: повертає id запиту (null — нема токена/чату/pg_net)
+create or replace function public.tg_test()
+returns bigint language plpgsql security definer set search_path = public as $$
+declare v_chat text;
+begin
+  perform public.require('admin');
+  select tg_chat into v_chat from public.app_settings where id = 1;
+  return public.tg_send(v_chat, '✅ Склад: сповіщення Telegram працюють');
+end $$;
+
+-- результат запиту pg_net (відповідь Telegram), коли вже є
+create or replace function public.tg_result(p_id bigint)
+returns text language plpgsql security definer set search_path = public as $$
+declare v text;
+begin
+  perform public.require('admin');
+  if not exists (select 1 from pg_extension where extname = 'pg_net') then
+    return 'pg_net не ввімкнено';
+  end if;
+  execute 'select coalesce(status_code::text, '''') || '' '' || coalesce(content, error_msg, '''') from net._http_response where id = $1'
+    into v using p_id;
+  return v;
+end $$;
 
 -- поточний залишок однієї позиції (для перевірок у функціях)
 create or replace function public.item_qty(p_item uuid)
@@ -231,10 +544,13 @@ $$;
 --    adjust    — qty = фактична кількість (≥ 0); сервер рахує різницю
 --    kit_out   — p_lines ігнорується, розкладається p_kit_id × p_kit_qty
 --  p_order_id — необовʼязково: операція під замовлення (видача деталей).
+--  p_op_id — id, який придумав клієнт (офлайн-черга): повторна відправка
+--            тієї самої операції не створює дубля, а повертає наявну.
 --  Списання нижче нуля — помилка з назвою позиції.
 -- ---------------------------------------------------------------------
--- стара версія без p_order_id: інакше лишилося б дві функції з одним імʼям
+-- старі версії з іншою кількістю аргументів: інакше лишилося б кілька функцій з одним імʼям
 drop function if exists public.post_operation(text, jsonb, text, text, uuid, numeric);
+drop function if exists public.post_operation(text, jsonb, text, text, uuid, numeric, uuid);
 
 create or replace function public.post_operation(
   p_type          text,
@@ -243,7 +559,8 @@ create or replace function public.post_operation(
   p_counterparty  text default '',
   p_kit_id        uuid default null,
   p_kit_qty       numeric default null,
-  p_order_id      uuid default null
+  p_order_id      uuid default null,
+  p_op_id         uuid default null
 ) returns uuid
 language plpgsql
 set search_path = public
@@ -256,11 +573,21 @@ declare
   v_delta numeric;
   v_name  text;
   v_del   timestamptz;
+  v_min   numeric;
+  v_unit  text;
   v_n     int := 0;
+  v_low   text := '';
+  v_set   public.app_settings%rowtype;
 begin
   perform public.require('ops.edit');
   if p_type not in ('in', 'out', 'adjust', 'kit_out') then
     raise exception 'Невідомий тип операції: %', p_type;
+  end if;
+  if p_op_id is not null then
+    select id into v_op from public.operations where id = p_op_id;
+    if v_op is not null then
+      return v_op;   -- уже проведено (повтор з офлайн-черги)
+    end if;
   end if;
   if p_order_id is not null and not exists (select 1 from public.orders
                                               where id = p_order_id and deleted_at is null and public.can_see_order(department_id)) then
@@ -290,8 +617,8 @@ begin
    where id in (select (e->>'item_id')::uuid from jsonb_array_elements(v_lines) e)
    order by id for update;
 
-  insert into public.operations (type, comment, counterparty, kit_id, kit_qty, order_id)
-  values (p_type, coalesce(p_comment, ''), coalesce(p_counterparty, ''),
+  insert into public.operations (id, type, comment, counterparty, kit_id, kit_qty, order_id)
+  values (coalesce(p_op_id, gen_random_uuid()), p_type, coalesce(p_comment, ''), coalesce(p_counterparty, ''),
           case when p_type = 'kit_out' then p_kit_id end,
           case when p_type = 'kit_out' then p_kit_qty end,
           p_order_id)
@@ -303,7 +630,7 @@ begin
       from jsonb_array_elements(v_lines) e
      group by 1
   loop
-    select name, deleted_at into v_name, v_del from public.items where id = r.item_id;
+    select name, deleted_at, min_qty, unit into v_name, v_del, v_min, v_unit from public.items where id = r.item_id;
     if v_name is null then
       raise exception 'Позицію не знайдено';
     end if;
@@ -329,12 +656,24 @@ begin
       insert into public.movements (operation_id, item_id, qty) values (v_op, r.item_id, v_delta);
       v_n := v_n + 1;
     end if;
+    -- саме цією операцією позиція опустилася нижче мінімуму
+    if v_delta < 0 and v_min > 0 and v_have >= v_min and v_have + v_delta < v_min then
+      v_low := v_low || format(E'\n«%s» — є %s з мін. %s %s', public.tg_esc(v_name),
+                               trim_scale(v_have + v_delta), trim_scale(v_min), public.tg_esc(v_unit));
+    end if;
   end loop;
 
   -- інвентаризація без розбіжностей теж фіксується (як факт перерахунку),
   -- а порожній прихід/видаток — ні
   if v_n = 0 and p_type <> 'adjust' then
     raise exception 'Немає що проводити';
+  end if;
+
+  if v_low <> '' then
+    select * into v_set from public.app_settings where id = 1;
+    if v_set.tg_low then
+      perform public.tg_send(v_set.tg_chat, '⚠️ <b>Мало на складі</b>' || v_low);
+    end if;
   end if;
 
   return v_op;
@@ -487,6 +826,9 @@ create trigger items_touch before update on public.items
   for each row execute function public.touch_updated_at();
 drop trigger if exists orders_touch on public.orders;
 create trigger orders_touch before update on public.orders
+  for each row execute function public.touch_updated_at();
+drop trigger if exists app_settings_touch on public.app_settings;
+create trigger app_settings_touch before update on public.app_settings
   for each row execute function public.touch_updated_at();
 
 -- ---------------------------------------------------------------------
@@ -1014,6 +1356,20 @@ create policy order_parts_write on public.order_parts for all to authenticated
   using ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id))
   with check ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id));
 
+-- вироби (серійні номери) — як чекліст: бачить, хто бачить замовлення; змінює — хто має orders.edit
+alter table public.order_units enable row level security;
+drop policy if exists order_units_read  on public.order_units;
+drop policy if exists order_units_write on public.order_units;
+create policy order_units_read  on public.order_units for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_units_write on public.order_units for all to authenticated
+  using ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id))
+  with check ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id));
+
+-- налаштування: несекретні поля читає кожен активний (шапка документів), змінює — лише адміністратор через функції
+alter table public.app_settings enable row level security;
+drop policy if exists app_settings_read on public.app_settings;
+create policy app_settings_read on public.app_settings for select to authenticated using ((select public.is_active()));
+
 -- історію напряму можна лише доповнити власним коментарем; передачі пише move_order
 drop policy if exists order_events_read    on public.order_events;
 drop policy if exists order_events_comment on public.order_events;
@@ -1052,9 +1408,21 @@ grant insert (id, title, customer, qty, due_date, description, department_id) on
 grant update (title, customer, qty, due_date, description) on public.orders to authenticated;
 grant insert (order_id, kind, text) on public.order_events to authenticated;
 
+-- вироби: відмітки «хто/коли» ставить тригер, напряму їх не записати
+revoke all on public.order_units from anon;
+revoke insert, update on public.order_units from authenticated;
+grant select, delete on public.order_units to authenticated;
+grant insert (id, order_id, position, serial, assembled, tested, note) on public.order_units to authenticated;
+grant update (position, serial, assembled, tested, note) on public.order_units to authenticated;
+
+-- резерв і налаштування: токен бота з таблиці не читається — лише маска з admin_settings()
+revoke all on public.reserved_qty, public.app_settings from anon, authenticated;
+grant select on public.reserved_qty to authenticated;
+grant select (id, org_name, app_url, backup_at, updated_at) on public.app_settings to authenticated;
+
 -- функції працюють від імені власника схеми (обходять revoke вище),
 -- але самі перевіряють auth.uid()
-alter function public.post_operation(text, jsonb, text, text, uuid, numeric, uuid) security definer;
+alter function public.post_operation(text, jsonb, text, text, uuid, numeric, uuid, uuid) security definer;
 alter function public.cancel_operation(uuid) security definer;
 alter function public.move_order(uuid, text, uuid, text) security definer;
 alter function public.delete_order(uuid) security definer;
@@ -1066,7 +1434,7 @@ alter function public.purge_item(uuid) security definer;
 alter function public.restore_order(uuid) security definer;
 alter function public.purge_order(uuid) security definer;
 alter function public.purge_trash() security definer;
-revoke execute on function public.post_operation(text, jsonb, text, text, uuid, numeric, uuid) from public, anon;
+revoke execute on function public.post_operation(text, jsonb, text, text, uuid, numeric, uuid, uuid) from public, anon;
 revoke execute on function public.cancel_operation(uuid) from public, anon;
 revoke execute on function public.move_order(uuid, text, uuid, text) from public, anon;
 revoke execute on function public.delete_order(uuid) from public, anon;
@@ -1078,7 +1446,7 @@ revoke execute on function public.purge_item(uuid) from public, anon;
 revoke execute on function public.restore_order(uuid) from public, anon;
 revoke execute on function public.purge_order(uuid) from public, anon;
 revoke execute on function public.purge_trash() from public, anon;
-grant  execute on function public.post_operation(text, jsonb, text, text, uuid, numeric, uuid) to authenticated;
+grant  execute on function public.post_operation(text, jsonb, text, text, uuid, numeric, uuid, uuid) to authenticated;
 grant  execute on function public.cancel_operation(uuid) to authenticated;
 grant  execute on function public.move_order(uuid, text, uuid, text) to authenticated;
 grant  execute on function public.delete_order(uuid) to authenticated;
@@ -1118,6 +1486,21 @@ grant  execute on function public.admin_delete_user(uuid) to authenticated;
 grant  execute on function public.set_my_department(uuid) to authenticated;
 revoke execute on function public.assert_admin_left() from public, anon, authenticated;
 
+-- сповіщення й налаштування: відправляти вміють лише функції (security definer), з застосунку — лише тест/прострочені
+revoke execute on function public.tg_send(text, text) from public, anon, authenticated;
+revoke execute on function public.tg_notify(text, uuid) from public, anon, authenticated;
+revoke execute on function public.order_link(uuid) from public, anon, authenticated;
+revoke execute on function public.notify_overdue() from public, anon;
+revoke execute on function public.admin_settings() from public, anon;
+revoke execute on function public.admin_save_settings(jsonb) from public, anon;
+revoke execute on function public.tg_test() from public, anon;
+revoke execute on function public.tg_result(bigint) from public, anon;
+grant  execute on function public.notify_overdue() to authenticated;
+grant  execute on function public.admin_settings() to authenticated;
+grant  execute on function public.admin_save_settings(jsonb) to authenticated;
+grant  execute on function public.tg_test() to authenticated;
+grant  execute on function public.tg_result(bigint) to authenticated;
+
 -- ---------------------------------------------------------------------
 --  Фото: приватне сховище «photos», доступ лише увійшлим
 -- ---------------------------------------------------------------------
@@ -1135,6 +1518,53 @@ create policy photos_update on storage.objects for update to authenticated using
 create policy photos_delete on storage.objects for delete to authenticated using (bucket_id = 'photos');
 
 -- ---------------------------------------------------------------------
+--  Резервні копії: приватне сховище «backups», доступ лише адміністратору.
+--  Копію (JSON усіх таблиць + Excel) робить застосунок, коли адміністратор
+--  входить і останній копії більше доби; старші 30 днів він же прибирає.
+-- ---------------------------------------------------------------------
+insert into storage.buckets (id, name, public)
+values ('backups', 'backups', false)
+on conflict (id) do nothing;
+
+drop policy if exists backups_read   on storage.objects;
+drop policy if exists backups_insert on storage.objects;
+drop policy if exists backups_update on storage.objects;
+drop policy if exists backups_delete on storage.objects;
+create policy backups_read   on storage.objects for select to authenticated
+  using (bucket_id = 'backups' and (select public.has_perm('admin')));
+create policy backups_insert on storage.objects for insert to authenticated
+  with check (bucket_id = 'backups' and (select public.has_perm('admin')));
+create policy backups_update on storage.objects for update to authenticated
+  using (bucket_id = 'backups' and (select public.has_perm('admin')));
+create policy backups_delete on storage.objects for delete to authenticated
+  using (bucket_id = 'backups' and (select public.has_perm('admin')));
+
+-- повний знімок даних для резервної копії — лише адміністратору (без токена бота)
+create or replace function public.admin_dump()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform public.require('admin');
+  return jsonb_build_object(
+    'items',          (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.items t),
+    'kits',           (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.kits t),
+    'kit_components', (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.kit_components t),
+    'operations',     (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.operations t),
+    'movements',      (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.movements t),
+    'departments',    (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.departments t),
+    'orders',         (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.orders t),
+    'order_tasks',    (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.order_tasks t),
+    'order_parts',    (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.order_parts t),
+    'order_events',   (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.order_events t),
+    'order_units',    (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.order_units t),
+    'roles',          (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.roles t),
+    'profiles',       (select coalesce(jsonb_agg(to_jsonb(t) || jsonb_build_object('email', u.email)), '[]')
+                         from public.profiles t join auth.users u on u.id = t.id),
+    'settings',       (select to_jsonb(t) - 'tg_token' from public.app_settings t where id = 1));
+end $$;
+revoke execute on function public.admin_dump() from public, anon;
+grant  execute on function public.admin_dump() to authenticated;
+
+-- ---------------------------------------------------------------------
 --  Живе оновлення: зміни з телефону одразу з'являються на ПК
 -- ---------------------------------------------------------------------
 do $$
@@ -1142,7 +1572,8 @@ declare t text;
 begin
   if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
     foreach t in array array['items', 'kits', 'kit_components', 'operations', 'movements',
-                             'departments', 'orders', 'order_tasks', 'order_parts', 'order_events', 'profiles', 'roles'] loop
+                             'departments', 'orders', 'order_tasks', 'order_parts', 'order_events', 'profiles', 'roles',
+                             'order_units', 'app_settings'] loop
       if not exists (select 1 from pg_publication_tables
                       where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = t) then
         execute format('alter publication supabase_realtime add table public.%I', t);

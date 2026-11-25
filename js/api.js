@@ -38,10 +38,17 @@ function normOrder(o) {
     qty: Number(o.qty),
     tasks: (o.order_tasks || o.tasks || []).slice().sort((a, b) => a.position - b.position),
     parts: (o.order_parts || o.parts || []).map((p) => ({ item_id: p.item_id, qty: Number(p.qty) })),
+    units: (o.order_units || o.units || []).slice().sort((a, b) => a.position - b.position || a.serial.localeCompare(b.serial)),
     order_tasks: undefined,
     order_parts: undefined,
+    order_units: undefined,
   };
 }
+
+// серійний номер виробу за замовчуванням: 0012-03 (№ замовлення — порядковий)
+export const defaultSerial = (orderNumber, n) => `${String(orderNumber).padStart(4, '0')}-${String(n).padStart(2, '0')}`;
+
+const UNIT_FIELDS = ['position', 'serial', 'assembled', 'tested', 'note'];
 
 // скільки кожної позиції вже видано під замовлення (без скасованих операцій)
 function issuedMap(ops) {
@@ -58,6 +65,7 @@ function friendly(error) {
   if (error?.code === '23505' && /departments/.test(msg)) return new Error('Такий відділ уже є');
   if (error?.code === '23505' && /roles/.test(msg)) return new Error('Така роль уже є');
   if (error?.code === '42501' || /row-level security/i.test(msg)) return new Error('Немає права на цю дію — зверніться до адміністратора');
+  if (error?.code === '23505' && /order_units/.test(msg)) return new Error('Такий серійний номер уже є в іншому виробі');
   if (error?.code === '23505') return new Error('Такий код уже є в іншої позиції');
   if (error?.code === '23503' && /departments|department_id/.test(msg)) return new Error('У відділі є замовлення — його можна лише перейменувати');
   if (error?.code === '23503') return new Error('Позиція має історію руху або є в комплекті чи замовленні — її можна лише архівувати');
@@ -152,22 +160,62 @@ class SupaApi {
 
   // ---------- відділи ----------
   async departments() {
-    return await this.q(this.sb.from('departments').select('id, name').order('name'));
+    return await this.q(this.sb.from('departments').select('id, name, tg_chat').order('name'));
   }
-  async saveDepartment({ id, name }) {
+  // tg_chat — необовʼязково: свій Telegram-чат відділу
+  async saveDepartment({ id, name, tg_chat }) {
     const row = { name: String(name || '').trim() };
+    if (tg_chat !== undefined) row.tg_chat = String(tg_chat || '').trim();
     if (id) { await this.q(this.sb.from('departments').update(row).eq('id', id)); return id; }
     return (await this.q(this.sb.from('departments').insert(row).select('id').single())).id;
   }
   async deleteDepartment(id) { await this.q(this.sb.from('departments').delete().eq('id', id)); }
 
+  // ---------- налаштування, сповіщення ----------
+  // несекретна частина — для всіх (шапка документів)
+  async settings() {
+    const rows = await this.q(this.sb.from('app_settings').select('org_name, app_url, backup_at').eq('id', 1));
+    return rows?.[0] || { org_name: '', app_url: '', backup_at: null };
+  }
+  async adminSettings() { return await this.q(this.sb.rpc('admin_settings')); }
+  async saveSettings(patch) { await this.q(this.sb.rpc('admin_save_settings', { p: patch })); }
+  async tgTest() { return await this.q(this.sb.rpc('tg_test')); }
+  async tgResult(id) { return await this.q(this.sb.rpc('tg_result', { p_id: id })); }
+  async notifyOverdue() { return await this.q(this.sb.rpc('notify_overdue')); }
+
+  // ---------- резервні копії (лише адміністратор) ----------
+  async dump() { return await this.q(this.sb.rpc('admin_dump')); }
+  async backups() {
+    const rows = await this.q(this.sb.storage.from('backups').list('', { limit: 1000, sortBy: { column: 'name', order: 'desc' } }));
+    return (rows || []).filter((r) => r.name && !r.name.startsWith('.')).map((r) => ({ name: r.name, size: r.metadata?.size || 0, created_at: r.created_at }));
+  }
+  async uploadBackup(name, blob, contentType) {
+    await this.q(this.sb.storage.from('backups').upload(name, blob, { contentType, upsert: true }));
+  }
+  async backupUrl(name) {
+    const { data, error } = await this.sb.storage.from('backups').createSignedUrl(name, 120, { download: true });
+    if (error) throw friendly(error);
+    return data.signedUrl;
+  }
+  async deleteBackups(names) { if (names.length) await this.q(this.sb.storage.from('backups').remove(names)); }
+
   // ---------- замовлення ----------
   async orders() {
     const rows = await this.all(() => this.sb.from('orders')
-      .select('*, order_tasks(id, position, text, done, done_by, done_at), order_parts(item_id, qty)')
+      .select('*, order_tasks(id, position, text, done, done_by, done_at), order_parts(item_id, qty), order_units(*)')
       .order('number', { ascending: false }));
     return rows.map(normOrder);
   }
+  // вироби: додати кілька (rows: [{position, serial}]), змінити один, прибрати
+  async addUnits(orderId, rows) {
+    await this.q(this.sb.from('order_units').insert(rows.map((u) => ({ order_id: orderId, ...pick(u, UNIT_FIELDS), serial: String(u.serial).trim() }))));
+  }
+  async updateUnit(id, patch) {
+    const row = pick(patch, UNIT_FIELDS);
+    if ('serial' in row) row.serial = String(row.serial).trim();
+    await this.q(this.sb.from('order_units').update(row).eq('id', id));
+  }
+  async deleteUnit(id) { await this.q(this.sb.from('order_units').delete().eq('id', id)); }
   // tasks: [{id?, text}] у потрібному порядку; parts: [{item_id, qty}]
   async saveOrder(order, tasks, parts) {
     const row = cleanOrder(order);
@@ -213,7 +261,7 @@ class SupaApi {
   // ---------- позиції ----------
   async items() {
     const rows = await this.all(() => this.sb.from('stock').select('*').order('name'));
-    for (const r of rows) { r.qty = Number(r.qty); r.min_qty = Number(r.min_qty); }
+    for (const r of rows) { r.qty = Number(r.qty); r.min_qty = Number(r.min_qty); r.reserved = Number(r.reserved) || 0; }
     return rows;
   }
   async saveItem(item) {
@@ -276,10 +324,11 @@ class SupaApi {
   async deleteKit(id) { await this.q(this.sb.from('kits').delete().eq('id', id)); }
 
   // ---------- операції ----------
-  async postOperation({ type, lines = [], comment = '', counterparty = '', kit_id = null, kit_qty = null, order_id = null }) {
+  // op_id — id від клієнта (офлайн-черга): повтор тієї ж операції не створює дубля
+  async postOperation({ type, lines = [], comment = '', counterparty = '', kit_id = null, kit_qty = null, order_id = null, op_id = null }) {
     return await this.q(this.sb.rpc('post_operation', {
       p_type: type, p_lines: lines, p_comment: comment, p_counterparty: counterparty,
-      p_kit_id: kit_id, p_kit_qty: kit_qty, p_order_id: order_id,
+      p_kit_id: kit_id, p_kit_qty: kit_qty, p_order_id: order_id, p_op_id: op_id,
     }));
   }
   // «видалити» операцію = покласти в кошик (cancelled_at): залишки рахуються без неї
@@ -363,7 +412,27 @@ class LocalApi {
       d.profileDeps = d.profileDeps || {};
       try { this.save(d); } catch { /* переповнене сховище — побачимо при наступному записі */ }
     }
+    if (!d.order_units) {
+      d.order_units = [];
+      d.settings = { org_name: '', app_url: '', tg_chat: '', tg_orders: true, tg_low: true, tg_overdue: true, backup_at: null };
+      try { this.save(d); } catch { /* */ }
+    }
     return d;
+  }
+  // резерв: деталі активних замовлень мінус уже видане під них
+  reservedOf(d, itemId) {
+    const live = new Set(d.operations.filter((o) => !o.cancelled_at && o.type === 'out' && o.order_id).map((o) => o.id));
+    const opOrder = Object.fromEntries(d.operations.map((o) => [o.id, o.order_id]));
+    let sum = 0;
+    for (const o of d.orders) {
+      if (o.deleted_at || !['new', 'in_work', 'testing', 'rework', 'done'].includes(o.status)) continue;
+      const part = d.order_parts.find((p) => p.order_id === o.id && p.item_id === itemId);
+      if (!part) continue;
+      const issued = d.movements.filter((m) => m.item_id === itemId && live.has(m.operation_id) && opOrder[m.operation_id] === o.id)
+        .reduce((s, m) => s - m.qty, 0);
+      sum += Math.max(0, part.qty - issued);
+    }
+    return round(sum);
   }
   save(d) {
     try {
@@ -470,18 +539,38 @@ class LocalApi {
 
   // ---------- відділи ----------
   async departments() {
-    return this.load().departments.map(({ id, name }) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+    return this.load().departments.map(({ id, name, tg_chat }) => ({ id, name, tg_chat: tg_chat || '' })).sort((a, b) => a.name.localeCompare(b.name, 'uk'));
   }
-  async saveDepartment({ id, name }) {
+  async saveDepartment({ id, name, tg_chat }) {
     const d = this.load();
     const n = String(name || '').trim();
     if (!n) throw new Error('Вкажіть назву відділу');
     if (d.departments.some((x) => x.id !== id && x.name.toLowerCase() === n.toLowerCase())) throw new Error('Такий відділ уже є');
-    if (id) d.departments.find((x) => x.id === id).name = n;
-    else { id = crypto.randomUUID(); d.departments.push({ id, name: n, created_at: new Date().toISOString() }); }
+    if (id) {
+      const dep = d.departments.find((x) => x.id === id);
+      dep.name = n;
+      if (tg_chat !== undefined) dep.tg_chat = String(tg_chat || '').trim();
+    } else { id = crypto.randomUUID(); d.departments.push({ id, name: n, tg_chat: String(tg_chat || '').trim(), created_at: new Date().toISOString() }); }
     this.save(d);
     return id;
   }
+
+  // ---------- налаштування (у демо сповіщення не надсилаються) ----------
+  async settings() { const s = this.load().settings; return { org_name: s.org_name, app_url: s.app_url, backup_at: s.backup_at }; }
+  async adminSettings() {
+    const s = this.load().settings;
+    return { ...s, tg_token_set: !!s.tg_token, tg_token_hint: s.tg_token ? '…' + s.tg_token.slice(-4) : '', pg_net: false, pg_cron: false, overdue_sent_on: null };
+  }
+  async saveSettings(patch) {
+    const d = this.load();
+    for (const k of ['org_name', 'app_url', 'tg_chat', 'tg_token']) if (k in patch) d.settings[k] = String(patch[k] ?? '').trim();
+    for (const k of ['tg_orders', 'tg_low', 'tg_overdue']) if (k in patch) d.settings[k] = !!patch[k];
+    if ('backup_at' in patch) d.settings.backup_at = patch.backup_at;
+    this.save(d);
+  }
+  async tgTest() { throw new Error('У демо-режимі сповіщення не надсилаються — потрібна спільна база'); }
+  async tgResult() { return ''; }
+  async notifyOverdue() { return 0; }
   async deleteDepartment(id) {
     const d = this.load();
     if (d.orders.some((o) => o.department_id === id)) throw new Error('У відділі є замовлення — його можна лише перейменувати');
@@ -501,7 +590,49 @@ class LocalApi {
       ...o,
       tasks: d.order_tasks.filter((t) => t.order_id === o.id),
       parts: d.order_parts.filter((p) => p.order_id === o.id),
+      units: d.order_units.filter((u) => u.order_id === o.id),
     }));
+  }
+  // вироби (серійні номери)
+  checkSerial(d, serial, exceptId) {
+    const s = String(serial || '').trim();
+    if (!s) throw new Error('Серійний номер не може бути порожнім');
+    if (d.order_units.some((u) => u.id !== exceptId && u.serial.toLowerCase() === s.toLowerCase())) throw new Error('Такий серійний номер уже є в іншому виробі');
+    return s;
+  }
+  stampUnit(u, old = {}) {
+    const now = new Date().toISOString();
+    for (const k of ['assembled', 'tested']) {
+      if (!u[k]) { u[`${k}_by`] = null; u[`${k}_at`] = null; }
+      else if (!old[k]) { u[`${k}_by`] = DEMO_USER; u[`${k}_at`] = now; }
+      else { u[`${k}_by`] = old[`${k}_by`]; u[`${k}_at`] = old[`${k}_at`]; }
+    }
+  }
+  async addUnits(orderId, rows) {
+    const d = this.load();
+    if (!d.orders.some((o) => o.id === orderId && !o.deleted_at)) throw new Error('Замовлення не знайдено');
+    for (const r of rows) {
+      const u = { id: crypto.randomUUID(), order_id: orderId, position: r.position || 0, serial: this.checkSerial(d, r.serial),
+        assembled: !!r.assembled, tested: !!r.tested, note: r.note || '', created_at: new Date().toISOString() };
+      this.stampUnit(u);
+      d.order_units.push(u);
+    }
+    this.save(d);
+  }
+  async updateUnit(id, patch) {
+    const d = this.load();
+    const u = d.order_units.find((x) => x.id === id);
+    if (!u) throw new Error('Виріб не знайдено');
+    const old = { ...u };
+    if ('serial' in patch) u.serial = this.checkSerial(d, patch.serial, id);
+    for (const k of ['position', 'note', 'assembled', 'tested']) if (k in patch) u[k] = patch[k];
+    this.stampUnit(u, old);
+    this.save(d);
+  }
+  async deleteUnit(id) {
+    const d = this.load();
+    d.order_units = d.order_units.filter((x) => x.id !== id);
+    this.save(d);
   }
   async saveOrder(order, tasks, parts) {
     const d = this.load();
@@ -567,7 +698,7 @@ class LocalApi {
   dropOrders(d, ids) {
     const gone = new Set(ids);
     d.orders = d.orders.filter((x) => !gone.has(x.id));
-    for (const k of ['order_tasks', 'order_parts', 'order_events']) d[k] = d[k].filter((x) => !gone.has(x.order_id));
+    for (const k of ['order_tasks', 'order_parts', 'order_events', 'order_units']) d[k] = d[k].filter((x) => !gone.has(x.order_id));
     for (const op of d.operations) if (gone.has(op.order_id)) op.order_id = null;
   }
   async addTask(orderId, text, position) {
@@ -597,7 +728,7 @@ class LocalApi {
 
   async items() {
     const d = this.load();
-    return d.items.map((i) => ({ ...i, qty: this.qtyOf(d, i.id) })).sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+    return d.items.map((i) => ({ ...i, qty: this.qtyOf(d, i.id), reserved: this.reservedOf(d, i.id) })).sort((a, b) => a.name.localeCompare(b.name, 'uk'));
   }
   async saveItem(item) {
     const d = this.load();
@@ -696,9 +827,10 @@ class LocalApi {
     this.save(d);
   }
 
-  async postOperation({ type, lines = [], comment = '', counterparty = '', kit_id = null, kit_qty = null, order_id = null }) {
+  async postOperation({ type, lines = [], comment = '', counterparty = '', kit_id = null, kit_qty = null, order_id = null, op_id = null }) {
     const d = this.load();
     if (!['in', 'out', 'adjust', 'kit_out'].includes(type)) throw new Error(`Невідомий тип операції: ${type}`);
+    if (op_id && d.operations.some((o) => o.id === op_id)) return op_id;  // повтор з офлайн-черги
     if (order_id && !d.orders.some((o) => o.id === order_id && !o.deleted_at)) throw new Error('Замовлення не знайдено (можливо, воно в кошику)');
     if (type === 'kit_out') {
       if (!kit_id || !(kit_qty > 0)) throw new Error('Вкажіть комплект і кількість');
@@ -709,7 +841,7 @@ class LocalApi {
     const merged = new Map();
     for (const l of lines) merged.set(l.item_id, round((merged.get(l.item_id) || 0) + Number(l.qty)));
 
-    const opId = crypto.randomUUID();
+    const opId = op_id || crypto.randomUUID();
     const now = new Date().toISOString();
     const moves = [];
     for (const [itemId, qty] of merged) {

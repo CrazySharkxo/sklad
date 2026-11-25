@@ -1,18 +1,19 @@
 // Замовлення: прийом і опис продукту, що зробити (чекліст), деталі зі складу,
 // передача між відділами з історією. Тут же — список відділів.
-import { api, TRASH_DAYS } from '../api.js';
+import { api, TRASH_DAYS, defaultSerial } from '../api.js';
 import {
   esc, fmtQty, fmtDate, parseNum, round, norm, toast, confirmDialog, promptDialog,
   statusTag, ORDER_STATUS, todayIso, downloadXlsx,
 } from '../util.js';
 import {
-  state, go, reloadData, itemPicker, userName, depName, myDepartment, ACTIVE_ORDER, ICON_PLUS,
-  trashRow, bindTrash, TRASH_EMPTY, can,
+  state, go, reloadData, itemPicker, userName, depName, myDepartment, ACTIVE_ORDER, ICON_PLUS, ICON_SCAN,
+  trashRow, bindTrash, TRASH_EMPTY, can, isOverdue, isDueSoon, dueText, reservedOf, freeQty, resolveCode,
 } from '../core.js';
+import { scanCode } from '../scanner.js';
+import { printOrder, printUnitLabels } from '../print.js';
 
 const findOrder = (id) => state.orders.find((o) => o.id === id);
 const doneCount = (o) => o.tasks.filter((t) => t.done).length;
-const isOverdue = (o) => !!o.due_date && ACTIVE_ORDER.includes(o.status) && o.due_date < todayIso();
 const fmtDue = (d) => (d ? fmtDate(`${d}T00:00:00`, false) : '');
 const isActive = (o) => ACTIVE_ORDER.includes(o.status);
 
@@ -22,6 +23,7 @@ const isActive = (o) => ACTIVE_ORDER.includes(o.status);
 const FILTERS = [
   ['mine', 'Мій відділ', (o) => isActive(o) && o.department_id === myDepartment()],
   ['active', 'Усі активні', isActive],
+  ['overdue', 'Прострочені', isOverdue],
   ['testing', 'На тестуванні', (o) => o.status === 'testing'],
   ['rework', 'На доопрацюванні', (o) => o.status === 'rework'],
   ['done', 'Готові', (o) => o.status === 'done'],
@@ -32,36 +34,50 @@ const ui = { q: '', f: null };
 function orderRow(o) {
   const n = doneCount(o);
   const t = o.tasks.length;
-  return `<a class="row order-row" href="#/order/${o.id}">
+  const dueCls = isOverdue(o) ? 'overdue' : isDueSoon(o) ? 'soon' : 'due';
+  return `<a class="row order-row${isOverdue(o) ? ' is-overdue' : ''}" href="#/order/${o.id}">
     <div class="row-main">
       <div class="row-title"><span class="no">№${o.number}</span>${esc(o.title)}${o.qty !== 1 ? ` <span class="muted">× ${fmtQty(o.qty)}</span>` : ''}</div>
       <div class="row-meta">${statusTag(o.status)}${esc(depName(o.department_id))}${o.customer ? ` · ${esc(o.customer)}` : ''}</div>
     </div>
     <div class="row-qty${t && n === t ? ' ok' : ''}">
       ${t ? `<b>${n}/${t}</b><small>пунктів</small>` : ''}
-      ${o.due_date ? `<em class="${isOverdue(o) ? 'overdue' : 'due'}">до ${fmtDue(o.due_date)}</em>` : ''}
+      ${o.due_date ? `<em class="${dueCls}">до ${fmtDue(o.due_date)}${isActive(o) ? ` · ${dueText(o)}` : ''}</em>` : ''}
     </div>
   </a>`;
 }
 
 export function viewOrders(ctx) {
-  ctx.header({ title: 'Замовлення', actions: can('orders.edit') ? `<a class="btn primary sm" href="#/order-edit/new">${ICON_PLUS}<span>Замовлення</span></a>` : '' });
+  ctx.header({
+    title: 'Замовлення',
+    actions: `<button class="icon-btn" id="oscan" title="Сканувати серійний номер" aria-label="Сканувати">${ICON_SCAN}</button>
+      ${can('orders.edit') ? `<a class="btn primary sm" href="#/order-edit/new">${ICON_PLUS}<span>Замовлення</span></a>` : ''}`,
+  });
   if (ui.f === 'trash' && !can('orders.delete')) ui.f = null;
   const mine = myDepartment();
   if (!ui.f) ui.f = mine ? 'mine' : 'active';
   const counts = Object.fromEntries(FILTERS.map(([k, , fn]) => [k, state.orders.filter(fn).length]));
   ctx.main.innerHTML = `
     <div class="toolbar"><div class="search">
-      <input type="search" id="q" placeholder="Пошук: номер, виріб, замовник" value="${esc(ui.q)}" autocomplete="off"></div></div>
-    <div class="chips" id="chips">${FILTERS.map(([k, label]) => `<button class="chip${ui.f === k ? ' on' : ''}" data-f="${k}">${label}${k !== 'archive' && counts[k] ? ` · ${counts[k]}` : ''}</button>`).join('')}
+      <input type="search" id="q" placeholder="Пошук: номер, виріб, замовник, серійний №" value="${esc(ui.q)}" autocomplete="off"></div></div>
+    <div class="chips" id="chips">${FILTERS.filter(([k]) => k !== 'overdue' || counts.overdue || ui.f === 'overdue')
+    .map(([k, label]) => `<button class="chip${ui.f === k ? ' on' : ''}${k === 'overdue' ? ' danger' : ''}" data-f="${k}">${label}${k !== 'archive' && counts[k] ? ` · ${counts[k]}` : ''}</button>`).join('')}
       ${can('orders.delete') && (state.trashOrders.length || ui.f === 'trash') ? `<button class="chip trash-chip${ui.f === 'trash' ? ' on' : ''}" data-f="trash">Кошик${state.trashOrders.length ? ` · ${state.trashOrders.length}` : ''}</button>` : ''}</div>
     <div id="list" class="list"></div>`;
   const listEl = ctx.main.querySelector('#list');
+  ctx.headerEl.querySelector('#oscan')?.addEventListener('click', async () => {
+    const code = await scanCode({ title: 'Сканування серійного номера' });
+    if (!code) return;
+    const r = resolveCode(code);
+    if (r?.kind === 'unit') go(`#/order/${r.order.id}?unit=${r.unit.id}`);
+    else if (r?.kind === 'item') go(`#/item/${r.item.id}`);
+    else toast(`Код «${code}» не знайдено`, 'err');
+  });
 
   const render = () => {
     const words = norm(ui.q).split(/\s+/).filter(Boolean);
     const match = (o) => {
-      const hay = norm(`№${o.number} ${o.number} ${o.title} ${o.customer} ${o.description}`);
+      const hay = norm(`№${o.number} ${o.number} ${o.title} ${o.customer} ${o.description} ${o.units.map((u) => u.serial).join(' ')}`);
       return words.every((w) => hay.includes(w));
     };
     if (ui.f === 'trash') {
@@ -97,7 +113,8 @@ export function viewOrders(ctx) {
       list.sort((a, b) => (a.due_date || '9999').localeCompare(b.due_date || '9999') || b.number - a.number);
     }
     listEl.innerHTML = list.length ? list.map(orderRow).join('')
-      : `<div class="empty-state"><p>${words.length ? 'Нічого не знайдено' : ui.f === 'mine' ? 'На ваш відділ зараз нічого не чекає' : 'Тут порожньо'}</p></div>`;
+      : `<div class="empty-state"><p>${words.length ? 'Нічого не знайдено' : ui.f === 'mine' ? 'На ваш відділ зараз нічого не чекає'
+        : ui.f === 'overdue' ? 'Прострочених замовлень немає' : 'Тут порожньо'}</p></div>`;
   };
   render();
   bindTrash(listEl, {
@@ -214,23 +231,84 @@ const taskRow = (t) => `<label class="task${t.done ? ' done' : ''}">
 function partsHtml(o, issued) {
   let short = 0;
   let left = 0;
+  let contested = 0;
   const rows = o.parts.map((p) => {
     const it = state.byId.get(p.item_id);
     const got = issued[p.item_id] || 0;
     const rest = Math.max(0, round(p.qty - got));
     const have = it?.qty || 0;
+    // вільне для ЦЬОГО замовлення: залишок мінус резерв інших замовлень (свій резерв — це rest)
+    const others = Math.max(0, round(reservedOf(it) - (isActive(o) ? rest : 0)));
+    const free = Math.max(0, round(have - others));
     const lack = rest > 0 && have < rest;
+    const tight = !lack && rest > 0 && free < rest;   // є на складі, але частину обіцяно іншим
     if (rest > 0) left++;
     if (lack) short++;
-    return `<tr class="${lack ? 'bad' : ''}"><td><a href="#/item/${p.item_id}">${esc(it?.name || '?')}</a></td>
+    if (tight) contested++;
+    return `<tr class="${lack ? 'bad' : tight ? 'tight' : ''}"><td><a href="#/item/${p.item_id}">${esc(it?.name || '?')}</a></td>
       <td>${fmtQty(p.qty)} ${esc(it?.unit || '')}</td><td>${got ? fmtQty(got) : '—'}</td>
-      <td>${fmtQty(have)}${lack ? ` <small class="err-text">бракує ${fmtQty(round(rest - have))}</small>` : ''}</td></tr>`;
+      <td>${fmtQty(have)}${lack ? ` <small class="err-text">бракує ${fmtQty(round(rest - have))}</small>`
+    : tight ? ` <small class="warn-text">вільно ${fmtQty(free)} — решта під іншими замовленнями</small>` : ''}</td></tr>`;
   }).join('');
   return `<table class="tbl"><thead><tr><th>Деталь</th><th>потрібно</th><th>видано</th><th>на складі</th></tr></thead><tbody>${rows}</tbody></table>
     <div class="form-actions">${left
-    ? `<span class="muted">${short ? `Бракує на складі: ${short} поз.` : 'Усе потрібне є на складі'}</span><span class="grow"></span>
+    ? `<span class="muted">${short ? `Бракує на складі: ${short} поз.` : contested ? `Є на складі, але ${contested} поз. частково зарезервовано іншими` : 'Усе потрібне є на складі'}</span><span class="grow"></span>
        ${can('ops.edit') ? `<a class="btn out" href="#/op/out?order=${o.id}">Видати зі складу</a>` : ''}`
     : '<span class="pos">Усі деталі видано</span>'}</div>`;
+}
+
+// ------------------------------------------------------------------
+// Вироби (серійні номери)
+// ------------------------------------------------------------------
+const unitRow = (u, hi) => `<div class="unit${hi ? ' hi' : ''}" data-unit="${u.id}">
+  <div class="unit-sn"><b>${esc(u.serial)}</b>${u.note ? `<small class="muted">${esc(u.note)}</small>` : ''}</div>
+  <label class="unit-chk" title="Зібрано"><input type="checkbox" data-k="assembled" ${u.assembled ? 'checked' : ''}${can('orders.edit') ? '' : ' disabled'}>
+    <span>Зібрано${u.assembled ? `<small>${esc(userName(u.assembled_by))} ${fmtDate(u.assembled_at, false)}</small>` : ''}</span></label>
+  <label class="unit-chk" title="Протестовано"><input type="checkbox" data-k="tested" ${u.tested ? 'checked' : ''}${can('orders.edit') ? '' : ' disabled'}>
+    <span>Тест${u.tested ? `<small>${esc(userName(u.tested_by))} ${fmtDate(u.tested_at, false)}</small>` : ''}</span></label>
+  <div class="unit-acts">
+    <button type="button" class="icon-btn" data-ulabel title="Етикетка" aria-label="Етикетка">${ICON_QR}</button>
+    ${can('orders.edit') ? `<button type="button" class="icon-btn" data-uedit title="Змінити номер / примітку" aria-label="Змінити">✎</button>
+    <button type="button" class="icon-btn" data-udel title="Прибрати" aria-label="Прибрати">✕</button>` : ''}
+  </div></div>`;
+const ICON_QR = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z"/></svg>';
+
+function unitsHtml(o, hiId) {
+  const done = o.units.filter((u) => u.tested).length;
+  const missing = Math.max(0, Math.round(o.qty) - o.units.length);
+  return `<h3>Вироби ${o.units.length ? `<span class="count${done === o.units.length ? ' pos' : ''}">${done} з ${o.units.length} протестовано</span>` : ''}</h3>
+    <div class="card" id="units">
+      ${o.units.length ? `<div class="units">${o.units.map((u) => unitRow(u, u.id === hiId)).join('')}</div>`
+    : `<p class="muted">Серійних номерів ще немає.${can('orders.edit') ? ` Створіть їх — по одному на кожен із ${fmtQty(o.qty)} виробів: номер друкується на QR-етикетці, а скан етикетки відкриває це замовлення.` : ''}</p>`}
+      <div class="form-actions">
+        ${o.units.length ? '<button type="button" class="btn ghost sm" data-ulabels>Етикетки на всі</button>' : ''}
+        <span class="grow"></span>
+        ${can('orders.edit') && missing ? `<button type="button" class="btn ghost sm" data-ugen>Створити номери${o.units.length ? ` (ще ${missing})` : ` (${missing})`}</button>` : ''}
+        ${can('orders.edit') ? '<button type="button" class="btn ghost sm" data-uadd>Додати свій номер</button>' : ''}
+      </div>
+    </div>`;
+}
+
+// діалог «серійний номер + примітка»
+function unitDialog(title, u = { serial: '', note: '' }) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal-wrap';
+    wrap.innerHTML = `<form class="modal small form" role="dialog" aria-modal="true" autocomplete="off">
+      <h2 class="modal-title">${esc(title)}</h2>
+      <label class="field"><span>Серійний номер *</span><div class="with-btn"><input name="serial" required value="${esc(u.serial)}">
+        <button type="button" class="icon-btn" data-scan aria-label="Сканувати">${ICON_SCAN}</button></div></label>
+      <label class="field"><span>Примітка</span><input name="note" value="${esc(u.note || '')}" placeholder="напр. заводський номер польотника"></label>
+      <div class="modal-actions"><button type="button" class="btn ghost" data-cancel>Скасувати</button><button class="btn primary">Зберегти</button></div></form>`;
+    const form = wrap.querySelector('form');
+    const done = (v) => { wrap.remove(); resolve(v); };
+    form.addEventListener('submit', (e) => { e.preventDefault(); if (form.serial.value.trim()) done({ serial: form.serial.value.trim(), note: form.note.value.trim() }); });
+    form.querySelector('[data-cancel]').addEventListener('click', () => done(null));
+    form.querySelector('[data-scan]').addEventListener('click', async () => { const c = await scanCode(); if (c) form.serial.value = c.replace(/^SN:/, ''); });
+    wrap.addEventListener('click', (e) => { if (e.target === wrap) done(null); });
+    document.body.appendChild(wrap);
+    form.serial.focus();
+  });
 }
 
 function eventHtml(e) {
@@ -248,10 +326,14 @@ function eventHtml(e) {
     ${e.text ? `<div class="ev-text">${esc(e.text)}</div>` : ''}</div>`;
 }
 
-export async function viewOrder(ctx, id) {
+export async function viewOrder(ctx, id, query) {
   const o = findOrder(id);
   if (!o) { ctx.notFound(); return; }
-  ctx.header({ title: `№${o.number} · ${o.title}`, back: '#/orders', actions: can('orders.edit') ? `<a class="btn ghost sm" href="#/order-edit/${id}">Редагувати</a>` : '' });
+  const hiUnit = query?.get('unit') || null;
+  ctx.header({
+    title: `№${o.number} · ${o.title}`, back: '#/orders',
+    actions: `<button class="btn ghost sm" id="oprint">Друк</button>${can('orders.edit') ? `<a class="btn ghost sm" href="#/order-edit/${id}">Редагувати</a>` : ''}`,
+  });
   const n = doneCount(o);
   const mineHere = isActive(o) && o.department_id && o.department_id === myDepartment();
   let events = [];
@@ -260,11 +342,12 @@ export async function viewOrder(ctx, id) {
   ctx.main.innerHTML = `
     <div class="card order-card">
       <div class="order-head">${statusTag(o.status)}<b>${esc(depName(o.department_id))}</b>
-        ${mineHere ? '<span class="badge warn">чекає на ваш відділ</span>' : ''}</div>
+        ${mineHere ? '<span class="badge warn">чекає на ваш відділ</span>' : ''}
+        ${isOverdue(o) ? `<span class="badge danger">${dueText(o)}</span>` : isDueSoon(o) ? `<span class="badge warn">термін ${dueText(o)}</span>` : ''}</div>
       <dl class="props">
         <dt>Замовник</dt><dd>${esc(o.customer) || '—'}</dd>
         <dt>Кількість</dt><dd>${fmtQty(o.qty)}</dd>
-        ${o.due_date ? `<dt>Термін</dt><dd class="${isOverdue(o) ? 'overdue' : ''}">${fmtDue(o.due_date)}${isOverdue(o) ? ' — прострочено' : ''}</dd>` : ''}
+        ${o.due_date ? `<dt>Термін</dt><dd class="${isOverdue(o) ? 'overdue' : ''}">${fmtDue(o.due_date)}${isActive(o) && dueText(o) ? ` — ${dueText(o)}` : ''}</dd>` : ''}
         <dt>Прийняв</dt><dd>${esc(userName(o.created_by))}, ${fmtDate(o.created_at)}</dd>
       </dl>
       <div class="section-title">Опис продукту</div>
@@ -282,7 +365,9 @@ export async function viewOrder(ctx, id) {
 
     <h3>Деталі зі складу</h3>
     <div class="card" id="parts">${o.parts.length ? '<div class="muted">Завантаження…</div>'
-      : `<p class="muted">Деталі не вказані.${can('orders.edit') ? ` <a href="#/order-edit/${id}">Додати</a> — тоді буде видно, чого бракує на складі, а видача спишеться під це замовлення.` : ''}</p>`}</div>
+      : `<p class="muted">Деталі не вказані.${can('orders.edit') ? ` <a href="#/order-edit/${id}">Додати</a> — тоді буде видно, чого бракує на складі, деталі зарезервуються, а видача спишеться під це замовлення.` : ''}</p>`}</div>
+
+    ${unitsHtml(o, hiUnit)}
 
     <h3>Історія</h3>
     <div class="card">
@@ -297,9 +382,61 @@ export async function viewOrder(ctx, id) {
     await reloadData();
     if (!ctx.alive()) return;
     const y = window.scrollY;
-    await viewOrder(ctx, id);
+    await viewOrder(ctx, id, query);
     window.scrollTo(0, y);
   };
+  ctx.headerEl.querySelector('#oprint').addEventListener('click', () => printOrder(findOrder(id) || o, { issued, events }));
+
+  // ---- вироби ----
+  const unitsEl = ctx.main.querySelector('#units');
+  if (hiUnit) setTimeout(() => unitsEl.querySelector(`[data-unit="${hiUnit}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 50);
+  unitsEl.addEventListener('change', async (e) => {
+    const k = e.target.dataset.k;
+    const uid = e.target.closest('.unit')?.dataset.unit;
+    if (!k || !uid) return;
+    e.target.disabled = true;
+    try {
+      await api.updateUnit(uid, { [k]: e.target.checked });
+      await refresh();
+    } catch (err) { toast(err.message, 'err'); e.target.disabled = false; }
+  });
+  unitsEl.addEventListener('click', async (e) => {
+    const cur = findOrder(id) || o;
+    try {
+      if (e.target.closest('[data-ugen]')) {
+        const taken = new Set(cur.units.map((u) => u.serial.toLowerCase()));
+        const rows = [];
+        for (let k = 1; rows.length < Math.round(cur.qty) - cur.units.length; k++) {
+          const s = defaultSerial(cur.number, k);
+          if (!taken.has(s.toLowerCase())) { rows.push({ position: cur.units.length + rows.length, serial: s }); taken.add(s.toLowerCase()); }
+        }
+        await api.addUnits(id, rows);
+        toast(`Створено номерів: ${rows.length}`);
+        await refresh();
+      } else if (e.target.closest('[data-uadd]')) {
+        const r = await unitDialog('Новий виріб');
+        if (!r) return;
+        await api.addUnits(id, [{ position: cur.units.length, ...r }]);
+        await refresh();
+      } else if (e.target.closest('[data-uedit]')) {
+        const u = cur.units.find((x) => x.id === e.target.closest('.unit').dataset.unit);
+        const r = await unitDialog('Виріб', u);
+        if (!r) return;
+        await api.updateUnit(u.id, r);
+        await refresh();
+      } else if (e.target.closest('[data-udel]')) {
+        const u = cur.units.find((x) => x.id === e.target.closest('.unit').dataset.unit);
+        if (!await confirmDialog(`Прибрати виріб ${u.serial}?`, { ok: 'Прибрати', danger: true })) return;
+        await api.deleteUnit(u.id);
+        await refresh();
+      } else if (e.target.closest('[data-ulabel]')) {
+        const u = cur.units.find((x) => x.id === e.target.closest('.unit').dataset.unit);
+        printUnitLabels(cur, [u]);
+      } else if (e.target.closest('[data-ulabels]')) {
+        printUnitLabels(cur, cur.units);
+      }
+    } catch (err) { toast(err.message, 'err', 6000); }
+  });
 
   ctx.main.querySelector('#acts').addEventListener('click', async (e) => {
     if (e.target.closest('[data-delete]')) {
@@ -461,7 +598,7 @@ export function viewOrderEdit(ctx, id) {
     partsEl.innerHTML = parts.length ? parts.map((p, n) => {
       const it = state.byId.get(p.item_id);
       return `<div class="line" data-n="${n}"><div class="line-name"><b>${esc(it?.name || '?')}</b>
-          <small class="muted">на складі ${fmtQty(it?.qty || 0)} ${esc(it?.unit || '')}</small></div>
+          <small class="muted">на складі ${fmtQty(it?.qty || 0)} ${esc(it?.unit || '')}${reservedOf(it) ? ` · вільно ${fmtQty(freeQty(it))}` : ''}</small></div>
         <input class="qty" inputmode="decimal" value="${esc(p.qty)}" placeholder="к-сть" aria-label="Кількість">
         <span class="unit">${esc(it?.unit || '')}</span>
         <button type="button" class="icon-btn" data-rm aria-label="Прибрати">✕</button></div>`;
@@ -585,11 +722,11 @@ export function viewDepartments(ctx) {
 
 // ------------------------------------------------------------------
 export function exportOrders() {
-  const rows = [['№', 'Прийнято', 'Прийняв', 'Що замовили', 'К-сть', 'Замовник', 'Термін', 'Статус', 'Відділ', 'Виконано пунктів', 'Опис продукту']];
+  const rows = [['№', 'Прийнято', 'Прийняв', 'Що замовили', 'К-сть', 'Замовник', 'Термін', 'Статус', 'Відділ', 'Виконано пунктів', 'Серійні номери', 'Опис продукту']];
   for (const o of state.orders.slice().sort((a, b) => a.number - b.number)) {
     rows.push([o.number, fmtDate(o.created_at), userName(o.created_by), o.title, o.qty, o.customer, fmtDue(o.due_date),
       ORDER_STATUS[o.status]?.label || o.status, depName(o.department_id),
-      o.tasks.length ? `${doneCount(o)}/${o.tasks.length}` : '', o.description]);
+      o.tasks.length ? `${doneCount(o)}/${o.tasks.length}` : '', o.units.map((u) => u.serial).join(', '), o.description]);
   }
-  downloadXlsx(`замовлення_${todayIso()}.xlsx`, [{ name: 'Замовлення', rows, widths: [6, 17, 14, 34, 7, 22, 11, 17, 18, 10, 50] }]);
+  downloadXlsx(`замовлення_${todayIso()}.xlsx`, [{ name: 'Замовлення', rows, widths: [6, 17, 14, 34, 7, 22, 11, 17, 18, 10, 24, 50] }]);
 }

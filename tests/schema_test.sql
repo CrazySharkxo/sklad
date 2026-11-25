@@ -653,9 +653,129 @@ do $$ begin
 end $$;
 reset role;
 
+-- =====================================================================
+--  Резерв під замовлення, повтор з офлайн-черги, серійні номери,
+--  налаштування й сповіщення (без pg_net — нічого не падає)
+-- =====================================================================
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+insert into public.orders (id, title, qty, department_id) values
+  ('cccccccc-0000-0000-0000-000000000007', 'Резерв', 2, (select id from public.departments where name = 'Прийом замовлень'));
+insert into public.order_parts values ('cccccccc-0000-0000-0000-000000000007', 'aaaaaaaa-0000-0000-0000-000000000003', 3);
+do $$ begin
+  assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000003') = 3, 'резерв не порахований';
+  assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000001') = 0, 'видане під №1 ще в резерві';
+end $$;
+select public.post_operation('out', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000003","qty":1}]', '', '',
+                             null, null, 'cccccccc-0000-0000-0000-000000000007');
+do $$ begin assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000003') = 2, 'видача не зменшила резерв'; end $$;
+select public.move_order('cccccccc-0000-0000-0000-000000000007', 'cancelled', null, 'перевірка резерву');
+do $$ begin assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000003') = 0, 'скасоване резервує'; end $$;
+select public.move_order('cccccccc-0000-0000-0000-000000000007', 'in_work');
+do $$ begin assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000003') = 2, 'відновлене не резервує'; end $$;
+
+-- повтор тієї самої операції з офлайн-черги (той самий p_op_id) не створює дубля
+do $$
+declare a uuid; b uuid;
+begin
+  a := public.post_operation('in', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000003","qty":4}]', 'офлайн', '', null, null, null,
+                             'eeeeeeee-0000-0000-0000-000000000001');
+  b := public.post_operation('in', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000003","qty":4}]', 'офлайн', '', null, null, null,
+                             'eeeeeeee-0000-0000-0000-000000000001');
+  assert a = b and a = 'eeeeeeee-0000-0000-0000-000000000001', 'повтор дав інший id';
+  assert (select count(*) from public.operations where comment = 'офлайн') = 1, 'повтор створив дубль';
+end $$;
+
+-- вироби: унікальний номер (без урахування регістру й пробілів), відмітки ставить сервер
+insert into public.order_units (order_id, position, serial) values
+  ('cccccccc-0000-0000-0000-000000000007', 0, '0007-01'),
+  ('cccccccc-0000-0000-0000-000000000007', 1, '0007-02');
+do $$ begin
+  begin
+    insert into public.order_units (order_id, serial) values ('cccccccc-0000-0000-0000-000000000001', ' 0007-01 ');
+    raise exception 'дубль серійного номера пройшов';
+  exception when unique_violation then null;
+  end;
+  begin
+    update public.order_units set assembled_at = now() where serial = '0007-01';
+    raise exception 'assembled_at записано напряму';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+update public.order_units set assembled = true where serial = '0007-01';
+do $$ begin
+  assert (select assembled_by from public.order_units where serial = '0007-01') = '11111111-1111-1111-1111-111111111111', 'assembled_by';
+  assert (select assembled_at from public.order_units where serial = '0007-01') is not null;
+  assert (select tested_by from public.order_units where serial = '0007-01') is null;
+end $$;
+update public.order_units set assembled = false, tested = true where serial = '0007-01';
+do $$ begin
+  assert (select assembled_by from public.order_units where serial = '0007-01') is null, 'assembled_by не скинуто';
+  assert (select tested_at from public.order_units where serial = '0007-01') is not null, 'tested_at';
+end $$;
+
+-- налаштування: токен видно лише маскою; не-адміну — ні
+do $$ begin
+  assert (public.admin_settings() ->> 'tg_token_set') = 'false';
+  perform public.admin_save_settings('{"tg_token": "123:ABCDEFGH", "tg_chat": "-100", "org_name": "ТОВ Тест", "tg_low": true}');
+  assert (public.admin_settings() ->> 'tg_token_set') = 'true';
+  assert (public.admin_settings() ->> 'tg_token_hint') = '…EFGH', public.admin_settings() ->> 'tg_token_hint';
+  assert (select org_name from public.app_settings) = 'ТОВ Тест', 'org_name читається всім';
+  begin
+    perform tg_token from public.app_settings;
+    raise exception 'токен прочитано з таблиці';
+  exception when insufficient_privilege then null;
+  end;
+  assert public.tg_test() is null, 'без pg_net тест має повернути null';
+end $$;
+
+-- сповіщення без pg_net: передача замовлення і падіння нижче мінімуму проходять мовчки
+insert into public.items (id, name, min_qty) values ('aaaaaaaa-0000-0000-0000-000000000020', 'Низький запас', 3);
+select public.post_operation('in',  '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000020","qty":5}]');
+select public.post_operation('out', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000020","qty":3}]');
+select public.move_order('cccccccc-0000-0000-0000-000000000007', 'testing', (select id from public.departments where name = 'Тестування'));
+do $$ begin assert public.item_qty('aaaaaaaa-0000-0000-0000-000000000020') = 2; end $$;
+
+-- прострочені: рахуються раз на добу
+update public.orders set due_date = current_date - 3 where id = 'cccccccc-0000-0000-0000-000000000007';
+do $$ begin
+  assert public.notify_overdue() = 1, 'має бути одне прострочене';
+  assert (public.admin_settings() ->> 'overdue_sent_on') = current_date::text;
+  assert public.notify_overdue() = 0, 'повторно за день не надсилати';
+end $$;
+
+-- знімок для резервної копії
+do $$
+declare d jsonb := public.admin_dump();
+begin
+  assert jsonb_array_length(d -> 'order_units') = 2, 'dump: вироби';
+  assert jsonb_array_length(d -> 'items') > 0 and jsonb_array_length(d -> 'operations') > 0, 'dump: таблиці';
+  assert not (d -> 'settings' ? 'tg_token'), 'dump містить токен';
+  assert (d -> 'settings' ->> 'org_name') = 'ТОВ Тест';
+end $$;
+
+-- Оля (свої галочки, без адміна): налаштувань не бачить, знімка не отримує
+reset role;
+select set_config('request.jwt.claim.sub', (select id::text from auth.users where email = 'view@example.com'), false);
+set role authenticated;
+do $$ begin
+  begin
+    perform public.admin_settings();
+    raise exception 'не-адмін побачив налаштування';
+  exception when raise_exception then assert sqlerrm = 'Немає права адміністрування', sqlerrm;
+  end;
+  begin
+    perform public.admin_dump();
+    raise exception 'не-адмін отримав знімок';
+  exception when raise_exception then assert sqlerrm = 'Немає права адміністрування', sqlerrm;
+  end;
+  assert (select org_name from public.app_settings) = 'ТОВ Тест', 'назва організації має бути видна всім';
+end $$;
+reset role;
+
 -- realtime підключено
 do $$ begin
-  assert (select count(*) from pg_publication_tables where pubname = 'supabase_realtime') = 12;
+  assert (select count(*) from pg_publication_tables where pubname = 'supabase_realtime') = 14;
 end $$;
 
 \echo ALL SCHEMA TESTS PASSED

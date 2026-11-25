@@ -446,6 +446,43 @@ h3 .count { font-weight: 600; margin-left: 6px; }
 @media (max-width: 480px) { .perm-tbl th:not(:first-child), .perm-tbl td:not(:first-child) { width: 64px; } }
 .user-row .row-meta { white-space: normal; }
 
+/* ---------- резерв, терміни, вироби, черга ---------- */
+.warn-text { color: var(--warn); display: block; font-size: 12px; }
+.row-qty em.res { color: var(--accent); }
+.big-qty .free { font-size: 15px; color: var(--muted); }
+.big-qty .free b { font-size: 18px; color: var(--accent); }
+.badge.res { background: var(--accent-soft); color: var(--accent); }
+.badge.danger { background: var(--out-soft); color: var(--err); font-weight: 600; }
+.tbl tr.tight td { background: var(--warn-soft); }
+.row-qty em.soon { color: var(--warn); font-weight: 600; }
+.order-row.is-overdue { border-left: 4px solid var(--err); }
+.chip.danger { color: var(--err); border-color: var(--err); }
+.chip.danger.on { background: var(--err); border-color: var(--err); color: #fff; }
+.units { display: flex; flex-direction: column; }
+.unit { display: grid; grid-template-columns: 1fr auto auto auto; gap: 10px; align-items: center; padding: 8px 2px; border-bottom: 1px solid var(--line); }
+.unit.hi { background: var(--accent-soft); border-radius: 8px; padding-left: 8px; }
+.unit-sn { display: flex; flex-direction: column; min-width: 0; }
+.unit-sn b { font-family: ui-monospace, Consolas, monospace; font-size: 15px; }
+.unit-chk { display: flex; gap: 6px; align-items: center; cursor: pointer; font-size: 13px; }
+.unit-chk input { width: 20px; height: 20px; min-height: 0; margin: 0; accent-color: var(--in); }
+.unit-chk span { display: flex; flex-direction: column; line-height: 1.15; }
+.unit-chk small { font-size: 11px; color: var(--muted); }
+.unit-acts { display: flex; }
+.unit-acts .icon-btn { width: 34px; height: 34px; }
+.unit-acts svg { width: 18px; height: 18px; }
+@media (max-width: 599px) {
+  .unit { grid-template-columns: 1fr auto; }
+  .unit-chk { grid-column: 1 / span 1; }
+  .unit-acts { grid-column: 2; grid-row: 1 / span 3; flex-direction: column; }
+}
+.banner.outbox { display: block; background: var(--warn-soft); color: var(--warn); font-weight: 600; position: sticky; top: 0; z-index: 19; }
+.outbox-item { border-color: var(--warn); }
+.warn-card { border-color: var(--warn); color: var(--warn); }
+.dep-chat { grid-template-columns: 1fr 180px auto; }
+.dep-chat .chat { padding: 8px; }
+@media (max-width: 480px) { .dep-chat { grid-template-columns: 1fr 120px auto; } }
+code { font-size: 13px; background: var(--bg); padding: 1px 5px; border-radius: 5px; }
+
 /* ---------- смужка «Є оновлення» ---------- */
 .banner.update {
   position: sticky; top: 0; z-index: 21;
@@ -454,3 +491,32 @@ h3 .count { font-weight: 600; margin-left: 6px; }
 }
 .banner.update .btn { background: var(--on-accent); color: var(--accent); border-color: var(--on-accent); min-height: 32px; }
 @media (min-width: 900px) { .banner.update { margin-left: 220px; } }
+
+/* ---------- друк документів (накладні, картка замовлення) ---------- */
+@media print {
+  .doc { color: #000; font: 11pt/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 4mm; }
+  .doc h1 { font-size: 16pt; margin: 2mm 0 1mm; white-space: normal; }
+  .doc h2 { font-size: 14pt; margin: 3mm 0 2mm; }
+  .doc h3 { font-size: 11pt; margin: 5mm 0 2mm; color: #000; text-transform: uppercase; letter-spacing: .03em; }
+  .doc-head { border-bottom: 0.5mm solid #000; padding-bottom: 2mm; margin-bottom: 3mm; break-inside: avoid; }
+  .doc-org { font-size: 9pt; color: #333; }
+  .doc-no { font-size: 10pt; }
+  .doc-props { display: grid; grid-template-columns: auto 1fr; gap: 1mm 5mm; margin: 0 0 3mm; }
+  .doc-props dt { color: #444; }
+  .doc-props dd { margin: 0; }
+  .doc-text { white-space: pre-wrap; margin: 0 0 2mm; }
+  .doc-tbl { width: 100%; border-collapse: collapse; font-size: 10.5pt; margin-bottom: 2mm; }
+  .doc-tbl th, .doc-tbl td { border: 0.3mm solid #000; padding: 1.5mm 2mm; text-align: left; vertical-align: top; }
+  .doc-tbl th { background: #eee; font-weight: 600; }
+  .doc-tbl td.num { text-align: right; white-space: nowrap; }
+  .doc-tbl tr { break-inside: avoid; }
+  .doc-total { text-align: right; margin: 0 0 4mm; }
+  .doc-tasks { list-style: none; padding: 0; margin: 0 0 2mm; }
+  .doc-tasks li { padding: 1mm 0; border-bottom: 0.2mm dotted #999; break-inside: avoid; }
+  .doc-tasks li small { color: #444; margin-left: 2mm; }
+  .sign-row { display: flex; gap: 12mm; margin-top: 12mm; break-inside: avoid; }
+  .sign { flex: 1; display: flex; align-items: flex-end; gap: 2mm; }
+  .sign span { white-space: nowrap; }
+  .sign i { flex: 1; border-bottom: 0.3mm solid #000; height: 6mm; }
+  .muted-print { color: #666; text-align: center; }
+}

@@ -9,12 +9,18 @@ import { viewInventory } from './views/inventory.js';
 import { viewMore, viewReorder, viewLabels, viewImport } from './views/more.js';
 import { viewOrders, viewOrder, viewOrderEdit, viewDepartments } from './views/orders.js';
 import { viewUsers, viewUserEdit, viewRoles, viewRoleEdit } from './views/users.js';
+import { viewNotifications } from './views/settings.js';
+import { viewOutbox, outboxBannerText, startAutoFlush, OUTBOX_EVENT } from './outbox.js';
+import { viewBackups, runCloudBackup } from './backup.js';
 
 const ROUTES = [
   // [шаблон, екран, вкладка меню, чи перемальовувати при змінах від інших, потрібне право]
   [/^\/stock$/, (c) => viewStock(c), 'stock', true, 'stock.view'],
   [/^\/orders$/, (c) => viewOrders(c), 'orders', true, 'orders.view'],
-  [/^\/order\/([\w-]+)$/, (c, m) => viewOrder(c, m[1]), 'orders', true, 'orders.view'],
+  [/^\/order\/([\w-]+)$/, (c, m, q) => viewOrder(c, m[1], q), 'orders', true, 'orders.view'],
+  [/^\/notifications$/, (c) => viewNotifications(c), 'more', false, 'admin'],
+  [/^\/backups$/, (c) => viewBackups(c), 'more', false, 'admin'],
+  [/^\/outbox$/, (c) => viewOutbox(c), 'more', false, 'ops.edit'],
   [/^\/order-edit\/([\w-]+)$/, (c, m) => viewOrderEdit(c, m[1]), 'orders', false, 'orders.edit'],
   [/^\/departments$/, (c) => viewDepartments(c), 'more', true, null],
   [/^\/item\/([\w-]+)$/, (c, m) => viewItem(c, m[1]), 'stock', true, 'stock.view'],
@@ -80,7 +86,8 @@ function shell() {
     ${isDemo ? '<div class="banner demo">Демо-режим: дані зберігаються лише в цьому браузері. Спільна база підключається в js/config.js (див. README).</div>' : ''}
     <div class="banner update" id="upd" hidden>Є нова версія програми
       <button type="button" class="btn sm" id="upd-go">Оновити</button></div>
-    <div class="banner offline" id="offline" hidden>Немає інтернету — зміни не збережуться, доки зʼєднання не повернеться</div>
+    <div class="banner offline" id="offline" hidden>Немає інтернету — прихід і видаток збережуться на пристрої та відправляться з появою мережі; решта змін зачекає</div>
+    <a class="banner outbox" id="outbox-banner" href="#/outbox" hidden></a>
     <div class="layout">
       <nav class="nav" id="nav"></nav>
       <div class="page">
@@ -92,9 +99,17 @@ function shell() {
   document.getElementById('upd-go').addEventListener('click', applyUpdate);
   if (updateFound) document.getElementById('upd').hidden = false;
   const off = document.getElementById('offline');
-  const upd = () => { off.hidden = navigator.onLine; };
+  const ob = document.getElementById('outbox-banner');
+  const upd = () => {
+    off.hidden = navigator.onLine && !state.offline;
+    const t = outboxBannerText();
+    ob.hidden = !t;
+    ob.textContent = t ? `${t} — ${navigator.onLine ? 'відправляємо…' : 'відправимо з появою мережі'} · переглянути` : '';
+  };
   addEventListener('online', upd);
   addEventListener('offline', upd);
+  document.addEventListener(OUTBOX_EVENT, upd);
+  document.addEventListener('sklad:data', upd);
   upd();
 }
 
@@ -217,7 +232,7 @@ async function start() {
   if (!state.me) { loginView(); return; }
   app.innerHTML = '<div class="loading">Завантаження…</div>';
   // прибрати з кошика все старше 30 днів; не вийшло (стара схема, мережа) — не страшно
-  await api.purgeTrash().catch(() => {});
+  if (navigator.onLine) await api.purgeTrash().catch(() => {});
   try {
     await reloadData();
   } catch (e) {
@@ -227,8 +242,15 @@ async function start() {
   }
   shell();
   updateBadge();
+  if (state.offline) toast(`Немає зʼєднання — показано дані станом на ${new Date(state.cachedAt).toLocaleString('uk-UA')}`, 'err', 6000);
   if (!started) {
     started = true;
+    // офлайн-черга, щоденні сповіщення про прострочені, резервна копія (лише адміністратор) — у фоні, без блокування
+    startAutoFlush();
+    if (!state.offline) {
+      api.notifyOverdue().catch(() => {});
+      runCloudBackup().then((r) => { if (r?.ok) toast('Резервну копію збережено'); }).catch((e) => console.warn('backup', e));
+    }
     // при запуску, коли програма знову на екрані, з появою мережі і раз на 10 хвилин
     setTimeout(checkUpdate, 3000);
     setInterval(checkUpdate, 10 * 60e3);

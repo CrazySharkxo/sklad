@@ -166,6 +166,11 @@ def main() -> int:
         page.goto(url + "#/journal")
         expect(page.locator(".op")).to_have_count(7)  # 3 поч. залишки + прихід + видаток + комплект + інвентаризація
         page.screenshot(path=str(SHOTS / "06_journal.png"), full_page=True)
+        # накладна / акт друкуються в print-area
+        page.locator(".op", has_text="Інвентаризація").locator("[data-print]").click()
+        expect(page.locator("#print-area .doc")).to_contain_text("Акт інвентаризації")
+        page.locator(".op", has_text="Прихід").first.locator("[data-print]").click()
+        expect(page.locator("#print-area .doc")).to_contain_text("Прибуткова накладна")
 
         def delete_kit_op():
             page.locator(".op", has_text="Видача комплекту").locator("[data-cancel]").click()
@@ -241,7 +246,35 @@ def main() -> int:
         expect(page.locator(".nav-badge")).to_have_text("1")
 
         page.locator(".task", has_text="Зібрати раму").locator("input").click()
-        expect(page.locator("h3 .count")).to_have_text("1 з 3")
+        expect(page.locator("h3 .count").first).to_have_text("1 з 3")
+
+        # --- резерв: деталі замовлення зарезервовано, у залишках видно «вільно» ---
+        expect(page.locator("#parts")).to_contain_text("Усе потрібне є на складі")
+        page.goto(url + "#/stock")
+        expect(page.locator(".row", has_text="Мотор 2207").locator("em.res")).to_have_text("вільно 31")  # 39 − 8
+        page.locator(".row", has_text="Мотор 2207").click()
+        expect(page.locator(".badge.res")).to_contain_text("Зарезервовано під замовлення: 8")
+        page.screenshot(path=str(SHOTS / "24_reserved.png"))
+        page.locator(".badge.res a").click()
+
+        # --- вироби: серійні номери, відмітки, етикетка, пошук за номером ---
+        page.locator("#units [data-ugen]").click()
+        assert "Створено номерів: 2" in toast_text()
+        expect(page.locator(".unit")).to_have_count(2)
+        expect(page.locator(".unit").first).to_contain_text("0001-01")
+        expect(page.locator("#units [data-ugen]")).to_have_count(0)
+        page.locator(".unit").first.locator("[data-k=assembled]").check()
+        expect(page.locator(".unit").first.locator(".unit-chk").first).to_contain_text("Демо")
+        page.locator("#units [data-ulabels]").click()
+        expect(page.locator("#print-area .label")).to_have_count(2)
+        page.locator("#oprint").click()
+        expect(page.locator("#print-area .doc")).to_contain_text("Замовлення №1")
+        page.screenshot(path=str(SHOTS / "25_units.png"), full_page=True)
+        page.goto(url + "#/orders")
+        page.locator("#q").fill("0001-02")
+        expect(page.locator(".order-row")).to_have_count(1)
+        page.locator("#q").fill("")
+        page.locator(".order-row").first.click()
 
         page.locator("#parts a.btn.out").click()
         expect(page.locator(".line")).to_have_count(4)
@@ -309,8 +342,17 @@ def main() -> int:
 
         page.goto(url + "#/order-edit/new")
         page.locator("#f [name=title]").fill("Помилкове замовлення")
+        page.locator("#f [name=due_date]").fill("2020-01-01")
         page.locator("#save").click()
         assert "Замовлення №2 прийнято" in toast_text()
+        # --- терміни: прострочене підсвічено й має свою вкладку ---
+        expect(page.locator(".order-head .badge.danger")).to_contain_text("прострочено на")
+        page.goto(url + "#/orders")
+        expect(page.locator("#chips [data-f=overdue]")).to_contain_text("Прострочені · 1")
+        page.locator("#chips [data-f=overdue]").click()
+        expect(page.locator(".order-row.is-overdue")).to_have_count(1)
+        page.screenshot(path=str(SHOTS / "26_overdue.png"))
+        page.locator(".order-row").first.click()
         page.locator("#acts [data-delete]").click()
         page.locator(".modal [data-r='1']").click()
         assert "Замовлення №2 перенесено в кошик" in toast_text()
@@ -335,7 +377,7 @@ def main() -> int:
         assert page.locator("#q").input_value() == ""
         page.locator("#q").fill("TMP-1")
         page.locator("#q").press("Enter")  # код у кошику не знаходиться
-        expect(page.locator("h1")).to_have_text("Залишки")
+        expect(page.locator("#top h1")).to_have_text("Залишки")
         page.locator("#q").fill("")
         page.locator("#chips [data-trash]").click()
         expect(page.locator(".trash-row")).to_have_count(1)
@@ -424,7 +466,7 @@ def main() -> int:
         expect(page.locator("#acts [data-to]")).to_have_count(0)
         expect(page.locator("#cmt")).to_have_count(0)
         page.goto(url + "#/item-edit/new")
-        expect(page.locator("h1")).to_have_text("Немає доступу")
+        expect(page.locator("#top h1")).to_have_text("Немає доступу")
         page.goto(url + "#/more")
         expect(page.locator("a[href='#/users']")).to_have_count(0)
         page.screenshot(path=str(SHOTS / "22_viewer.png"), full_page=True)
@@ -437,7 +479,7 @@ def main() -> int:
         page.locator("#scan").click()
         page.locator(".scan-manual input").fill("4820000000017")
         page.locator(".scan-manual button").click()
-        expect(page.locator("h1")).to_have_text("Мотор 2207 1750KV")
+        expect(page.locator("#top h1")).to_have_text("Мотор 2207 1750KV")
         page.screenshot(path=str(SHOTS / "07_item.png"), full_page=True)
 
         # --- десктоп ---

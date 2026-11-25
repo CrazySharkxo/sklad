@@ -1,7 +1,22 @@
 // Прихід / видаток і журнал операцій
 import { api, TRASH_DAYS } from '../api.js';
 import { esc, fmtQty, fmtSigned, fmtDate, parseNum, round, toast, confirmDialog, OP_TYPES, downloadXlsx, todayIso } from '../util.js';
-import { state, go, reloadData, itemPicker, userName, bindTrash, trashNote, TRASH_EMPTY, can } from '../core.js';
+import { state, go, reloadData, itemPicker, userName, bindTrash, trashNote, TRASH_EMPTY, can, reservedOf, freeQty } from '../core.js';
+import { postOrQueue } from '../outbox.js';
+import { printOperation } from '../print.js';
+
+// підпис рядка видатку: залишок, резерв під замовлення, що стане
+function lineHint(it, q, isIn, underOrder) {
+  const after = q > 0 ? round(isIn ? it.qty + q : it.qty - q) : null;
+  const res = reservedOf(it);
+  const short = !isIn && q > 0 && q > it.qty;
+  // видаток не під замовлення зачіпає чужий резерв — попереджаємо, але не забороняємо
+  const eatsReserve = !isIn && !underOrder && !short && q > 0 && res > 0 && q > freeQty(it);
+  return `<b>${esc(it.name)}</b>
+    <small class="muted">є ${fmtQty(it.qty)} ${esc(it.unit)}${res ? ` (вільно ${fmtQty(freeQty(it))})` : ''}${after !== null ? ` → стане ${fmtQty(after)}` : ''}</small>
+    ${short ? '<small class="err-text">Недостатньо на складі</small>' : ''}
+    ${eatsReserve ? `<small class="warn-text">Зарезервовано під замовлення ${fmtQty(res)} — вільних лише ${fmtQty(freeQty(it))}</small>` : ''}`;
+}
 
 // контрагенти з недавніх операцій — підказки в полі
 let recentCounterparties = null;
@@ -66,11 +81,8 @@ export async function viewOp(ctx, type, query) {
       const it = state.byId.get(l.item_id);
       const q = parseNum(l.qty);
       const short = !isIn && q > 0 && q > it.qty;
-      const after = q > 0 ? round(isIn ? it.qty + q : it.qty - q) : null;
       return `<div class="line${short ? ' bad' : ''}" data-n="${n}">
-        <div class="line-name"><b>${esc(it.name)}</b>
-          <small class="muted">є ${fmtQty(it.qty)} ${esc(it.unit)}${after !== null ? ` → стане ${fmtQty(after)}` : ''}</small>
-          ${short ? '<small class="err-text">Недостатньо на складі</small>' : ''}</div>
+        <div class="line-name">${lineHint(it, q, isIn, !!order)}</div>
         <input class="qty" inputmode="decimal" value="${esc(l.qty)}" placeholder="к-сть" aria-label="Кількість">
         <span class="unit">${esc(it.unit)}</span>
         <button type="button" class="icon-btn" data-rm aria-label="Прибрати">✕</button>
@@ -102,12 +114,8 @@ export async function viewOp(ctx, type, query) {
     const it = state.byId.get(lines[n].item_id);
     const q = parseNum(lines[n].qty);
     const row = e.target.closest('.line');
-    const short = !isIn && q > 0 && q > it.qty;
-    row.classList.toggle('bad', short);
-    const after = q > 0 ? round(isIn ? it.qty + q : it.qty - q) : null;
-    row.querySelector('.line-name').innerHTML = `<b>${esc(it.name)}</b>
-      <small class="muted">є ${fmtQty(it.qty)} ${esc(it.unit)}${after !== null ? ` → стане ${fmtQty(after)}` : ''}</small>
-      ${short ? '<small class="err-text">Недостатньо на складі</small>' : ''}`;
+    row.classList.toggle('bad', !isIn && q > 0 && q > it.qty);
+    row.querySelector('.line-name').innerHTML = lineHint(it, q, isIn, !!order);
     updateSum();
   });
   linesEl.addEventListener('keydown', (e) => {
@@ -135,10 +143,10 @@ export async function viewOp(ctx, type, query) {
     const btn = f.querySelector('#post');
     btn.disabled = true;
     try {
-      await api.postOperation({ type, lines: out, counterparty: f.counterparty.value.trim(), comment: f.comment.value.trim(), order_id: order?.id || null });
+      const r = await postOrQueue({ type, lines: out, counterparty: f.counterparty.value.trim(), comment: f.comment.value.trim(), order_id: order?.id || null });
       recentCounterparties = null;
-      await reloadData();
-      toast(isIn ? 'Прихід проведено' : 'Видаток проведено');
+      if (r.queued) toast('Немає інтернету — збережено на пристрої, відправиться з появою мережі', 'ok', 6000);
+      else { await reloadData(); toast(isIn ? 'Прихід проведено' : 'Видаток проведено'); }
       go(back);
     } catch (err) {
       toast(err.message, 'err', 6000);
@@ -183,7 +191,8 @@ function opCard(op, trash = false) {
       ? `<small class="muted grow">${trashNote(op.cancelled_at, op.cancelled_by)}</small>
          <button type="button" class="btn ghost sm" data-restore>Відновити</button>
          <button type="button" class="btn ghost sm del-btn" data-purge>Видалити назавжди</button>`
-      : can('ops.delete') ? '<button type="button" class="btn ghost sm del-btn" data-cancel>Видалити</button>' : ''}</div>
+      : `<button type="button" class="btn ghost sm" data-print>${op.type === 'adjust' ? 'Акт' : 'Накладна'}</button>
+         ${can('ops.delete') ? '<button type="button" class="btn ghost sm del-btn" data-cancel>Видалити</button>' : ''}`}</div>
   </div>`;
 }
 
@@ -205,9 +214,10 @@ export async function viewJournal(ctx) {
   const opsEl = ctx.main.querySelector('#ops');
   const more = ctx.main.querySelector('#more');
   let last = null;
+  const shown = new Map();  // id → операція, для друку накладної
 
   const load = async (append) => {
-    if (!append) { opsEl.innerHTML = '<div class="muted pad">Завантаження…</div>'; last = null; }
+    if (!append) { opsEl.innerHTML = '<div class="muted pad">Завантаження…</div>'; last = null; shown.clear(); }
     if (journalTrash) {
       try {
         const ops = await api.trashOperations();
@@ -220,6 +230,7 @@ export async function viewJournal(ctx) {
     try {
       const ops = await api.operations({ ...jf, before: last, limit: 50 });
       if (!ctx.alive()) return;
+      for (const op of ops) shown.set(op.id, op);
       if (!append) opsEl.innerHTML = '';
       opsEl.insertAdjacentHTML('beforeend', ops.map((op) => opCard(op)).join(''));
       if (!append && !ops.length) opsEl.innerHTML = '<div class="empty-state"><p>Операцій немає</p></div>';
@@ -244,6 +255,12 @@ export async function viewJournal(ctx) {
   }
   more.addEventListener('click', () => load(true));
   opsEl.addEventListener('click', async (e) => {
+    const p = e.target.closest('[data-print]');
+    if (p) {
+      const op = shown.get(p.closest('.op').dataset.id);
+      if (op) printOperation(op);
+      return;
+    }
     const b = e.target.closest('[data-cancel]');
     if (!b) return;
     const id = b.closest('.op').dataset.id;

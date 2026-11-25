@@ -1,7 +1,8 @@
 // Спільний стан і компоненти, якими користуються всі екрани
-import { api, TRASH_DAYS } from './api.js';
+import { api, isDemo, TRASH_DAYS } from './api.js';
 import { esc, fmtQty, fmtDate, norm, round, toast, confirmDialog } from './util.js';
 import { scanCode } from './scanner.js';
+import { applyPendingTo } from './outbox.js';
 
 export const state = {
   items: [],         // живі позиції (без кошика)
@@ -15,14 +16,18 @@ export const state = {
   trashOrders: [],
   perms: new Set(),  // права поточного користувача
   roles: [],
+  settings: { org_name: '', app_url: '', backup_at: null },  // несекретні налаштування (шапка документів)
   me: null,
   loaded: false,
+  offline: false,    // дані взято з кешу на пристрої, сервер недоступний
+  cachedAt: null,
 };
 
-export async function reloadData() {
-  const [items, kits, profiles, departments, orders, perms, roles] = await Promise.all([
-    api.items(), api.kits(), api.profiles(), api.departments(), api.orders(), api.myPerms(), api.roles(),
-  ]);
+// останній знімок даних — щоб програма відкривалася й без інтернету (лише спільна база)
+const CACHE_KEY = 'sklad-cache-v1';
+const isNetErr = (e) => /Немає зʼєднання|Failed to fetch|NetworkError|Load failed/i.test(e?.message || '');
+
+function fill({ items, kits, profiles, departments, orders, perms, roles, settings }) {
   state.perms = new Set(perms);
   state.roles = roles;
   state.items = items.filter((i) => !i.deleted_at);
@@ -34,9 +39,38 @@ export async function reloadData() {
   state.departments = departments;
   state.orders = orders.filter((o) => !o.deleted_at);
   state.trashOrders = orders.filter((o) => inTrash(o.deleted_at));
+  state.settings = settings || state.settings;
   state.loaded = true;
+}
+
+export async function reloadData() {
+  let snap;
+  try {
+    const [items, kits, profiles, departments, orders, perms, roles, settings] = await Promise.all([
+      api.items(), api.kits(), api.profiles(), api.departments(), api.orders(), api.myPerms(), api.roles(),
+      api.settings().catch(() => null),  // стара схема без app_settings — не привід падати
+    ]);
+    snap = { items, kits, profiles, departments, orders, perms, roles, settings, me: state.me, at: new Date().toISOString() };
+    state.offline = false;
+    state.cachedAt = null;
+    if (!isDemo) try { localStorage.setItem(CACHE_KEY, JSON.stringify(snap)); } catch { /* тісно — без кешу */ }
+    // те, що ще в офлайн-черзі, сервер не бачить — показуємо так, як буде після відправки
+    applyPendingTo(snap.items);
+  } catch (e) {
+    if (isDemo || !isNetErr(e)) throw e;
+    let cached = null;
+    try { cached = JSON.parse(localStorage.getItem(CACHE_KEY)); } catch { /* */ }
+    if (!cached || cached.me !== state.me) throw e;
+    snap = cached;
+    applyPendingTo(snap.items);
+    state.offline = true;
+    state.cachedAt = cached.at;
+  }
+  fill(snap);
   document.dispatchEvent(new Event('sklad:data'));
 }
+
+export const clearCache = () => { try { localStorage.removeItem(CACHE_KEY); } catch { /* */ } };
 
 export const go = (hash) => { location.hash = hash; };
 
@@ -113,6 +147,46 @@ export const waitingForMe = () => {
 };
 export const activeItems = () => state.items.filter((i) => !i.archived);
 export const isLow = (i) => i.min_qty > 0 && i.qty < i.min_qty;
+// резерв під активні замовлення і вільний залишок
+export const reservedOf = (i) => Number(i?.reserved) || 0;
+export const freeQty = (i) => round((i?.qty || 0) - reservedOf(i));
+// замовлення, що тримають резерв на позицію (для картки позиції)
+export const reservingOrders = (itemId) => state.orders.filter((o) => ACTIVE_ORDER.includes(o.status) && o.parts.some((p) => p.item_id === itemId));
+
+// терміни замовлень
+export const daysToDue = (o) => (o.due_date ? Math.round((Date.parse(`${o.due_date}T00:00:00`) - new Date().setHours(0, 0, 0, 0)) / 864e5) : null);
+export const isOverdue = (o) => ACTIVE_ORDER.includes(o.status) && daysToDue(o) < 0;
+export const isDueSoon = (o) => ACTIVE_ORDER.includes(o.status) && daysToDue(o) !== null && daysToDue(o) >= 0 && daysToDue(o) <= 2;
+// «сьогодні», «завтра», «через 5 дн.», «прострочено на 3 дн.»
+export function dueText(o) {
+  const d = daysToDue(o);
+  if (d === null) return '';
+  if (!ACTIVE_ORDER.includes(o.status)) return '';
+  if (d < 0) return `прострочено на ${-d} дн.`;
+  if (d === 0) return 'сьогодні';
+  if (d === 1) return 'завтра';
+  return `через ${d} дн.`;
+}
+
+// виріб за серійним номером (у всіх замовленнях, разом із кошиком)
+export function findUnit(serial) {
+  const s = String(serial || '').trim().toLowerCase();
+  if (!s) return null;
+  for (const o of [...state.orders, ...state.trashOrders]) {
+    const u = o.units.find((x) => x.serial.toLowerCase() === s);
+    if (u) return { order: o, unit: u };
+  }
+  return null;
+}
+// що означає відсканований код: позиція, виріб або нічого
+export function resolveCode(code) {
+  const c = String(code || '').trim();
+  if (c.startsWith('SN:')) { const r = findUnit(c.slice(3)); return r ? { ...r, kind: 'unit' } : null; }
+  const item = findByCode(c);
+  if (item) return { kind: 'item', item };
+  const r = findUnit(c);
+  return r ? { ...r, kind: 'unit' } : null;
+}
 export const categories = () => [...new Set(state.items.map((i) => i.category).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk'));
 export const locations = () => [...new Set(state.items.map((i) => i.location).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk'));
 export const units = () => [...new Set(['шт', 'м', 'кг', 'г', 'л', 'компл', 'уп', 'пара', ...state.items.map((i) => i.unit).filter(Boolean)])];
@@ -193,7 +267,7 @@ export function itemPicker(container, onPick, { placeholder = 'Додати по
     list.innerHTML = found.length
       ? found.map((i, n) => `<button type="button" class="picker-opt${n === 0 ? ' on' : ''}" data-id="${i.id}">
           <span>${esc(i.name)}${i.code ? ` <small>${esc(i.code)}</small>` : ''}</span>
-          ${showQty ? `<small class="muted">${fmtQty(i.qty)} ${esc(i.unit)}</small>` : ''}</button>`).join('')
+          ${showQty ? `<small class="muted">${fmtQty(i.qty)} ${esc(i.unit)}${reservedOf(i) ? ` · вільно ${fmtQty(freeQty(i))}` : ''}</small>` : ''}</button>`).join('')
       : '<div class="picker-empty">Нічого не знайдено</div>';
   };
   const choose = (item) => {
