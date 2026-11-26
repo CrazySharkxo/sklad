@@ -1,6 +1,6 @@
 // Залишки, картка позиції, створення/редагування позиції
 import { api, TRASH_DAYS } from '../api.js';
-import { esc, fmtQty, fmtSigned, fmtDate, parseNum, compressImage, toast, confirmDialog, OP_TYPES, qrSvg, labelPayload } from '../util.js';
+import { esc, norm, fmtQty, fmtSigned, fmtDate, parseNum, compressImage, toast, confirmDialog, OP_TYPES, qrSvg, labelPayload } from '../util.js';
 import { scanCode } from '../scanner.js';
 import {
   state, go, reloadData, activeItems, isLow, categories, locations, units, searchItems, findByCode, resolveCode,
@@ -218,13 +218,13 @@ export function viewItemEdit(ctx, id, query) {
       </div>
       <label class="field"><span>Назва *</span><input name="name" required value="${esc(item.name)}" placeholder="Напр. Мотор 2207 1750KV"></label>
       <div class="grid2">
+        ${isNew && can('ops.edit') ? '<label class="field"><span>Кількість на складі зараз</span><input name="init_qty" inputmode="decimal" placeholder="напр. 100"></label>' : ''}
+        <label class="field"><span>Одиниця виміру (без числа)</span><input name="unit" list="dl-unit" value="${esc(item.unit)}" placeholder="шт, м, кг…"></label>
         <label class="field"><span>Код / штрихкод / артикул</span>
           <div class="with-btn"><input name="code" value="${esc(item.code || '')}"><button type="button" class="icon-btn" id="scode" aria-label="Сканувати">${ICON_SCAN}</button></div></label>
         <label class="field"><span>Категорія</span><input name="category" list="dl-cat" value="${esc(item.category)}" placeholder="Мотори, Камери, Кабелі…"></label>
-        <label class="field"><span>Одиниця виміру</span><input name="unit" list="dl-unit" value="${esc(item.unit)}"></label>
         <label class="field"><span>Місце зберігання</span><input name="location" list="dl-loc" value="${esc(item.location)}" placeholder="Стелаж 2, коробка 5"></label>
         <label class="field"><span>Мінімальний залишок</span><input name="min_qty" inputmode="decimal" value="${item.min_qty ? fmtQty(item.min_qty) : ''}" placeholder="0 — не стежити"></label>
-        ${isNew && can('ops.edit') ? '<label class="field"><span>Початкова кількість</span><input name="init_qty" inputmode="decimal" placeholder="скільки зараз є на складі"></label>' : ''}
       </div>
       <label class="field"><span>Примітка</span><textarea name="note" rows="2">${esc(item.note)}</textarea></label>
       ${!isNew ? `<label class="check"><input type="checkbox" name="archived" ${item.archived ? 'checked' : ''}> В архіві (сховати зі списку)</label>` : ''}
@@ -265,8 +265,33 @@ export function viewItemEdit(ctx, id, query) {
     const min = parseNum(f.min_qty.value);
     const init = isNew && f.init_qty ? parseNum(f.init_qty.value) : null;
     if (Number.isNaN(min) || (min !== null && min < 0)) return toast('Мінімальний залишок — невідʼємне число', 'err');
-    if (Number.isNaN(init) || (init !== null && init < 0)) return toast('Початкова кількість — невідʼємне число', 'err');
+    if (Number.isNaN(init) || (init !== null && init < 0)) return toast('Кількість на складі — невідʼємне число', 'err');
+    // «100 шт» в одиниці виміру — це кількість не в тому полі: залишок лишився б 0
+    if (/\d/.test(f.unit.value)) {
+      f.unit.focus();
+      return toast(`В «Одиниця виміру» — лише «шт», «м», «кг», без числа. Кількість — ${isNew ? 'у полі «Кількість на складі зараз»' : 'через «＋ Прихід» у картці позиції'}.`, 'err', 8000);
+    }
     const btn = f.querySelector('#save');
+    // така позиція вже є → не плодити дубль: кількість додається до наявної, фото лишається одне
+    const twin = isNew && state.items.find((i) => norm(i.name) === norm(f.name.value));
+    if (twin) {
+      const add = init > 0 ? `Додати ${fmtQty(init)} ${twin.unit} до неї?` : 'Відкрити її?';
+      if (!await confirmDialog(`Позиція «${twin.name}» вже є — на складі ${fmtQty(twin.qty)} ${twin.unit}. ${add}`,
+        { ok: init > 0 ? 'Додати до наявної' : 'Відкрити' })) return;
+      btn.disabled = true;
+      try {
+        if (init > 0) await api.postOperation({ type: 'in', lines: [{ item_id: twin.id, qty: init }], comment: 'Додано повторно' });
+        const photo = !twin.photo_path && newPhoto ? await api.uploadPhoto(newPhoto) : twin.photo_path;
+        if (photo !== twin.photo_path || twin.archived) await api.saveItem({ ...twin, photo_path: photo, archived: false });
+        await reloadData();
+        if (init > 0) toast(`Додано ${fmtQty(init)} ${twin.unit} — разом ${fmtQty(state.byId.get(twin.id)?.qty)}`);
+        go(`#/item/${twin.id}`);
+      } catch (err) {
+        toast(err.message, 'err');
+        btn.disabled = false;
+      }
+      return;
+    }
     btn.disabled = true;
     try {
       let path = photoPath;

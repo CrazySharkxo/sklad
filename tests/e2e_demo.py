@@ -395,6 +395,58 @@ def main() -> int:
         expect(page.locator("#chips [data-trash]")).to_have_count(0)
         page.goto(url + "#/stock")
 
+        # --- нова позиція: число в «Одиниці виміру» відхиляється; повторна назва додає кількість до наявної ---
+        page.goto(url + "#/item-edit/new")
+        f = page.locator("#f")
+        expect(f.locator("label.field", has=page.locator("[name=init_qty]"))).to_contain_text("Кількість на складі зараз")
+        expect(f.locator("label.field", has=page.locator("[name=unit]"))).to_contain_text("Одиниця виміру (без числа)")
+        f.locator("[name=name]").fill("Дубль тест")
+        f.locator("[name=unit]").fill("100 шт")
+        f.locator("#save").click()
+        expect(page.locator(".toast", has_text="В «Одиниця виміру» — лише")).to_be_visible()
+        expect(page.locator("#f")).to_be_visible()  # лишились у формі, нічого не створено
+        f.locator("[name=unit]").fill("шт")
+        f.locator("[name=init_qty]").fill("100")
+        f.locator("#save").click()
+        expect(page.locator(".big-qty b")).to_have_text("100")
+        dup_url = page.url
+
+        # та сама відмова при редагуванні наявної
+        page.goto(page.url.replace("#/item/", "#/item-edit/"))
+        page.locator("#f [name=unit]").fill("5 шт")
+        page.locator("#save").click()
+        expect(page.locator(".toast", has_text="В «Одиниця виміру» — лише")).to_be_visible()
+        expect(page.locator("#f")).to_be_visible()
+
+        # та сама назва іншим регістром + кількість → питання → прихід на наявну, без другої позиції
+        page.goto(url + "#/item-edit/new")
+        f.locator("[name=name]").fill("дубль ТЕСТ")
+        f.locator("[name=init_qty]").fill("10")
+        f.locator("#save").click()
+        expect(page.locator(".modal")).to_contain_text("Позиція «Дубль тест» вже є — на складі 100 шт. Додати 10 шт до неї?")
+        page.screenshot(path=str(SHOTS / "27_duplicate.png"))
+        page.locator(".modal [data-r='1']").click()
+        expect(page.locator(".toast", has_text="Додано 10 шт — разом 110")).to_be_visible()
+        expect(page.locator(".big-qty b")).to_have_text("110")
+        assert page.url == dup_url, (page.url, dup_url)  # картка наявної позиції
+        expect(page.locator("#top h1")).to_have_text("Дубль тест")
+
+        # без кількості — лише «Відкрити», залишок не міняється
+        page.goto(url + "#/item-edit/new")
+        f.locator("[name=name]").fill("ДУБЛЬ ТЕСТ")
+        f.locator("#save").click()
+        expect(page.locator(".modal")).to_contain_text("Відкрити її?")
+        expect(page.locator(".modal [data-r='1']")).to_have_text("Відкрити")
+        page.locator(".modal [data-r='1']").click()
+        expect(page.locator(".big-qty b")).to_have_text("110")
+        assert page.url == dup_url, (page.url, dup_url)
+
+        page.goto(url + "#/stock")
+        expect(page.locator(".row-title", has_text=re.compile("дубль тест", re.I))).to_have_count(1)  # не задвоїлась
+        assert stock_qty(page, "Дубль тест") == "110"
+        page.goto(url + "#/journal")
+        expect(page.locator(".op", has_text="Додано повторно")).to_have_count(1)
+
         # --- користувачі та ролі (у демо — записи без входу) ---
         page.goto(url + "#/more")
         page.locator("a[href='#/users']").click()
