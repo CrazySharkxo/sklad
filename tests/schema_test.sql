@@ -13,6 +13,18 @@ do $$ begin
            where p.id = '11111111-1111-1111-1111-111111111111') = 'Адміністратор';
   assert (select r.name from public.profiles p join public.roles r on r.id = p.role_id
            where p.id = '22222222-2222-2222-2222-222222222222') = 'Лише перегляд';
+  -- перший акаунт — головний адміністратор, і він один
+  assert (select array_agg(id) from public.profiles where is_owner) = array['11111111-1111-1111-1111-111111111111'::uuid], 'головний';
+  -- ролі: чотири стартові + дві нові, з точним набором прав; повторний запуск schema.sql їх не подвоїв
+  assert (select count(*) from public.roles) = 6, 'ролей має бути 6';
+  assert (select perms from public.roles where name = 'Звичайний користувач')
+       = array['stock.view', 'ops.view', 'kits.view', 'orders.view'], 'Звичайний користувач';
+  assert (select perms from public.roles where name = 'Старший користувач')
+       = array['stock.view', 'stock.edit', 'ops.view', 'ops.edit', 'kits.view', 'kits.edit',
+               'orders.view', 'orders.edit', 'orders.all'], 'Старший користувач';
+  assert (select perms from public.roles where name = 'Адміністратор') = array['admin'];
+  assert (select perms from public.roles where name = 'Лише перегляд') = array['stock.view', 'ops.view', 'kits.view', 'orders.view', 'orders.all'];
+  assert (select roles_seed from public.app_settings) = 1;
 end $$;
 -- для перевірок складу обидва — адміністратори (обмежені права — окремо, в кінці)
 update public.profiles set role_id = (select id from public.roles where name = 'Адміністратор');
@@ -612,6 +624,246 @@ do $$ begin
   assert (select created_by from public.operations where comment = 'Петро') is null, 'автор лишився';
 end $$;
 
+-- =====================================================================
+--  Головний адміністратор: користувачами й ролями керує лише він
+-- =====================================================================
+-- ---- olena: роль «Адміністратор», але не головна ----
+reset role;
+select set_config('request.jwt.claim.sub', '22222222-2222-2222-2222-222222222222', false);
+set role authenticated;
+do $$
+declare
+  v_olya uuid := (select id from public.admin_users() where email = 'view@example.com');
+  v_ivan uuid := '11111111-1111-1111-1111-111111111111';
+  v_role uuid := (select id from public.roles where name = 'Комірник');
+  v_snap jsonb := (select jsonb_agg(to_jsonb(r) order by r.id) from public.roles r);
+  v_prof jsonb := (select jsonb_agg(to_jsonb(p) order by p.id) from public.profiles p);
+  v_n    int;
+begin
+  assert public.has_perm('admin') and not public.is_owner(), 'olena: адмін, але не головна';
+  assert public.owner_id() = v_ivan, 'owner_id';
+  assert (select count(*) from public.admin_users()) = 3, 'список людей адміну видно';
+  -- RPC: створити, змінити (роль / права / відділ / активність), пароль, видалити — нікого
+  begin
+    perform public.admin_create_user('new@example.com', 'secret1');
+    raise exception 'не головний створив користувача';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.admin_update_user(v_olya, 'Оля', v_role, null, null, true);
+    raise exception 'не головний змінив роль';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.admin_update_user(v_olya, 'Оля', null, null, array['admin'], true);
+    raise exception 'не головний змінив права';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.admin_update_user(v_olya, 'Оля', null, null, array['stock.view', 'stock.edit'], false);
+    raise exception 'не головний заблокував людину';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.admin_update_user(auth.uid(), 'olena', v_role, null, null, true);
+    raise exception 'не головний змінив роль собі';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.admin_set_password(v_olya, 'hacked12');
+    raise exception 'не головний змінив пароль';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.admin_delete_user(v_olya);
+    raise exception 'не головний видалив людину';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  -- головного не торкнутись
+  begin
+    perform public.admin_update_user(v_ivan, 'ivan', v_role, null, null, false);
+    raise exception 'не головний змінив головного';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.admin_set_password(v_ivan, 'hacked12');
+    raise exception 'не головний змінив пароль головного';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.admin_delete_user(v_ivan);
+    raise exception 'не головний видалив головного';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  -- напряму в таблиці, в обхід RPC: profiles
+  begin
+    update public.profiles set is_owner = true where id = auth.uid();
+    raise exception 'призначив себе головним';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    update public.profiles set is_owner = false where id = v_ivan;
+    raise exception 'зняв головного';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    update public.profiles set role_id = v_role where id = v_olya;
+    raise exception 'роль напряму';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    update public.profiles set perms = array['admin'] where id = v_olya;
+    raise exception 'права напряму';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    update public.profiles set active = false where id = v_ivan;
+    raise exception 'блокування напряму';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    update public.profiles set department_id = null where id = v_olya;
+    raise exception 'відділ напряму';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    insert into public.profiles (id, display_name) values (gen_random_uuid(), 'самозванець');
+    raise exception 'профіль напряму';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    delete from public.profiles where id = v_ivan;
+    raise exception 'профіль головного видалено';
+  exception when insufficient_privilege then null;
+  end;
+  update public.profiles set display_name = 'чуже імʼя' where id = v_ivan;   -- RLS: лише свій рядок
+  get diagnostics v_n = row_count;
+  assert v_n = 0, 'чуже імʼя змінено';
+  -- напряму в таблиці: roles (RLS — лише головний)
+  begin
+    insert into public.roles (name, perms) values ('Самочинна', array['admin']);
+    raise exception 'не головний створив роль';
+  exception when insufficient_privilege then null;
+  end;
+  update public.roles set perms = array['admin'] where name = 'Лише перегляд';
+  get diagnostics v_n = row_count;
+  assert v_n = 0, 'не головний змінив роль';
+  update public.roles set name = 'Перейменована' where name = 'Комірник';
+  get diagnostics v_n = row_count;
+  assert v_n = 0, 'не головний перейменував роль';
+  delete from public.roles where name = 'Склад-плюс';
+  get diagnostics v_n = row_count;
+  assert v_n = 0, 'не головний видалив роль';
+  assert (select jsonb_agg(to_jsonb(r) order by r.id) from public.roles r) = v_snap, 'ролі змінилися';
+  assert (select jsonb_agg(to_jsonb(p) order by p.id) from public.profiles p) = v_prof, 'профілі змінилися';
+  assert (select count(*) from public.roles) = 7;   -- їх видно всім
+  -- решта адмінського лишилась: налаштування, знімок для копії, відділи, своє імʼя
+  assert (public.admin_settings() ->> 'org_name') is not null;
+  perform public.admin_save_settings('{"org_name": "ТОВ Тест"}');
+  assert (public.admin_dump() -> 'roles') is not null;
+  insert into public.departments (name) values ('Тимчасовий відділ');
+  update public.departments set name = 'Тимчасовий 2' where name = 'Тимчасовий відділ';
+  delete from public.departments where name = 'Тимчасовий 2';
+  update public.profiles set display_name = 'olena' where id = auth.uid();
+end $$;
+
+-- ---- ivan: головний — може все, але себе не вимкне й не понизить ----
+reset role;
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+do $$
+declare
+  v_ivan  uuid := '11111111-1111-1111-1111-111111111111';
+  v_olena uuid := '22222222-2222-2222-2222-222222222222';
+  v_admin uuid := (select id from public.roles where name = 'Адміністратор');
+  v_new   uuid;
+  v_role  uuid;
+begin
+  assert public.is_owner() and public.owner_id() = v_ivan;
+  -- користувач: створити (нова роль), роль, свої права, відділ, блокування, пароль, видалити
+  v_new := public.admin_create_user('senior@example.com', 'secret1', 'Старший',
+    (select id from public.roles where name = 'Старший користувач'), null);
+  perform public.admin_update_user(v_new, 'Старший', (select id from public.roles where name = 'Звичайний користувач'),
+    (select id from public.departments where name = 'Тестування'), null, true);
+  assert (select r.name from public.profiles p join public.roles r on r.id = p.role_id where p.id = v_new) = 'Звичайний користувач';
+  perform public.admin_update_user(v_new, 'Старший', null, null, array['stock.view'], false);
+  assert (select not active and perms = array['stock.view'] and department_id is null from public.profiles where id = v_new);
+  perform public.admin_set_password(v_new, 'newpass2');
+  perform public.admin_delete_user(v_new);
+  assert not exists (select 1 from public.profiles where id = v_new);
+  -- роль: створити, змінити, видалити
+  insert into public.roles (name, perms) values ('Тимчасова', array['stock.view']) returning id into v_role;
+  update public.roles set name = 'Тимчасова 2', perms = array['stock.view', 'ops.view'] where id = v_role;
+  assert (select perms from public.roles where id = v_role) = array['stock.view', 'ops.view'];
+  delete from public.roles where id = v_role;
+  assert not exists (select 1 from public.roles where id = v_role);
+  -- себе: не заблокувати, не понизити (ні роллю, ні галочками, ні «без ролі»), не видалити
+  begin
+    perform public.admin_update_user(v_ivan, 'ivan', v_admin, null, null, false);
+    raise exception 'головний заблокував себе';
+  exception when raise_exception then assert sqlerrm = 'Не можна заблокувати самого себе', sqlerrm;
+  end;
+  begin
+    perform public.admin_update_user(v_ivan, 'ivan', (select id from public.roles where name = 'Старший користувач'), null, null, true);
+    raise exception 'головний понизив себе роллю';
+  exception when raise_exception then assert sqlerrm like 'Не можна забрати права адміністратора%', sqlerrm;
+  end;
+  begin
+    perform public.admin_update_user(v_ivan, 'ivan', v_admin, null, array['stock.view'], true);
+    raise exception 'головний понизив себе галочками';
+  exception when raise_exception then assert sqlerrm like 'Не можна забрати права адміністратора%', sqlerrm;
+  end;
+  begin
+    perform public.admin_update_user(v_ivan, 'ivan', null, null, null, true);
+    raise exception 'головний лишив себе без ролі';
+  exception when raise_exception then assert sqlerrm like 'Не можна забрати права адміністратора%', sqlerrm;
+  end;
+  begin
+    perform public.admin_delete_user(v_ivan);
+    raise exception 'головний видалив себе';
+  exception when raise_exception then assert sqlerrm = 'Не можна видалити самого себе', sqlerrm;
+  end;
+  -- через роль теж ні: інший адміністратор лишається (свої галочки), а головний втратив би права
+  perform public.admin_update_user(v_olena, 'olena', v_admin, null, array['admin'], true);
+  begin
+    update public.roles set perms = array['stock.view'] where id = v_admin;
+    raise exception 'головного понижено зміною ролі';
+  exception when raise_exception then assert sqlerrm like 'Головного адміністратора не можна%', sqlerrm;
+  end;
+  begin
+    delete from public.roles where id = v_admin;
+    raise exception 'головного понижено видаленням ролі';
+  exception when raise_exception then assert sqlerrm like 'Головного адміністратора не можна%', sqlerrm;
+  end;
+  perform public.admin_update_user(v_olena, 'olena', v_admin, null, null, true);
+  assert (select role_id = v_admin and active and is_owner from public.profiles where id = v_ivan), 'головний на місці';
+  -- своє імʼя міняє, як усі; дані (name) зберіг
+  perform public.admin_update_user(v_ivan, 'ivan', v_admin, null, null, true);
+end $$;
+reset role;
+do $$ begin
+  -- рівно один: другого головного база не прийме навіть від власника схеми
+  begin
+    update public.profiles set is_owner = true where id = '22222222-2222-2222-2222-222222222222';
+    raise exception 'другий головний пройшов';
+  exception when unique_violation then null;
+  end;
+  assert (select count(*) from public.profiles where is_owner) = 1;
+  assert (select count(*) from public.roles) = 7, 'ролі: 6 стартових + Склад-плюс';
+end $$;
+
+-- не-адмін (Оля, свої галочки): хто головний — бачить, керувати не може
+select set_config('request.jwt.claim.sub', (select id::text from auth.users where email = 'view@example.com'), false);
+set role authenticated;
+do $$ begin
+  assert public.owner_id() = '11111111-1111-1111-1111-111111111111' and not public.is_owner();
+  begin
+    perform public.admin_create_user('new2@example.com', 'secret1');
+    raise exception 'не-адмін створив користувача';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+end $$;
+
 -- без входу — нічого не видно і нічого не провести
 reset role;
 set role anon;
@@ -648,6 +900,16 @@ do $$ begin
   begin
     perform * from public.admin_users();
     raise exception 'анонім побачив користувачів';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    perform public.owner_id();
+    raise exception 'анонім дізнався головного';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    perform public.admin_create_user('anon@example.com', 'secret1');
+    raise exception 'анонім створив користувача';
   exception when insufficient_privilege then null;
   end;
 end $$;

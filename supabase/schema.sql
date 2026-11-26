@@ -16,13 +16,15 @@ create table if not exists public.profiles (
 
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  -- адміністраторів ще немає: це перший акаунт — він адміністратор і головний адміністратор
+  v_first boolean := not exists (select 1 from public.profiles p join public.roles r on r.id = p.role_id
+                                  where p.active and 'admin' = any(coalesce(p.perms, r.perms)));
 begin
-  insert into public.profiles (id, display_name, role_id)
+  insert into public.profiles (id, display_name, role_id, is_owner)
   values (new.id, split_part(coalesce(new.email, ''), '@', 1),
-          (select id from public.roles
-            where name = case when exists (select 1 from public.profiles p join public.roles r on r.id = p.role_id
-                                            where p.active and 'admin' = any(coalesce(p.perms, r.perms)))
-                              then 'Лише перегляд' else 'Адміністратор' end))
+          (select id from public.roles where name = case when v_first then 'Адміністратор' else 'Лише перегляд' end),
+          v_first and not exists (select 1 from public.profiles where is_owner))
   on conflict (id) do nothing;
   return new;
 end $$;
@@ -1072,7 +1074,8 @@ end $$;
 --             orders — замовлення
 --    дії:     .view (перегляд) .edit (зміна) .delete (видалення, кошик)
 --    orders.all — замовлення всіх відділів (без нього — лише свого відділу)
---    admin      — користувачі, ролі, відділи і всі інші права
+--    admin      — відділи, налаштування, сповіщення, резервні копії і всі інші права
+--    Користувачами й ролями керує лише головний адміністратор (profiles.is_owner).
 --  Права людини = власні галочки (profiles.perms), а якщо їх нема — права ролі.
 -- ---------------------------------------------------------------------
 create or replace function public.all_perms()
@@ -1105,10 +1108,28 @@ select v.name, v.perms from (values
 ) as v(name, perms)
 where not exists (select 1 from public.roles);
 
+-- ролі, додані пізніше, — один раз за позначкою: видалена в програмі роль не повертається
+-- при наступному запуску цього файлу (і на новій, і на наявній базі)
+alter table public.app_settings add column if not exists roles_seed int not null default 0;
+do $$ begin
+  if (select roles_seed from public.app_settings where id = 1) < 1 then
+    insert into public.roles (name, perms)
+    select v.name, v.perms from (values
+      ('Звичайний користувач', array['stock.view', 'ops.view', 'kits.view', 'orders.view']),
+      ('Старший користувач',   array['stock.view', 'stock.edit', 'ops.view', 'ops.edit', 'kits.view', 'kits.edit',
+                                     'orders.view', 'orders.edit', 'orders.all'])
+    ) as v(name, perms)
+    where not exists (select 1 from public.roles r where lower(r.name) = lower(v.name));
+    update public.app_settings set roles_seed = 1 where id = 1;
+  end if;
+end $$;
+
 alter table public.profiles
   add column if not exists role_id uuid references public.roles(id) on delete set null,
   add column if not exists perms   text[],                          -- null = як у ролі
-  add column if not exists active  boolean not null default true;  -- false = заблокований
+  add column if not exists active  boolean not null default true,  -- false = заблокований
+  add column if not exists is_owner boolean not null default false; -- головний адміністратор (рівно один)
+create unique index if not exists profiles_owner_uq on public.profiles (is_owner) where is_owner;
 alter table public.profiles drop constraint if exists profiles_perms_chk;
 alter table public.profiles add constraint profiles_perms_chk check (perms is null or perms <@ public.all_perms());
 
@@ -1118,6 +1139,21 @@ update public.profiles
  where role_id is null and perms is null
    and not exists (select 1 from public.profiles p join public.roles r on r.id = p.role_id
                     where 'admin' = any(coalesce(p.perms, r.perms)));
+
+-- головний адміністратор: лише він керує користувачами й ролями (require_owner нижче).
+-- Якщо його ще немає — ним стає найраніше створений активний адміністратор;
+-- уже призначеного повторний запуск не змінює. Застосунок цю колонку записати не може
+-- (на profiles дозволено оновлювати лише display_name). Передати вручну — README.
+update public.profiles
+   set is_owner = true
+ where not exists (select 1 from public.profiles where is_owner)
+   and id = (select p.id
+               from public.profiles p
+               left join public.roles r on r.id = p.role_id
+               left join auth.users u on u.id = p.id
+              where p.active and 'admin' = any(coalesce(p.perms, r.perms, '{}'))
+              order by u.created_at nulls last, p.created_at, p.id
+              limit 1);
 
 -- права поточного користувача (заблокований — без прав)
 create or replace function public.my_perms()
@@ -1187,7 +1223,30 @@ begin
   end if;
 end $$;
 
--- хоч один активний адміністратор має лишитися завжди
+-- головний адміністратор: чи це я (заблокований — ні) і хто він (застосунок показує бейдж)
+create or replace function public.is_owner()
+returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce((select active and is_owner from public.profiles where id = auth.uid()), false)
+$$;
+
+create or replace function public.owner_id()
+returns uuid language sql stable security definer set search_path = public as $$
+  select id from public.profiles where is_owner and public.is_active()
+$$;
+
+-- перевірка на початку кожної функції, що керує користувачами
+create or replace function public.require_owner()
+returns void language plpgsql stable security definer set search_path = public as $$
+begin
+  if auth.uid() is null then
+    raise exception 'Потрібно увійти';
+  end if;
+  if not public.is_owner() then
+    raise exception 'Права надає лише головний адміністратор';
+  end if;
+end $$;
+
+-- хоч один активний адміністратор має лишитися завжди; головний — завжди активний адміністратор
 create or replace function public.assert_admin_left()
 returns void language plpgsql security definer set search_path = public as $$
 begin
@@ -1195,6 +1254,10 @@ begin
        select 1 from public.profiles p left join public.roles r on r.id = p.role_id
         where p.active and 'admin' = any(coalesce(p.perms, r.perms, '{}'))) then
     raise exception 'Має лишитися хоча б один активний адміністратор';
+  end if;
+  if exists (select 1 from public.profiles p left join public.roles r on r.id = p.role_id
+              where p.is_owner and not (p.active and 'admin' = any(coalesce(p.perms, r.perms, '{}')))) then
+    raise exception 'Головного адміністратора не можна заблокувати чи позбавити прав адміністратора';
   end if;
 end $$;
 
@@ -1209,7 +1272,8 @@ create trigger roles_guard after update or delete on public.roles
   for each statement execute function public.roles_guard();
 
 -- ---------------------------------------------------------------------
---  Керування користувачами — лише адміністратор
+--  Керування користувачами — лише головний адміністратор (require_owner);
+--  список людей (admin_users) бачить кожен адміністратор
 -- ---------------------------------------------------------------------
 create or replace function public.admin_users()
 returns table (id uuid, email text, display_name text, role_id uuid, department_id uuid,
@@ -1232,7 +1296,7 @@ declare
   v       uuid := gen_random_uuid();
   v_email text := lower(trim(coalesce(p_email, '')));
 begin
-  perform public.require('admin');
+  perform public.require_owner();
   if v_email !~ '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$' then
     raise exception 'Неправильний email';
   end if;
@@ -1266,7 +1330,7 @@ create or replace function public.admin_update_user(
 ) returns void
 language plpgsql security definer set search_path = public as $$
 begin
-  perform public.require('admin');
+  perform public.require_owner();
   if p_user = auth.uid() and not p_active then
     raise exception 'Не можна заблокувати самого себе';
   end if;
@@ -1295,7 +1359,7 @@ end $$;
 create or replace function public.admin_set_password(p_user uuid, p_password text)
 returns void language plpgsql security definer set search_path = public as $$
 begin
-  perform public.require('admin');
+  perform public.require_owner();
   if length(coalesce(p_password, '')) < 6 then
     raise exception 'Пароль — мінімум 6 символів';
   end if;
@@ -1310,9 +1374,12 @@ end $$;
 create or replace function public.admin_delete_user(p_user uuid)
 returns void language plpgsql security definer set search_path = public as $$
 begin
-  perform public.require('admin');
+  perform public.require_owner();
   if p_user = auth.uid() then
     raise exception 'Не можна видалити самого себе';
+  end if;
+  if exists (select 1 from public.profiles where id = p_user and is_owner) then
+    raise exception 'Головного адміністратора не можна видалити';
   end if;
   delete from auth.users where id = p_user;
   if not found then
@@ -1363,8 +1430,9 @@ create policy profiles_upd  on public.profiles for update to authenticated using
 drop policy if exists roles_read  on public.roles;
 drop policy if exists roles_admin on public.roles;
 create policy roles_read  on public.roles for select to authenticated using ((select public.is_active()));
+-- ролі змінює лише головний адміністратор (як і користувачів)
 create policy roles_admin on public.roles for all to authenticated
-  using ((select public.has_perm('admin'))) with check ((select public.has_perm('admin')));
+  using ((select public.is_owner())) with check ((select public.is_owner()));
 
 drop policy if exists items_all    on public.items;
 drop policy if exists items_read   on public.items;
@@ -1562,6 +1630,9 @@ revoke execute on function public.admin_update_user(uuid, text, uuid, uuid, text
 revoke execute on function public.admin_set_password(uuid, text) from public, anon;
 revoke execute on function public.admin_delete_user(uuid) from public, anon;
 revoke execute on function public.set_my_department(uuid) from public, anon;
+revoke execute on function public.is_owner() from public, anon;
+revoke execute on function public.owner_id() from public, anon;
+revoke execute on function public.require_owner() from public, anon;
 grant  execute on function public.my_perms() to authenticated;
 grant  execute on function public.has_perm(text) to authenticated;
 grant  execute on function public.is_active() to authenticated;
@@ -1575,6 +1646,9 @@ grant  execute on function public.admin_update_user(uuid, text, uuid, uuid, text
 grant  execute on function public.admin_set_password(uuid, text) to authenticated;
 grant  execute on function public.admin_delete_user(uuid) to authenticated;
 grant  execute on function public.set_my_department(uuid) to authenticated;
+grant  execute on function public.is_owner() to authenticated;
+grant  execute on function public.owner_id() to authenticated;
+grant  execute on function public.require_owner() to authenticated;
 revoke execute on function public.assert_admin_left() from public, anon, authenticated;
 
 -- сповіщення й налаштування: відправляти вміють лише функції (security definer), з застосунку — лише тест/прострочені

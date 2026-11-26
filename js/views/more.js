@@ -1,7 +1,7 @@
 // Дозамовити, етикетки, імпорт/експорт Excel, профіль
 import { api, isDemo } from '../api.js';
 import { esc, fmtQty, parseNum, norm, toast, confirmDialog, promptDialog, downloadXlsx, readSheet, todayIso } from '../util.js';
-import { state, go, reloadData, activeItems, isLow, searchItems, hydratePhotos, thumb, myDepartment, depName, can } from '../core.js';
+import { canManageUsers, state, go, reloadData, activeItems, isLow, searchItems, hydratePhotos, thumb, myDepartment, depName, can } from '../core.js';
 import { printLabels } from './stock.js';
 import { exportJournal } from './ops.js';
 import { exportOrders } from './orders.js';
@@ -19,7 +19,7 @@ export function viewMore(ctx) {
       він відкриє потрібні розділи в «Ще → Користувачі».</div>`}
     <div class="menu">
       ${queued ? `<a href="#/outbox" class="menu-item outbox-item"><b>Черга відправки</b><span class="muted">${esc(outboxBannerText())}</span></a>` : ''}
-      ${can('admin') ? `<a href="#/users" class="menu-item"><b>Користувачі та ролі</b><span class="muted">додати людей, права доступу, блокування</span></a>
+      ${can('admin') ? `<a href="#/users" class="menu-item"><b>Користувачі та ролі</b><span class="muted">${canManageUsers() ? 'додати людей, права доступу, блокування' : 'список людей і ролей — лише перегляд'}</span></a>
       <a href="#/notifications" class="menu-item"><b>Сповіщення Telegram</b><span class="muted">нові замовлення, передачі, мало на складі, прострочені</span></a>
       <a href="#/backups" class="menu-item"><b>Резервні копії</b><span class="muted">${isDemo ? 'завантажити копію даних' : esc(lastBackupText(state.settings?.backup_at))}</span></a>` : ''}
       <a href="#/departments" class="menu-item"><b>Відділи</b><span class="muted">${dep ? `мій відділ: ${esc(depName(dep))}` : 'свій відділ ще не вибрано'}</span></a>

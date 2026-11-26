@@ -234,6 +234,8 @@ main { padding: 0 16px; max-width: 980px; }
 .hist-row b { font-size: 16px; white-space: nowrap; }
 .hist-row.cancelled { opacity: .5; text-decoration: line-through; }
 .tag { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; margin-right: 6px; }
+.user-row .row-title { white-space: normal; }   /* імʼя + «ви» + «Головний адміністратор» на вузькому екрані */
+.user-row .row-title .tag { margin: 2px 0 2px 4px; }
 .tag.in { background: var(--in-soft); color: var(--in); }
 .tag.out { background: var(--out-soft); color: var(--out); }
 .tag.adj { background: var(--adj-soft); color: var(--adj); }

@@ -158,6 +158,14 @@ class SupaApi {
 
   // ---------- права, ролі, користувачі ----------
   async myPerms() { return (await this.q(this.sb.rpc('my_perms'))) || []; }
+  // Головний адміністратор: id; null — у базі його немає; undefined — база зі старою схемою,
+  // де головного ще немає як поняття (тоді людьми керує будь-який адміністратор, як раніше).
+  async ownerId() {
+    const { data, error } = await this.sb.rpc('owner_id');
+    if (!error) return data || null;
+    if (/Failed to fetch|NetworkError|Load failed/i.test(error.message || '')) throw friendly(error);
+    return undefined;
+  }
   async roles() { return await this.q(this.sb.from('roles').select('id, name, perms').order('name')); }
   async saveRole({ id, name, perms }) {
     const row = { name: String(name || '').trim(), perms };
@@ -418,6 +426,12 @@ const DEMO_ROLES = [
   ['Виробництво', ['stock.view', 'ops.view', 'ops.edit', 'kits.view', 'orders.view', 'orders.edit']],
   ['Лише перегляд', ['stock.view', 'ops.view', 'kits.view', 'orders.view', 'orders.all']],
 ];
+// додані пізніше — один раз (позначка roles_seed), щоб видалена роль не поверталася
+const DEMO_ROLES_2 = [
+  ['Звичайний користувач', ['stock.view', 'ops.view', 'kits.view', 'orders.view']],
+  ['Старший користувач', ['stock.view', 'stock.edit', 'ops.view', 'ops.edit', 'kits.view', 'kits.edit', 'orders.view', 'orders.edit', 'orders.all']],
+];
+const OWNER_ONLY = 'Права надає лише головний адміністратор';
 const DEMO_USER = '00000000-0000-0000-0000-00000000demo';
 
 class LocalApi {
@@ -436,6 +450,22 @@ class LocalApi {
     if (!d.roles) {
       d.roles = DEMO_ROLES.map(([name, perms]) => ({ id: crypto.randomUUID(), name, perms }));
       d.users = { [DEMO_USER]: { email: 'demo@example.com', role_id: d.roles[0].id, perms: null, active: true, created_at: new Date().toISOString() } };
+      try { this.save(d); } catch { /* */ }
+    }
+    // головний адміністратор і дві нові ролі — і в демо-даних, збережених до їх появи
+    if (!d.owner || !d.users[d.owner] || (d.roles_seed || 0) < 1) {
+      if (!d.owner || !d.users[d.owner]) {
+        // як у schema.sql: найраніше створений активний адміністратор
+        d.owner = Object.keys(d.users)
+          .filter((id) => this.permsOf(d, id).includes('admin'))
+          .sort((a, b) => String(d.users[a].created_at).localeCompare(String(d.users[b].created_at)))[0] || DEMO_USER;
+      }
+      if ((d.roles_seed || 0) < 1) {
+        for (const [name, perms] of DEMO_ROLES_2) {
+          if (!d.roles.some((r) => r.name.toLowerCase() === name.toLowerCase())) d.roles.push({ id: crypto.randomUUID(), name, perms });
+        }
+        d.roles_seed = 1;
+      }
       try { this.save(d); } catch { /* */ }
     }
     if (!d.departments) {
@@ -512,11 +542,20 @@ class LocalApi {
     if (!Object.keys(d.users).some((id) => d.users[id].active && this.permsOf(d, id).includes('admin'))) {
       throw new Error('Має лишитися хоча б один активний адміністратор');
     }
+    if (!this.permsOf(d, d.owner).includes('admin')) {
+      throw new Error('Головного адміністратора не можна заблокувати чи позбавити прав адміністратора');
+    }
+  }
+  // користувачами й ролями керує лише головний адміністратор (require_owner у schema.sql)
+  requireOwner(d) {
+    if (d.owner !== DEMO_USER) throw new Error(OWNER_ONLY);
   }
   async myPerms() { return this.permsOf(this.load(), DEMO_USER); }
+  async ownerId() { return this.load().owner; }
   async roles() { return this.load().roles.slice().sort((a, b) => a.name.localeCompare(b.name, 'uk')); }
   async saveRole({ id, name, perms }) {
     const d = this.load();
+    this.requireOwner(d);
     const n = String(name || '').trim();
     if (!n) throw new Error('Вкажіть назву ролі');
     if (d.roles.some((r) => r.id !== id && r.name.toLowerCase() === n.toLowerCase())) throw new Error('Така роль уже є');
@@ -528,6 +567,7 @@ class LocalApi {
   }
   async deleteRole(id) {
     const d = this.load();
+    this.requireOwner(d);
     d.roles = d.roles.filter((r) => r.id !== id);
     for (const u of Object.values(d.users)) if (u.role_id === id) u.role_id = null;
     this.assertAdminLeft(d);
@@ -542,6 +582,7 @@ class LocalApi {
   }
   async createUser({ email, password, name, role_id, department_id }) {
     const d = this.load();
+    this.requireOwner(d);
     const e = String(email || '').trim().toLowerCase();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)) throw new Error('Неправильний email');
     if (String(password || '').length < 6) throw new Error('Пароль — мінімум 6 символів');
@@ -555,6 +596,7 @@ class LocalApi {
   }
   async updateUser({ id, name, role_id, department_id, perms, active }) {
     const d = this.load();
+    this.requireOwner(d);
     const u = d.users[id];
     if (!u) throw new Error('Користувача не знайдено');
     if (id === DEMO_USER && !active) throw new Error('Не можна заблокувати самого себе');
@@ -566,11 +608,14 @@ class LocalApi {
     this.save(d);
   }
   async setUserPassword(id, password) {
+    this.requireOwner(this.load());
     if (String(password || '').length < 6) throw new Error('Пароль — мінімум 6 символів');
   }
   async deleteUser(id) {
     const d = this.load();
+    this.requireOwner(d);
     if (id === DEMO_USER) throw new Error('Не можна видалити самого себе');
+    if (id === d.owner) throw new Error('Головного адміністратора не можна видалити');
     delete d.users[id];
     delete d.profiles[id];
     delete d.profileDeps[id];

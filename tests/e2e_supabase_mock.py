@@ -8,6 +8,10 @@
 category_order і функцій порядку) працює як раніше, а спроба змінити порядок дає
 зрозуміле повідомлення; на новій схемі порядок зберігається одним викликом rpc;
 без мережі зміна не ставиться в чергу.
+
+Головний адміністратор: на базі зі СТАРОЮ схемою (функції owner_id ще немає) адміністратор
+керує людьми, як раніше; на новій — керування лише в головного, інший адміністратор бачить
+список для читання.
 """
 import base64
 import functools
@@ -25,6 +29,7 @@ from playwright.sync_api import sync_playwright, expect
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FAKE = "https://fake-project.supabase.co"
 UID = "11111111-1111-1111-1111-111111111111"
+OTHER = "22222222-2222-2222-2222-222222222222"
 
 
 def b64(d):
@@ -47,7 +52,8 @@ def main() -> int:
                         "app_metadata": {}, "user_metadata": {}, "created_at": "2026-01-01T00:00:00Z"}}
     calls = []
     items = []
-    db = {"new_schema": False, "category_order": []}
+    # owner: "absent" — у базі ще немає функції owner_id (стара схема); інакше — id головного
+    db = {"new_schema": False, "category_order": [], "owner": "absent"}
 
     def handle(route):
         req = route.request
@@ -92,12 +98,26 @@ def main() -> int:
             return route.fulfill(json=[{"id": "dddddddd-0000-0000-0000-000000000001", "name": "Тестування"}])
         if path.startswith("/rest/v1/rpc/my_perms"):
             return route.fulfill(json=["admin"])
+        if path.startswith("/rest/v1/rpc/owner_id"):
+            if db["owner"] == "absent":
+                return route.fulfill(status=404, json={
+                    "code": "PGRST202", "hint": None,
+                    "details": "Searched for the function public.owner_id without parameters or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.",
+                    "message": "Could not find the function public.owner_id without parameters in the schema cache"})
+            return route.fulfill(json=db["owner"])
+        if path.startswith("/rest/v1/rpc/admin_users"):
+            return route.fulfill(json=[
+                {"id": UID, "email": "ivan@example.com", "display_name": "ivan", "role_id": "r1", "department_id": None,
+                 "perms": None, "active": True, "last_sign_in_at": None, "created_at": "2026-01-01T00:00:00Z"},
+                {"id": OTHER, "email": "olena@example.com", "display_name": "olena", "role_id": "r1", "department_id": None,
+                 "perms": None, "active": True, "last_sign_in_at": None, "created_at": "2026-02-01T00:00:00Z"}])
         if path.startswith("/rest/v1/roles"):
             return route.fulfill(json=[{"id": "r1", "name": "Адміністратор", "perms": ["admin"]}])
         if path.startswith("/rest/v1/rpc/purge_trash"):
             return route.fulfill(json=[])
         if path.startswith("/rest/v1/profiles"):
-            return route.fulfill(json=[{"id": UID, "display_name": "ivan", "department_id": None}])
+            return route.fulfill(json=[{"id": UID, "display_name": "ivan", "department_id": None},
+                                       {"id": OTHER, "display_name": "olena", "department_id": None}])
         if path.startswith("/rest/v1/items") and req.method == "POST":
             row = json.loads(req.post_data)
             row = row[0] if isinstance(row, list) else row
@@ -234,6 +254,58 @@ def main() -> int:
         expect(page.locator("#list a.row")).to_have_count(2)
         assert titles() == ["Антена", "Мотор"] and cat_chips() == ["Антени", "Мотори"], (titles(), cat_chips())  # збережене пережило перезавантаження
         assert len(order_rpc("set_item_order")) == 1
+
+        # ---------- головний адміністратор ----------
+        def users_page():
+            calls.clear()
+            page.goto(url + "#/users")
+            reload()
+            expect(page.locator(".user-row")).to_have_count(2)
+            assert [c for c in calls if "/rpc/owner_id" in c[1]], "owner_id не запитано"
+
+        # новий застосунок, база ще без головного (schema.sql не запускали): адміністратор керує, як раніше
+        assert db["owner"] == "absent"
+        users_page()
+        expect(page.locator("a[href='#/user/new']")).to_have_count(1)
+        expect(page.locator("a.user-row")).to_have_count(2)
+        expect(page.locator(".owner-tag")).to_have_count(0)
+        expect(page.locator("#ro-note")).to_have_count(0)
+        page.locator(".user-row", has_text="olena").click()
+        expect(page.locator("#f [name=role]")).to_be_enabled()            # форма робоча
+        expect(page.locator("#save")).to_be_visible()
+        page.goto(url + "#/roles")
+        expect(page.locator("a[href='#/role/new']")).to_have_count(1)
+
+        # після schema.sql: я — головний
+        db["owner"] = UID
+        users_page()
+        expect(page.locator(".user-row", has_text="ivan").locator(".owner-tag")).to_have_text("Головний адміністратор")
+        expect(page.locator(".owner-tag")).to_have_count(1)
+        expect(page.locator("a[href='#/user/new']")).to_have_count(1)
+        expect(page.locator("a.user-row")).to_have_count(2)
+        page.locator(".user-row", has_text="ivan").click()
+        expect(page.locator("#owner-note")).to_be_visible()
+        expect(page.locator("#f [name=role]")).to_be_disabled()           # із себе роль не зняти
+
+        # після schema.sql: головний — інша людина, я лише адміністратор
+        db["owner"] = OTHER
+        users_page()
+        expect(page.locator("#ro-note")).to_contain_text("Права надає лише головний адміністратор")
+        expect(page.locator("#ro-note")).to_contain_text("olena")
+        expect(page.locator(".user-row", has_text="olena").locator(".owner-tag")).to_have_count(1)
+        expect(page.locator("a[href='#/user/new']")).to_have_count(0)
+        expect(page.locator("a.user-row")).to_have_count(0)
+        page.goto(url + f"#/user/{OTHER}")
+        expect(page.locator("#ro-note")).to_be_visible()
+        expect(page.locator("#f")).to_have_count(0)
+        page.goto(url + "#/roles")
+        expect(page.locator("a[href='#/role/new']")).to_have_count(0)
+        expect(page.locator("a.row")).to_have_count(0)
+        page.goto(url + "#/more")
+        expect(page.locator("a[href='#/notifications']")).to_have_count(1)  # решта адмінського лишилась
+        assert not [c for c in calls if any(f"/rpc/admin_{x}" in c[1] for x in ("create_user", "update_user", "set_password", "delete_user"))]
+        # функції, на які спирається клієнт, є в schema.sql
+        assert re.search(r"function public\.owner_id\(\)\s+returns uuid", sql), "owner_id у schema.sql"
         browser.close()
     httpd.shutdown()
     if errors:

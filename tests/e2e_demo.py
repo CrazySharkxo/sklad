@@ -677,6 +677,9 @@ def main() -> int:
         page.goto(url + "#/more")
         page.locator("a[href='#/users']").click()
         expect(page.locator(".user-row")).to_have_count(1)
+        # демо-користувач — головний адміністратор: бейдж і керування
+        expect(page.locator(".user-row .owner-tag")).to_have_text("Головний адміністратор")
+        expect(page.locator("#ro-note")).to_have_count(0)
         page.locator("a[href='#/user/new']").click()
         f = page.locator("#f")
         f.locator("[name=name]").fill("Петро")
@@ -702,19 +705,61 @@ def main() -> int:
         assert "Збережено" in toast_text()
         expect(page.locator(".user-row", has_text="Петро")).to_contain_text("свої права")
         page.screenshot(path=str(SHOTS / "20_users.png"))
+        # очима головного: бейдж лише біля нього, рядки — посилання на картки, є «+ Користувач»
+        expect(page.locator(".user-row .owner-tag")).to_have_count(1)
+        expect(page.locator(".user-row", has_text="ви").locator(".owner-tag")).to_have_count(1)
+        expect(page.locator("a.user-row")).to_have_count(2)
+        expect(page.locator("a[href='#/user/new']")).to_have_count(1)
+        page.screenshot(path=str(SHOTS / "32_owner_users.png"))
 
         page.locator(".user-row", has_text="ви").click()
         expect(page.locator("[name=active]")).to_be_disabled()           # себе не заблокувати
         expect(page.locator("#del")).to_have_count(0)                     # і не видалити
+        # головний не зніме із себе роль і права
+        expect(page.locator("#owner-note")).to_contain_text("головний адміністратор")
+        expect(page.locator("#f [name=role]")).to_be_disabled()
+        expect(page.locator("#f [name=mode][value=own]")).to_be_disabled()
+        expect(page.locator("[data-p='admin']")).to_be_disabled()
+        page.locator("#f [name=name]").fill("Демо")
+        page.locator("#save").click()                                     # імʼя зберігається, роль лишається
+        assert "Збережено" in toast_text()
+        expect(page.locator(".user-row", has_text="ви").locator(".row-meta")).to_contain_text("Адміністратор")
+        owner_errs = page.evaluate("""async () => {
+            const { api } = await import('./js/api.js');
+            const me = '00000000-0000-0000-0000-00000000demo';
+            const roles = await api.roles();
+            const role = (n) => roles.find((r) => r.name === n).id;
+            const out = [];
+            for (const f of [
+              () => api.updateUser({ id: me, name: 'Демо', role_id: role('Адміністратор'), department_id: null, perms: null, active: false }),
+              () => api.updateUser({ id: me, name: 'Демо', role_id: role('Старший користувач'), department_id: null, perms: null, active: true }),
+              () => api.deleteUser(me),
+              () => api.deleteRole(role('Адміністратор')),
+            ]) { try { await f(); out.push('ok'); } catch (e) { out.push(e.message); } }
+            return out;
+        }""")
+        assert owner_errs[0] == "Не можна заблокувати самого себе", owner_errs
+        assert owner_errs[1].startswith("Не можна забрати права адміністратора"), owner_errs
+        assert owner_errs[2] == "Не можна видалити самого себе", owner_errs
+        assert owner_errs[3].startswith(("Має лишитися", "Головного адміністратора не можна")), owner_errs
 
         page.goto(url + "#/roles")
-        expect(page.locator(".list .row")).to_have_count(4)
+        expect(page.locator(".list .row")).to_have_count(6)               # чотири стартові + дві нові
+        expect(page.locator(".list .row", has_text="Звичайний користувач").locator(".row-meta")).to_have_text(
+            "Склад: перегляд · Прихід / видаток: перегляд · Комплекти: перегляд · Замовлення: перегляд")
+        expect(page.locator(".list .row", has_text="Старший користувач").locator(".row-meta")).to_have_text(
+            "Склад: перегляд, зміна · Прихід / видаток: перегляд, зміна · Комплекти: перегляд, зміна · Замовлення: перегляд, зміна · усі відділи")
+        new_roles = page.evaluate("""() => Object.fromEntries(JSON.parse(localStorage.getItem('sklad-demo-v1')).roles.map((r) => [r.name, r.perms]))""")
+        assert new_roles["Звичайний користувач"] == ["stock.view", "ops.view", "kits.view", "orders.view"], new_roles
+        assert new_roles["Старший користувач"] == ["stock.view", "stock.edit", "ops.view", "ops.edit", "kits.view", "kits.edit",
+                                                    "orders.view", "orders.edit", "orders.all"], new_roles
+        assert new_roles["Лише перегляд"] == ["stock.view", "ops.view", "kits.view", "orders.view", "orders.all"]  # старі не зачеплено
         page.locator("a[href='#/role/new']").click()
         page.locator("#f [name=name]").fill("Тестувальник")
         page.locator("[data-p='orders.edit']").check()
         page.locator("#save").click()
         assert "Роль збережено" in toast_text()
-        expect(page.locator(".list .row")).to_have_count(5)
+        expect(page.locator(".list .row")).to_have_count(7)
         expect(page.locator(".list .row", has_text="Тестувальник")).to_contain_text("Замовлення: перегляд, зміна")
         page.screenshot(path=str(SHOTS / "21_roles.png"))
 
@@ -752,6 +797,88 @@ def main() -> int:
         page.evaluate(set_role, "Адміністратор")
         page.reload()
         expect(page.locator("a[href='#/users']")).to_have_count(1)
+
+        # --- роль «Адміністратор», але не головний: списки лише для читання ---
+        petro = page.evaluate("""() => {
+            const d = JSON.parse(localStorage.getItem('sklad-demo-v1'));
+            const id = Object.keys(d.users).find((k) => d.users[k].email === 'petro@example.com');
+            Object.assign(d.users[id], { role_id: d.roles.find((r) => r.name === 'Адміністратор').id, perms: null });
+            d.owner = id;                       // головний — Петро, демо-користувач лишається адміністратором
+            localStorage.setItem('sklad-demo-v1', JSON.stringify(d));
+            return id;
+        }""")
+        page.reload()
+        expect(page.locator("a[href='#/users']")).to_contain_text("лише перегляд")
+        expect(page.locator("a[href='#/notifications']")).to_have_count(1)   # решта адмінського на місці
+        expect(page.locator("a[href='#/backups']")).to_have_count(1)
+        page.locator("a[href='#/users']").click()
+        expect(page.locator(".user-row")).to_have_count(2)
+        expect(page.locator("#ro-note")).to_contain_text("Права надає лише головний адміністратор")
+        expect(page.locator("#ro-note")).to_contain_text("Петро")
+        expect(page.locator("a.user-row")).to_have_count(0)                  # рядки — не посилання
+        expect(page.locator("a[href='#/user/new']")).to_have_count(0)
+        expect(page.locator(".user-row", has_text="Петро").locator(".owner-tag")).to_have_count(1)
+        expect(page.locator(".user-row", has_text="ви").locator(".owner-tag")).to_have_count(0)
+        page.screenshot(path=str(SHOTS / "33_admin_not_owner.png"))
+        for h in ("#/user/new", f"#/user/{petro}", "#/user/00000000-0000-0000-0000-00000000demo"):
+            page.goto(url + h)                                               # прямі адреси форм — той самий список
+            expect(page.locator("#ro-note")).to_be_visible()
+            expect(page.locator("#f")).to_have_count(0)
+        page.goto(url + "#/roles")
+        expect(page.locator(".list .row")).to_have_count(7)
+        expect(page.locator("#ro-note")).to_be_visible()
+        expect(page.locator("a.row")).to_have_count(0)
+        expect(page.locator("a[href='#/role/new']")).to_have_count(0)
+        page.goto(url + "#/role/new")
+        expect(page.locator("#f")).to_have_count(0)
+        expect(page.locator(".list .row")).to_have_count(7)
+        # і в обхід кнопок — та сама відмова, що й на сервері
+        denied = page.evaluate("""async (petro) => {
+            const { api } = await import('./js/api.js');
+            const roles = await api.roles();
+            const me = '00000000-0000-0000-0000-00000000demo';
+            const out = [];
+            for (const f of [
+              () => api.createUser({ email: 'x@example.com', password: 'secret1', name: 'X' }),
+              () => api.updateUser({ id: petro, name: 'Петро', role_id: null, department_id: null, perms: null, active: false }),
+              () => api.updateUser({ id: me, name: 'Демо', role_id: roles[0].id, department_id: null, perms: ['admin'], active: true }),
+              () => api.setUserPassword(petro, 'secret12'),
+              () => api.deleteUser(petro),
+              () => api.saveRole({ name: 'Нова', perms: [] }),
+              () => api.saveRole({ id: roles[0].id, name: roles[0].name, perms: ['admin'] }),
+              () => api.deleteRole(roles[0].id),
+            ]) { try { await f(); out.push('ok'); } catch (e) { out.push(e.message); } }
+            const d = JSON.parse(localStorage.getItem('sklad-demo-v1'));
+            return { out, users: Object.keys(d.users).length, roles: d.roles.length, owner: d.owner };
+        }""", petro)
+        assert denied["out"] == ["Права надає лише головний адміністратор"] * 8, denied
+        assert denied["users"] == 2 and denied["roles"] == 7 and denied["owner"] == petro, denied
+
+        # --- демо-дані, збережені до появи головного й нових ролей: з'являються самі, видалена роль не вертається ---
+        page.evaluate("""() => {
+            const d = JSON.parse(localStorage.getItem('sklad-demo-v1'));
+            const petro = Object.keys(d.users).find((k) => d.users[k].email === 'petro@example.com');
+            d.users[petro].role_id = d.roles.find((r) => r.name === 'Виробництво').id;
+            delete d.owner;
+            delete d.roles_seed;
+            d.roles = d.roles.filter((r) => !['Звичайний користувач', 'Старший користувач'].includes(r.name));
+            localStorage.setItem('sklad-demo-v1', JSON.stringify(d));
+        }""")
+        page.goto(url + "#/users")
+        page.reload()
+        expect(page.locator(".user-row", has_text="ви").locator(".owner-tag")).to_have_count(1)  # єдиний адміністратор — головний
+        expect(page.locator(".user-row .owner-tag")).to_have_count(1)
+        expect(page.locator("a[href='#/user/new']")).to_have_count(1)
+        page.goto(url + "#/roles")
+        expect(page.locator(".list .row")).to_have_count(7)
+        page.locator(".list .row", has_text="Звичайний користувач").click()
+        page.locator("#del").click()
+        page.locator(".modal [data-r='1']").click()
+        expect(page.locator(".list .row")).to_have_count(6)
+        page.reload()
+        expect(page.locator(".list .row")).to_have_count(6)                  # видалена не повернулась
+        expect(page.locator(".list .row", has_text="Звичайний користувач")).to_have_count(0)
+        expect(page.locator(".list .row", has_text="Старший користувач")).to_have_count(1)
         page.goto(url + "#/stock")
 
         # --- скан-модалка відкривається і приймає ручний код (камери в headless нема) ---

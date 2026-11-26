@@ -1,8 +1,10 @@
-// Користувачі, ролі та права — лише для адміністратора
+// Користувачі, ролі та права: керує лише головний адміністратор,
+// інші адміністратори бачать списки без кнопок і форм
 import { api, isDemo } from '../api.js';
 import { esc, fmtDate, toast, confirmDialog, promptDialog } from '../util.js';
 import {
   state, go, reloadData, depName, roleName, PERM_SECTIONS, PERM_ACTIONS, PERM_EXTRA, ICON_PLUS,
+  isOwner, canManageUsers, userName,
 } from '../core.js';
 
 // ------------------------------------------------------------------
@@ -67,24 +69,32 @@ export function permSummary(perms) {
 const demoNote = isDemo
   ? '<div class="card hint">Демо-режим: користувачі тут лише записи — увійти ними не можна. У спільній базі все працює по-справжньому.</div>' : '';
 
+const OWNER_TAG = '<span class="tag st-new owner-tag">Головний адміністратор</span>';
+// пояснення для адміністратора, який не головний: списки — лише для читання
+const readOnlyNote = () => (canManageUsers() ? '' : `<div class="card hint" id="ro-note"><b>Права надає лише головний адміністратор</b>${
+  state.owner ? ` — ${esc(userName(state.owner))}` : ''}. Ви бачите список людей і ролей, але додавати, змінювати чи блокувати може тільки він.</div>`);
+
 // ------------------------------------------------------------------
 export async function viewUsers(ctx) {
+  const manage = canManageUsers();
   ctx.header({
     title: 'Користувачі', back: '#/more',
-    actions: `<a class="btn ghost sm" href="#/roles">Ролі</a><a class="btn primary sm" href="#/user/new">${ICON_PLUS}<span>Користувач</span></a>`,
+    actions: `<a class="btn ghost sm" href="#/roles">Ролі</a>${manage ? `<a class="btn primary sm" href="#/user/new">${ICON_PLUS}<span>Користувач</span></a>` : ''}`,
   });
-  ctx.main.innerHTML = `${demoNote}<div id="list" class="list"><div class="muted pad">Завантаження…</div></div>`;
+  ctx.main.innerHTML = `${demoNote}${readOnlyNote()}<div id="list" class="list"><div class="muted pad">Завантаження…</div></div>`;
   let users;
   try { users = await api.users(); } catch (e) { toast(e.message, 'err'); return; }
   if (!ctx.alive()) return;
+  // головному — рядки-посилання на картку; іншим адміністраторам — просто список
+  const [open, close] = manage ? ['a', 'a'] : ['div', 'div'];
   ctx.main.querySelector('#list').innerHTML = users.map((u) => `
-    <a class="row user-row${u.active ? '' : ' archived'}" href="#/user/${u.id}">
+    <${open} class="row user-row${u.active ? '' : ' archived'}"${manage ? ` href="#/user/${u.id}"` : ''}>
       <div class="row-main">
-        <div class="row-title">${esc(u.display_name || u.email)}${u.id === state.me ? ' <span class="tag st-done">ви</span>' : ''}${u.active ? '' : ' <span class="tag st-rework">заблоковано</span>'}</div>
+        <div class="row-title">${esc(u.display_name || u.email)}${u.id === state.me ? ' <span class="tag st-done">ви</span>' : ''}${isOwner(u.id) ? ` ${OWNER_TAG}` : ''}${u.active ? '' : ' <span class="tag st-rework">заблоковано</span>'}</div>
         <div class="row-meta">${esc(u.email)} · ${u.perms ? 'свої права' : esc(roleName(u.role_id))}${u.department_id ? ` · ${esc(depName(u.department_id))}` : ''}</div>
       </div>
       <div class="row-qty"><small>${u.last_sign_in_at ? `входив ${fmtDate(u.last_sign_in_at)}` : 'ще не входив'}</small></div>
-    </a>`).join('') || '<div class="empty-state"><p>Користувачів немає</p></div>';
+    </${close}>`).join('') || '<div class="empty-state"><p>Користувачів немає</p></div>';
 }
 
 // ------------------------------------------------------------------
@@ -95,6 +105,7 @@ const randomPassword = () => {
 };
 
 export async function viewUserEdit(ctx, id) {
+  if (!canManageUsers()) { await viewUsers(ctx); return; }  // картки — лише головному
   const isNew = id === 'new';
   ctx.header({ title: isNew ? 'Новий користувач' : 'Користувач', back: '#/users' });
   let u = { display_name: '', email: '', role_id: null, department_id: null, perms: null, active: true };
@@ -106,11 +117,15 @@ export async function viewUserEdit(ctx, id) {
     if (!u) { ctx.notFound(); return; }
   }
   const self = u.id === state.me;
+  // головний адміністратор не може зняти із себе роль чи права (сервер відмовить так само)
+  const lock = !isNew && isOwner(u.id);
   const viewer = state.roles.find((r) => r.name === 'Лише перегляд');
   const roleId = isNew ? (viewer?.id || state.roles[0]?.id || '') : (u.role_id || '');
 
   ctx.main.innerHTML = `
     ${demoNote}
+    ${lock ? `<div class="card hint" id="owner-note">${OWNER_TAG} Це головний адміністратор: лише він додає людей і надає права.
+      Його роль, права й активність змінити не можна — щоб випадково не лишити склад без керування.</div>` : ''}
     <form class="form card" id="f" autocomplete="off">
       <div class="grid2">
         <label class="field"><span>Імʼя (так видно в журналі)</span><input name="name" value="${esc(u.display_name)}" placeholder="Напр. Петро Іваненко"></label>
@@ -120,7 +135,7 @@ export async function viewUserEdit(ctx, id) {
              <div class="with-btn"><input name="password" required minlength="6" value="${randomPassword()}"><button type="button" class="btn ghost sm" id="gen">Інший</button></div>
              <small class="muted">Передайте його людині — змінити можна в «Ще → Змінити пароль».</small></label>`
     : `<div class="field"><span>Email (логін)</span><div class="static">${esc(u.email)}</div></div>`}
-        <label class="field"><span>Роль</span><select name="role">
+        <label class="field"><span>Роль</span><select name="role"${lock ? ' disabled' : ''}>
           <option value="">— без ролі —</option>
           ${state.roles.map((r) => `<option value="${r.id}"${r.id === roleId ? ' selected' : ''}>${esc(r.name)}</option>`).join('')}
         </select></label>
@@ -131,8 +146,8 @@ export async function viewUserEdit(ctx, id) {
       </div>
       <div class="field"><span>Права</span>
         <div class="seg">
-          <label><input type="radio" name="mode" value="role"${u.perms ? '' : ' checked'}> як у ролі</label>
-          <label><input type="radio" name="mode" value="own"${u.perms ? ' checked' : ''}> свої галочки</label>
+          <label><input type="radio" name="mode" value="role"${u.perms ? '' : ' checked'}${lock ? ' disabled' : ''}> як у ролі</label>
+          <label><input type="radio" name="mode" value="own"${u.perms ? ' checked' : ''}${lock ? ' disabled' : ''}> свої галочки</label>
         </div>
       </div>
       <div id="perms"></div>
@@ -150,7 +165,7 @@ export async function viewUserEdit(ctx, id) {
   const f = ctx.main.querySelector('#f');
   const rolePerms = () => state.roles.find((r) => r.id === f.role.value)?.perms || [];
   const own = () => f.querySelector('[name=mode]:checked').value === 'own';
-  const matrix = permMatrix(ctx.main.querySelector('#perms'), u.perms || rolePerms(), { disabled: !u.perms });
+  const matrix = permMatrix(ctx.main.querySelector('#perms'), u.perms || rolePerms(), { disabled: lock || !u.perms });
   f.role.addEventListener('change', () => { if (!own()) matrix.set(rolePerms()); });
   f.querySelectorAll('[name=mode]').forEach((r) => r.addEventListener('change', () => {
     if (!own()) matrix.set(rolePerms());
@@ -204,21 +219,25 @@ export async function viewUserEdit(ctx, id) {
 
 // ------------------------------------------------------------------
 export async function viewRoles(ctx) {
-  ctx.header({ title: 'Ролі', back: '#/users', actions: `<a class="btn primary sm" href="#/role/new">${ICON_PLUS}<span>Роль</span></a>` });
+  const manage = canManageUsers();
+  ctx.header({ title: 'Ролі', back: '#/users', actions: manage ? `<a class="btn primary sm" href="#/role/new">${ICON_PLUS}<span>Роль</span></a>` : '' });
   const users = await api.users().catch(() => []);
   if (!ctx.alive()) return;
+  const tag = manage ? 'a' : 'div';
   ctx.main.innerHTML = `
-    <div class="card hint">Роль — готовий набір прав. Змініть роль — зміняться права всіх, у кого вона стоїть
+    ${readOnlyNote()}
+    <div class="card hint">Роль — готовий набір прав. ${manage ? 'Змініть роль — зміняться права всіх, у кого вона стоїть' : 'Зміна ролі змінює права всіх, у кого вона стоїть'}
       (крім людей зі «своїми галочками»).</div>
     <div class="list">${state.roles.map((r) => {
       const n = users.filter((u) => u.role_id === r.id && !u.perms).length;
-      return `<a class="row" href="#/role/${r.id}"><div class="row-main">
+      return `<${tag} class="row"${manage ? ` href="#/role/${r.id}"` : ''}><div class="row-main">
         <div class="row-title">${esc(r.name)}</div><div class="row-meta wrap">${esc(permSummary(r.perms))}</div></div>
-        <div class="row-qty"><b>${n}</b><small>людей</small></div></a>`;
+        <div class="row-qty"><b>${n}</b><small>людей</small></div></${tag}>`;
     }).join('')}</div>`;
 }
 
 export async function viewRoleEdit(ctx, id) {
+  if (!canManageUsers()) { await viewRoles(ctx); return; }  // ролі змінює лише головний
   const isNew = id === 'new';
   const role = isNew ? { name: '', perms: ['stock.view', 'ops.view', 'kits.view', 'orders.view'] } : state.roles.find((r) => r.id === id);
   if (!role) { ctx.notFound(); return; }

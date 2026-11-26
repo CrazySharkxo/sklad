@@ -16,6 +16,7 @@ export const state = {
   trashOrders: [],
   perms: new Set(),  // права поточного користувача
   roles: [],
+  owner: undefined,  // id головного адміністратора; null — не призначено; undefined — стара схема бази, без головного
   settings: { org_name: '', app_url: '', backup_at: null, category_order: [] },  // несекретні налаштування (шапка документів, порядок категорій)
   me: null,
   loaded: false,
@@ -27,9 +28,10 @@ export const state = {
 const CACHE_KEY = 'sklad-cache-v1';
 const isNetErr = (e) => /Немає зʼєднання|Failed to fetch|NetworkError|Load failed/i.test(e?.message || '');
 
-function fill({ items, kits, profiles, departments, orders, perms, roles, settings }) {
+function fill({ items, kits, profiles, departments, orders, perms, roles, settings, owner }) {
   state.perms = new Set(perms);
   state.roles = roles;
+  state.owner = owner;
   state.items = items.filter((i) => !i.deleted_at);
   state.trashItems = items.filter((i) => inTrash(i.deleted_at));
   state.byId = new Map(items.map((i) => [i.id, i]));
@@ -46,11 +48,12 @@ function fill({ items, kits, profiles, departments, orders, perms, roles, settin
 export async function reloadData() {
   let snap;
   try {
-    const [items, kits, profiles, departments, orders, perms, roles, settings] = await Promise.all([
+    const [items, kits, profiles, departments, orders, perms, roles, settings, owner] = await Promise.all([
       api.items(), api.kits(), api.profiles(), api.departments(), api.orders(), api.myPerms(), api.roles(),
       api.settings().catch(() => null),  // стара схема без app_settings — не привід падати
+      api.ownerId(),                     // стара схема без головного адміністратора — undefined
     ]);
-    snap = { items, kits, profiles, departments, orders, perms, roles, settings, me: state.me, at: new Date().toISOString() };
+    snap = { items, kits, profiles, departments, orders, perms, roles, settings, owner, me: state.me, at: new Date().toISOString() };
     state.offline = false;
     state.cachedAt = null;
     if (!isDemo) try { localStorage.setItem(CACHE_KEY, JSON.stringify(snap)); } catch { /* тісно — без кешу */ }
@@ -86,9 +89,13 @@ export const PERM_SECTIONS = [
 export const PERM_ACTIONS = [['view', 'Перегляд'], ['edit', 'Зміна'], ['delete', 'Видалення']];
 export const PERM_EXTRA = [
   ['orders.all', 'Замовлення всіх відділів', 'без цього людина бачить лише замовлення свого відділу'],
-  ['admin', 'Адміністратор', 'користувачі, ролі, відділи — і всі інші права'],
+  ['admin', 'Адміністратор', 'відділи, налаштування, копії — і всі інші права'],
 ];
 export const can = (p) => state.perms.has('admin') || state.perms.has(p);
+// Користувачами й ролями керує лише головний адміністратор (сервер перевіряє те саме).
+// На базі зі старою схемою головного ще немає як поняття — тоді, як раніше, будь-який адміністратор.
+export const isOwner = (id) => !!id && state.owner === id;
+export const canManageUsers = () => can('admin') && (state.owner === undefined || state.owner === state.me);
 export const roleName = (id) => state.roles.find((r) => r.id === id)?.name || 'без ролі';
 
 // ------------------------------------------------------------------

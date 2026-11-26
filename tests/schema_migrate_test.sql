@@ -1,7 +1,31 @@
 -- Міграція зі схеми, де порядку позицій і категорій ще не було: відкочуємо ці
 -- частини, запускаємо schema.sql (двічі) і дивимось, що дані на місці, наявні
 -- позиції стали за назвою, а повторний запуск збережений порядок не збиває.
+-- Так само — головний адміністратор і дві нові ролі: на базі без них головним стає
+-- найстарший активний адміністратор, ролі додаються один раз.
 \set ON_ERROR_STOP on
+
+-- стара схема: без головного адміністратора й нових ролей
+delete from public.roles where name in ('Звичайний користувач', 'Старший користувач');
+drop policy roles_admin on public.roles;
+create policy roles_admin on public.roles for all to authenticated
+  using ((select public.has_perm('admin'))) with check ((select public.has_perm('admin')));
+drop function public.require_owner();
+drop function public.owner_id();
+drop function public.is_owner();
+drop index public.profiles_owner_uq;
+alter table public.profiles drop column is_owner;
+alter table public.app_settings drop column roles_seed;
+-- хто є: ivan і olena — «Адміністратор», Оля — свої галочки. Найстаршою робимо Олю,
+-- але вона заблокований адміністратор; серед активних найстарша — olena
+update public.profiles set perms = array['admin'], active = false, created_at = '2020-01-01'
+ where id = (select id from auth.users where email = 'view@example.com');
+update auth.users set created_at = '2020-01-01' where email = 'view@example.com';
+update public.profiles set created_at = '2021-01-01' where id = '22222222-2222-2222-2222-222222222222';
+update auth.users set created_at = '2021-01-01' where id = '22222222-2222-2222-2222-222222222222';
+update public.profiles set created_at = '2022-01-01' where id = '11111111-1111-1111-1111-111111111111';
+update auth.users set created_at = '2022-01-01' where id = '11111111-1111-1111-1111-111111111111';
+create temp table mig_roles as select id, name, perms from public.roles;
 
 -- стара схема: без sort_order, category_order і функцій порядку
 drop function public.set_item_order(uuid[]);
@@ -50,7 +74,41 @@ begin
        = (select array_agg(id order by name, created_at, id) from public.items), 'початковий порядок — за назвою';
   assert (select min(sort_order) = 1 and max(sort_order) = count(*) and count(distinct sort_order) = count(*) from public.items);
   assert (select category_order from public.app_settings) = '{}';
+  -- головний — найстарший АКТИВНИЙ адміністратор, рівно один
+  assert (select array_agg(id) from public.profiles where is_owner) = array['22222222-2222-2222-2222-222222222222'::uuid],
+    'головний після міграції: ' || coalesce((select string_agg(id::text, ',') from public.profiles where is_owner), 'нема');
+  -- нові ролі додано, старі не зачеплено
+  assert (select perms from public.roles where name = 'Звичайний користувач') = array['stock.view', 'ops.view', 'kits.view', 'orders.view'];
+  assert (select perms from public.roles where name = 'Старший користувач')
+       = array['stock.view', 'stock.edit', 'ops.view', 'ops.edit', 'kits.view', 'kits.edit', 'orders.view', 'orders.edit', 'orders.all'];
+  assert (select count(*) from public.roles) = (select count(*) from mig_roles) + 2;
+  assert not exists (select 1 from mig_roles m left join public.roles r on r.id = m.id
+                      where r.id is null or r.name <> m.name or r.perms <> m.perms), 'міграція зачепила старі ролі';
+  -- ролі й права людей не змінились
+  assert (select r.name from public.profiles p join public.roles r on r.id = p.role_id
+           where p.id = '11111111-1111-1111-1111-111111111111') = 'Адміністратор';
 end $$;
+
+-- після міграції: колишній адміністратор ivan уже не керує людьми, olena — керує
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+do $$ begin
+  begin
+    perform public.admin_create_user('mig@example.com', 'secret1');
+    raise exception 'не головний створив користувача після міграції';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+end $$;
+reset role;
+select set_config('request.jwt.claim.sub', '22222222-2222-2222-2222-222222222222', false);
+set role authenticated;
+-- головна видаляє одну з нових ролей і змінює другу — повторний запуск цього не відкотить
+delete from public.roles where name = 'Звичайний користувач';
+update public.roles set perms = array['stock.view'] where name = 'Старший користувач';
+reset role;
+-- якби головного перераховували заново — ним став би ivan (тепер найстарший)
+update auth.users set created_at = '2019-01-01' where id = '11111111-1111-1111-1111-111111111111';
+update public.profiles set created_at = '2019-01-01' where id = '11111111-1111-1111-1111-111111111111';
 
 -- старий клієнт на новій схемі: вставка без sort_order працює, позиція — в кінці
 select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
@@ -76,6 +134,35 @@ do $$ begin
            where i.sort_order <> o.sort_order or i.updated_at <> o.updated_at) = 0, 'повторний запуск збив порядок';
   assert (select count(*) from public.items) = (select count(*) from mig_order);
   assert (select category_order from public.app_settings) = array['Стара', 'Мотори'], 'повторний запуск збив порядок категорій';
+  assert (select array_agg(id) from public.profiles where is_owner) = array['22222222-2222-2222-2222-222222222222'::uuid],
+    'повторний запуск змінив головного';
+  assert not exists (select 1 from public.roles where name = 'Звичайний користувач'), 'видалена роль воскресла';
+  assert (select perms from public.roles where name = 'Старший користувач') = array['stock.view'], 'змінену роль перезаписано';
+  assert (select count(*) from public.roles) = (select count(*) from mig_roles) + 1, 'повторний запуск додав ролі';
 end $$;
+
+-- ручна передача статусу головного (README): olena → ivan, далі керує ivan, olena — вже ні
+begin;
+update public.profiles set is_owner = false where is_owner;
+update public.profiles set is_owner = true where id = (select id from auth.users where email = 'ivan@example.com');
+commit;
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+do $$ begin
+  assert public.is_owner() and public.owner_id() = '11111111-1111-1111-1111-111111111111';
+  perform public.admin_update_user('22222222-2222-2222-2222-222222222222', 'olena',
+    (select id from public.roles where name = 'Адміністратор'), null, null, true);
+end $$;
+reset role;
+select set_config('request.jwt.claim.sub', '22222222-2222-2222-2222-222222222222', false);
+set role authenticated;
+do $$ begin
+  begin
+    perform public.admin_set_password('11111111-1111-1111-1111-111111111111', 'secret12');
+    raise exception 'колишня головна керує після передачі';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+end $$;
+reset role;
 
 \echo MIGRATION TESTS PASSED
