@@ -309,6 +309,94 @@ export function itemPicker(container, onPick, { placeholder = 'Додати по
   return input;
 }
 
+// ------------------------------------------------------------------
+// Поле з випадним списком наявних значень (замість <datalist>, який на Android
+// не розкривається під полем). Можна вибрати зі списку або надрукувати своє.
+// getOptions() → масив рядків; викликається щоразу, тож список може підвантажитись пізніше.
+// ------------------------------------------------------------------
+export function comboInput(input, getOptions) {
+  const wrap = document.createElement('div');
+  wrap.className = 'picker combo';
+  input.before(wrap);
+  wrap.append(input);
+  const list = document.createElement('div');
+  list.className = 'picker-list combo-list';
+  list.hidden = true;
+  wrap.append(list);
+  input.autocomplete = 'off';
+  let found = [];
+  let active = -1;
+
+  const mark = () => list.querySelectorAll('.picker-opt').forEach((b, n) => {
+    b.classList.toggle('on', n === active);
+    if (n === active) b.scrollIntoView({ block: 'nearest' });
+  });
+  const hide = () => { list.hidden = true; active = -1; window.visualViewport?.removeEventListener('resize', fit); };
+  // filter=false (дотик у вже заповнене поле) — показати всі варіанти, а не лише поточний
+  const show = (filter) => {
+    const q = filter ? norm(input.value) : '';
+    const seen = new Set();
+    found = (getOptions() || []).filter((o) => {
+      const k = norm(o);
+      if (!k || seen.has(k) || (q && !k.includes(q))) return false;
+      seen.add(k);
+      return true;
+    });
+    active = -1;
+    if (!found.length) { list.hidden = true; return; }
+    const cur = norm(input.value);
+    list.innerHTML = found.map((o, n) => `<button type="button" class="picker-opt" data-n="${n}" tabindex="-1">
+      <span>${esc(o)}</span>${norm(o) === cur ? '<small>✓</small>' : ''}</button>`).join('');
+    list.hidden = false;
+    list.scrollTop = 0;
+    fit();
+    window.visualViewport?.addEventListener('resize', fit); // клавіатура виїжджає вже після фокуса
+  };
+  // список не має ховатись за нижнім краєм екрана чи екранною клавіатурою: підкручуємо сторінку,
+  // але не далі, ніж поле лишається видимим під шапкою
+  const fit = () => {
+    if (list.hidden) return;
+    const vv = window.visualViewport;
+    const bottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+    const over = list.getBoundingClientRect().bottom + 8 - bottom;
+    const room = input.getBoundingClientRect().top - (vv ? vv.offsetTop : 0) - 70;
+    if (over > 0 && room > 0) window.scrollBy(0, Math.min(over, room));
+  };
+  const choose = (value) => {
+    input.value = value;
+    hide();
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+
+  input.addEventListener('focus', () => show(false));
+  input.addEventListener('click', () => { if (list.hidden) show(false); });
+  input.addEventListener('input', () => show(true));
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (list.hidden) show(false);
+      if (!found.length) return;
+      e.preventDefault();
+      const down = e.key === 'ArrowDown';
+      active = active < 0 ? (down ? 0 : found.length - 1) : (active + (down ? 1 : found.length - 1)) % found.length;
+      mark();
+    } else if (e.key === 'Enter') {
+      // без підсвіченого варіанта Enter працює як завжди (відправляє форму)
+      if (!list.hidden && found[active] !== undefined) { e.preventDefault(); choose(found[active]); }
+    } else if (e.key === 'Escape') {
+      hide();
+    }
+  });
+  // mousedown не забирає фокус у поля, тож blur не ховає список раніше за клік
+  list.addEventListener('mousedown', (e) => e.preventDefault());
+  list.addEventListener('click', (e) => {
+    e.preventDefault(); // поле стоїть у <label>: клік по варіанту не має ще раз «натискати» поле
+    const b = e.target.closest('[data-n]');
+    if (b) choose(found[+b.dataset.n]);
+  });
+  input.addEventListener('blur', hide);
+  return input;
+}
+
 export const ICON_SCAN = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7V4h3M21 7V4h-3M3 17v3h3M21 17v3h-3M7 8v8M10 8v8M13 8v8M17 8v8"/></svg>';
 export const ICON_PLUS = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
 export const ICON_BACK = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>';

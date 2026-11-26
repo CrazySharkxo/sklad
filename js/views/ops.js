@@ -1,7 +1,7 @@
 // Прихід / видаток і журнал операцій
 import { api, TRASH_DAYS } from '../api.js';
 import { esc, fmtQty, fmtSigned, fmtDate, parseNum, round, toast, confirmDialog, OP_TYPES, downloadXlsx, todayIso } from '../util.js';
-import { state, go, reloadData, itemPicker, userName, bindTrash, trashNote, TRASH_EMPTY, can, reservedOf, freeQty } from '../core.js';
+import { state, go, reloadData, itemPicker, comboInput, userName, bindTrash, trashNote, TRASH_EMPTY, can, reservedOf, freeQty } from '../core.js';
 import { postOrQueue } from '../outbox.js';
 import { printOperation } from '../print.js';
 
@@ -56,10 +56,9 @@ export async function viewOp(ctx, type, query) {
       <div id="lines" class="lines"></div>
       <div class="grid2">
         <label class="field"><span>${isIn ? 'Постачальник / звідки' : 'Кому / для чого'}</span>
-          <input name="counterparty" list="dl-cp" value="${esc(cpValue)}" placeholder="${isIn ? 'Напр. магазин, замовлення №' : 'Напр. екіпаж, збірка, ремонт'}"></label>
+          <input name="counterparty" autocomplete="off" value="${esc(cpValue)}" placeholder="${isIn ? 'Напр. магазин, замовлення №' : 'Напр. екіпаж, збірка, ремонт'}"></label>
         <label class="field"><span>Коментар</span><input name="comment"></label>
       </div>
-      <datalist id="dl-cp"></datalist>
       <div class="form-actions">
         <span class="muted" id="sum"></span><span class="grow"></span>
         <a class="btn ghost" href="${back}">Скасувати</a>
@@ -68,9 +67,9 @@ export async function viewOp(ctx, type, query) {
     </form>`;
   const f = ctx.main.querySelector('#f');
   const linesEl = ctx.main.querySelector('#lines');
-  counterparties().then((list) => {
-    if (ctx.alive()) ctx.main.querySelector('#dl-cp').innerHTML = list.map((c) => `<option value="${esc(c)}">`).join('');
-  });
+  let cpList = [];
+  comboInput(f.counterparty, () => cpList);
+  counterparties().then((list) => { cpList = list; });
 
   const updateSum = () => {
     const n = lines.filter((l) => parseNum(l.qty) > 0).length;

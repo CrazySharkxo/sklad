@@ -270,6 +270,11 @@ main { padding: 0 16px; max-width: 980px; }
 .picker-opt.on, .picker-opt:hover { background: var(--accent-soft); }
 .picker-opt small { color: var(--muted); }
 .picker-empty { padding: 12px; color: var(--muted); }
+/* поле з випадним списком значень (comboInput): рядки під палець, до ~6 на екрані */
+.combo-list { max-height: 268px; overscroll-behavior: contain; }
+.combo-list .picker-opt { min-height: 44px; align-items: center; }
+.combo-list .picker-opt + .picker-opt { border-top: 1px solid var(--line); }
+.with-btn > .combo { flex: 1; min-width: 0; }
 
 .lines { display: flex; flex-direction: column; gap: 6px; }
 .line, .inv-row {

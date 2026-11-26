@@ -478,6 +478,66 @@ def main() -> int:
         page.goto(url + "#/journal")
         expect(page.locator(".op", has_text="Виправлено в картці позиції")).to_have_count(1)
 
+        # --- випадний список у полях «Категорія / Місце / Одиниця» (замість datalist) ---
+        page.goto(url + "#/item-edit/new")
+        f = page.locator("#f")
+        expect(f.locator("datalist")).to_have_count(0)
+        cat = f.locator("[name=category]")
+        cat_list = f.locator(".combo", has=page.locator("[name=category]")).locator(".combo-list")
+        expect(cat_list).to_be_hidden()
+        cat.click()
+        expect(cat_list).to_be_visible()
+        for c in ("Мотори", "Камери", "Кабелі", "Електроніка"):
+            expect(cat_list.locator(".picker-opt", has_text=c)).to_have_count(1)
+        # список лежить під полем, у межах екрана, і його не перекриває наступне поле
+        ib, lb = cat.bounding_box(), cat_list.bounding_box()
+        assert lb["y"] >= ib["y"] + ib["height"] and lb["x"] >= 0 and lb["x"] + lb["width"] <= 400, (ib, lb)
+        ob = cat_list.locator(".picker-opt").first.bounding_box()
+        assert ob["height"] >= 44, ob
+        assert page.evaluate("""() => { const o = document.querySelector('.combo-list:not([hidden]) .picker-opt');
+            const r = o.getBoundingClientRect();
+            return o.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)); }""")
+        expect(page.locator(".toast")).to_have_count(0, timeout=15000)  # старі сповіщення не мають закривати знімок
+        page.screenshot(path=str(SHOTS / "29_category_dropdown.png"))
+        cat.press_sequentially("кам")
+        expect(cat_list.locator(".picker-opt")).to_have_count(1)
+        expect(cat_list.locator(".picker-opt")).to_contain_text("Камери")
+        cat_list.locator(".picker-opt").click()
+        expect(cat).to_have_value("Камери")
+        expect(cat_list).to_be_hidden()
+        # нове значення, якого в списку немає, просто друкується; список без збігів не показується
+        cat.fill("Пропелери")
+        expect(cat).to_have_value("Пропелери")
+        expect(cat_list).to_be_hidden()
+        # клавіатура: стрілка + Enter вибирає і не відправляє форму; Escape ховає
+        cat.fill("")
+        expect(cat_list).to_be_visible()
+        cat.press("ArrowDown")
+        cat.press("Enter")
+        expect(page.locator("#f")).to_be_visible()
+        expect(cat_list).to_be_hidden()
+        assert cat.input_value() != "", "Enter мав вибрати підсвічений варіант"
+        cat.press("ArrowDown")
+        expect(cat_list).to_be_visible()
+        cat.press("Escape")
+        expect(cat_list).to_be_hidden()
+        # одиниця виміру: за замовчуванням «шт», дотик показує всі одиниці, а не лише «шт»
+        unit = f.locator("[name=unit]")
+        unit_list = f.locator(".combo", has=page.locator("[name=unit]")).locator(".combo-list")
+        expect(unit).to_have_value("шт")
+        unit.click()
+        expect(cat_list).to_be_hidden()
+        expect(unit_list.locator(".picker-opt", has_text="кг")).to_have_count(1)
+        unit_list.locator(".picker-opt", has_text="кг").click()
+        expect(unit).to_have_value("кг")
+        # втрата фокусу ховає список
+        f.locator("[name=location]").click()
+        expect(f.locator(".combo", has=page.locator("[name=location]")).locator(".combo-list")).to_be_visible()
+        f.locator("[name=name]").click()
+        expect(f.locator(".combo-list:visible")).to_have_count(0)
+        f.locator("a", has_text="Скасувати").click()  # нічого не зберігаємо
+        expect(page.locator("#top h1")).to_have_text("Залишки")
+
         # --- користувачі та ролі (у демо — записи без входу) ---
         page.goto(url + "#/more")
         page.locator("a[href='#/users']").click()

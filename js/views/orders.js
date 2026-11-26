@@ -6,7 +6,7 @@ import {
   statusTag, ORDER_STATUS, todayIso, downloadXlsx,
 } from '../util.js';
 import {
-  state, go, reloadData, itemPicker, userName, depName, myDepartment, ACTIVE_ORDER, ICON_PLUS, ICON_SCAN,
+  state, go, reloadData, itemPicker, comboInput, userName, depName, myDepartment, ACTIVE_ORDER, ICON_PLUS, ICON_SCAN,
   trashRow, bindTrash, TRASH_EMPTY, can, isOverdue, isDueSoon, dueText, reservedOf, freeQty, resolveCode,
 } from '../core.js';
 import { scanCode } from '../scanner.js';
@@ -531,7 +531,7 @@ export function viewOrderEdit(ctx, id) {
       <label class="field"><span>Що замовили *</span>
         <input name="title" required value="${esc(o.title)}" placeholder='Напр. Дрон 7" з нічною камерою'></label>
       <div class="grid2">
-        <label class="field"><span>Замовник</span><input name="customer" list="dl-cust" value="${esc(o.customer)}" placeholder="Хто замовив, контакт"></label>
+        <label class="field"><span>Замовник</span><input name="customer" autocomplete="off" value="${esc(o.customer)}" placeholder="Хто замовив, контакт"></label>
         <label class="field"><span>Кількість</span><input name="qty" inputmode="decimal" value="${fmtQty(o.qty)}"></label>
         <label class="field"><span>Термін</span><input name="due_date" type="date" value="${esc(o.due_date || '')}"></label>
         ${isNew && state.departments.length ? `<label class="field"><span>Відділ, де буде замовлення</span><select name="dep">
@@ -551,7 +551,6 @@ export function viewOrderEdit(ctx, id) {
       <div id="picker"></div>
       <div id="parts" class="lines"></div>
 
-      <datalist id="dl-cust">${customers.map((c) => `<option value="${esc(c)}">`).join('')}</datalist>
       <div class="form-actions">
         <span class="grow"></span>
         <a class="btn ghost" href="${back}">Скасувати</a>
@@ -562,6 +561,7 @@ export function viewOrderEdit(ctx, id) {
   const tasksEl = ctx.main.querySelector('#tasks');
   const partsEl = ctx.main.querySelector('#parts');
   const newTask = ctx.main.querySelector('#newtask');
+  comboInput(f.customer, () => customers);
 
   // ---- чекліст ----
   const renderTasks = () => {

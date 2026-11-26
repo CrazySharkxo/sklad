@@ -5,7 +5,7 @@ import { scanCode } from '../scanner.js';
 import { postOrQueue } from '../outbox.js';
 import {
   state, go, reloadData, activeItems, isLow, categories, locations, units, searchItems, findByCode, resolveCode,
-  hydratePhotos, thumb, userName, ICON_SCAN, ICON_PLUS, trashRow, bindTrash, trashNote, TRASH_EMPTY, can,
+  hydratePhotos, thumb, comboInput, userName, ICON_SCAN, ICON_PLUS, trashRow, bindTrash, trashNote, TRASH_EMPTY, can,
   reservedOf, freeQty, reservingOrders,
 } from '../core.js';
 
@@ -226,18 +226,15 @@ export function viewItemEdit(ctx, id, query) {
       <label class="field"><span>Назва *</span><input name="name" required value="${esc(item.name)}" placeholder="Напр. Мотор 2207 1750KV"></label>
       <div class="grid2">
         ${qtyField}
-        <label class="field"><span>Одиниця виміру (без числа)</span><input name="unit" list="dl-unit" value="${esc(item.unit)}" placeholder="шт, м, кг…"></label>
+        <label class="field"><span>Одиниця виміру (без числа)</span><input name="unit" autocomplete="off" value="${esc(item.unit)}" placeholder="шт, м, кг…"></label>
         <label class="field"><span>Код / штрихкод / артикул</span>
           <div class="with-btn"><input name="code" value="${esc(item.code || '')}"><button type="button" class="icon-btn" id="scode" aria-label="Сканувати">${ICON_SCAN}</button></div></label>
-        <label class="field"><span>Категорія</span><input name="category" list="dl-cat" value="${esc(item.category)}" placeholder="Мотори, Камери, Кабелі…"></label>
-        <label class="field"><span>Місце зберігання</span><input name="location" list="dl-loc" value="${esc(item.location)}" placeholder="Стелаж 2, коробка 5"></label>
+        <label class="field"><span>Категорія</span><input name="category" autocomplete="off" value="${esc(item.category)}" placeholder="Мотори, Камери, Кабелі…"></label>
+        <label class="field"><span>Місце зберігання</span><input name="location" autocomplete="off" value="${esc(item.location)}" placeholder="Стелаж 2, коробка 5"></label>
         <label class="field"><span>Мінімальний залишок</span><input name="min_qty" inputmode="decimal" value="${item.min_qty ? fmtQty(item.min_qty) : ''}" placeholder="0 — не стежити"></label>
       </div>
       <label class="field"><span>Примітка</span><textarea name="note" rows="2">${esc(item.note)}</textarea></label>
       ${!isNew ? `<label class="check"><input type="checkbox" name="archived" ${item.archived ? 'checked' : ''}> В архіві (сховати зі списку)</label>` : ''}
-      <datalist id="dl-cat">${categories().map((c) => `<option value="${esc(c)}">`).join('')}</datalist>
-      <datalist id="dl-loc">${locations().map((c) => `<option value="${esc(c)}">`).join('')}</datalist>
-      <datalist id="dl-unit">${units().map((c) => `<option value="${esc(c)}">`).join('')}</datalist>
       <div class="form-actions">
         ${!isNew && can('stock.delete') ? '<button type="button" class="btn danger ghost" id="del">Видалити</button>' : ''}
         <span class="grow"></span>
@@ -249,6 +246,9 @@ export function viewItemEdit(ctx, id, query) {
   const f = ctx.main.querySelector('#f');
   const pbox = ctx.main.querySelector('#pbox');
   const pdel = ctx.main.querySelector('#pdel');
+  comboInput(f.unit, units);
+  comboInput(f.category, categories);
+  comboInput(f.location, locations);
 
   f.querySelectorAll('[data-photo-in]').forEach((inp) => inp.addEventListener('change', async () => {
     const file = inp.files[0];
