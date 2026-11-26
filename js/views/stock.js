@@ -1,7 +1,8 @@
 // Залишки, картка позиції, створення/редагування позиції
 import { api, TRASH_DAYS } from '../api.js';
-import { esc, norm, fmtQty, fmtSigned, fmtDate, parseNum, compressImage, toast, confirmDialog, OP_TYPES, qrSvg, labelPayload } from '../util.js';
+import { esc, norm, fmtQty, fmtSigned, fmtDate, parseNum, round, compressImage, toast, confirmDialog, OP_TYPES, qrSvg, labelPayload } from '../util.js';
 import { scanCode } from '../scanner.js';
+import { postOrQueue } from '../outbox.js';
 import {
   state, go, reloadData, activeItems, isLow, categories, locations, units, searchItems, findByCode, resolveCode,
   hydratePhotos, thumb, userName, ICON_SCAN, ICON_PLUS, trashRow, bindTrash, trashNote, TRASH_EMPTY, can,
@@ -205,6 +206,12 @@ export function viewItemEdit(ctx, id, query) {
   ctx.header({ title: isNew ? 'Нова позиція' : 'Редагування', back: isNew ? '#/stock' : `#/item/${id}` });
   let photoPath = item.photo_path;
   let newPhoto = null;
+  // залишок рахується з журналу руху: у наявної позиції його править інвентаризація (adjust), а не saveItem
+  const qtyText = isNew ? '' : fmtQty(item.qty);
+  const qtyLocked = !isNew && (!can('ops.edit') || !!item.deleted_at);
+  const qtyField = isNew
+    ? (can('ops.edit') ? '<label class="field"><span>Кількість на складі зараз</span><input name="init_qty" inputmode="decimal" placeholder="напр. 100"></label>' : '')
+    : `<label class="field"><span>Кількість на складі зараз</span><input name="init_qty" inputmode="decimal" value="${esc(qtyText)}"${qtyLocked ? ' disabled' : ''}></label>`;
 
   ctx.main.innerHTML = `
     <form class="form card" id="f" autocomplete="off">
@@ -218,7 +225,7 @@ export function viewItemEdit(ctx, id, query) {
       </div>
       <label class="field"><span>Назва *</span><input name="name" required value="${esc(item.name)}" placeholder="Напр. Мотор 2207 1750KV"></label>
       <div class="grid2">
-        ${isNew && can('ops.edit') ? '<label class="field"><span>Кількість на складі зараз</span><input name="init_qty" inputmode="decimal" placeholder="напр. 100"></label>' : ''}
+        ${qtyField}
         <label class="field"><span>Одиниця виміру (без числа)</span><input name="unit" list="dl-unit" value="${esc(item.unit)}" placeholder="шт, м, кг…"></label>
         <label class="field"><span>Код / штрихкод / артикул</span>
           <div class="with-btn"><input name="code" value="${esc(item.code || '')}"><button type="button" class="icon-btn" id="scode" aria-label="Сканувати">${ICON_SCAN}</button></div></label>
@@ -265,11 +272,15 @@ export function viewItemEdit(ctx, id, query) {
     const min = parseNum(f.min_qty.value);
     const init = isNew && f.init_qty ? parseNum(f.init_qty.value) : null;
     if (Number.isNaN(min) || (min !== null && min < 0)) return toast('Мінімальний залишок — невідʼємне число', 'err');
+    // наявна позиція: порожнє або не чіпане поле — залишок не міняється
+    const fact = !isNew && !qtyLocked && f.init_qty.value.trim() !== qtyText ? parseNum(f.init_qty.value) : null;
     if (Number.isNaN(init) || (init !== null && init < 0)) return toast('Кількість на складі — невідʼємне число', 'err');
+    if (Number.isNaN(fact) || (fact !== null && fact < 0)) return toast('Кількість на складі — невідʼємне число', 'err');
+    const adjust = fact !== null && round(fact - item.qty) !== 0;
     // «100 шт» в одиниці виміру — це кількість не в тому полі: залишок лишився б 0
     if (/\d/.test(f.unit.value)) {
       f.unit.focus();
-      return toast(`В «Одиниця виміру» — лише «шт», «м», «кг», без числа. Кількість — ${isNew ? 'у полі «Кількість на складі зараз»' : 'через «＋ Прихід» у картці позиції'}.`, 'err', 8000);
+      return toast(`В «Одиниця виміру» — лише «шт», «м», «кг», без числа. Кількість — ${isNew || !qtyLocked ? 'у полі «Кількість на складі зараз»' : 'через «＋ Прихід» у картці позиції'}.`, 'err', 8000);
     }
     const btn = f.querySelector('#save');
     // така позиція вже є → не плодити дубль: кількість додається до наявної, фото лишається одне
@@ -306,8 +317,13 @@ export function viewItemEdit(ctx, id, query) {
       if (isNew && init > 0) {
         await api.postOperation({ type: 'in', lines: [{ item_id: saved, qty: init }], comment: 'Початковий залишок' });
       }
+      // як на екрані інвентаризації: рядок adjust несе фактичну кількість, різницю рахує сервер
+      const adj = adjust
+        ? await postOrQueue({ type: 'adjust', lines: [{ item_id: saved, qty: fact }], comment: 'Виправлено в картці позиції' })
+        : null;
       await reloadData();
-      toast(isNew ? 'Позицію додано' : 'Збережено');
+      if (adj?.queued) toast('Збережено. Кількість відправиться з появою мережі', 'ok', 6000);
+      else toast(isNew ? 'Позицію додано' : 'Збережено');
       go(`#/item/${saved}`);
     } catch (err) {
       toast(err.message, 'err');

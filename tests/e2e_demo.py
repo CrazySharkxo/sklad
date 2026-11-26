@@ -447,6 +447,37 @@ def main() -> int:
         page.goto(url + "#/journal")
         expect(page.locator(".op", has_text="Додано повторно")).to_have_count(1)
 
+        # --- редагування наявної позиції: поле кількості показує залишок і править його інвентаризацією ---
+        page.goto(dup_url.replace("#/item/", "#/item-edit/"))
+        qty_in = page.locator("#f [name=init_qty]")
+        expect(qty_in).to_have_value("110")
+        expect(qty_in).to_be_enabled()
+        qty_in.fill("-3")
+        page.locator("#save").click()
+        expect(page.locator(".toast", has_text="Кількість на складі — невідʼємне число")).to_be_visible()
+        expect(page.locator("#f")).to_be_visible()
+        qty_in.fill("95")
+        page.locator("#save").click()
+        expect(page.locator(".big-qty b")).to_have_text("95")
+        assert page.url == dup_url, (page.url, dup_url)
+        adj_rows = page.locator("#hist .hist-row", has_text="Інвентаризація")
+        expect(adj_rows).to_have_count(1)
+        expect(adj_rows).to_contain_text("Виправлено в картці позиції")
+        expect(adj_rows.locator("b")).to_have_text("−15")
+        expect(page.locator("#hist .hist-row")).to_have_count(3)
+        page.screenshot(path=str(SHOTS / "28_item_qty_edit.png"), full_page=True)
+        # збереження без змін (і з порожнім полем) — залишок той самий, нової операції немає
+        for val in (None, ""):
+            page.goto(dup_url.replace("#/item/", "#/item-edit/"))
+            expect(page.locator("#f [name=init_qty]")).to_have_value("95")
+            if val is not None:
+                page.locator("#f [name=init_qty]").fill(val)
+            page.locator("#save").click()
+            expect(page.locator(".big-qty b")).to_have_text("95")
+            expect(page.locator("#hist .hist-row")).to_have_count(3)
+        page.goto(url + "#/journal")
+        expect(page.locator(".op", has_text="Виправлено в картці позиції")).to_have_count(1)
+
         # --- користувачі та ролі (у демо — записи без входу) ---
         page.goto(url + "#/more")
         page.locator("a[href='#/users']").click()
