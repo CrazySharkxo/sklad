@@ -207,7 +207,7 @@ create unique index items_code_uq
 
 -- ---------------------------------------------------------------------
 --  Порядок позицій у «Залишках» — спільний для всіх. Міняє його лише
---  set_item_order() (право «змінювати позиції складу»); нова позиція стає в кінець.
+--  set_item_order() (лише головний адміністратор); нова позиція стає в кінець.
 --  Наявні позиції отримують місця за назвою — так список сортувався досі;
 --  повторний запуск чіпає лише ті, що ще без місця.
 -- ---------------------------------------------------------------------
@@ -334,6 +334,9 @@ insert into public.app_settings (id) values (1) on conflict (id) do nothing;
 -- порядок кнопок категорій у «Залишках» — спільний для всіх (set_category_order);
 -- категорії, яких тут немає, застосунок показує в кінці за абеткою
 alter table public.app_settings add column if not exists category_order text[] not null default '{}';
+-- порядок розділів меню — спільний для всіх (set_nav_order): ключі розділів застосунку;
+-- розділи, яких тут немає, застосунок показує в кінці у своєму порядку, невідомі ключі пропускає
+alter table public.app_settings add column if not exists nav_order text[] not null default '{}';
 
 -- у відділу може бути свій чат: туди йдуть замовлення, що приходять у цей відділ
 alter table public.departments add column if not exists tg_chat text not null default '';
@@ -850,7 +853,8 @@ begin
 end $$;
 
 -- ---------------------------------------------------------------------
---  Порядок позицій і категорій у «Залишках» (один виклик на весь новий порядок)
+--  Порядок позицій і категорій у «Залишках» і порядок розділів меню
+--  (один виклик на весь новий порядок). Міняє лише головний адміністратор.
 -- ---------------------------------------------------------------------
 -- p_ids — позиції в новому порядку. Вони переставляються між собою в межах тих
 -- місць, які займали; решта (архів, кошик, приховані фільтром, щойно додані
@@ -861,7 +865,7 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  perform public.require('stock.edit');
+  perform public.require_owner();
   if (select count(*) <> count(distinct x) from unnest(p_ids) x) then
     raise exception 'Позиція в порядку повторюється';
   end if;
@@ -893,12 +897,31 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  perform public.require('stock.edit');
+  perform public.require_owner();
   update public.app_settings
      set category_order = coalesce((
            select array_agg(q.n order by q.ord)
              from (select distinct on (trim(u.x)) trim(u.x) as n, u.ord
                      from unnest(p_names) with ordinality u(x, ord)
+                    where trim(u.x) <> ''
+                    order by trim(u.x), u.ord) q), '{}')
+   where id = 1;
+end $$;
+
+-- p_ids — ключі розділів меню в новому порядку (порожні й повтори відкидаються).
+-- Які ключі існують, знає застосунок: невідомі він пропускає, нові розділи ставить у кінець.
+create or replace function public.set_nav_order(p_ids text[])
+returns void
+language plpgsql
+set search_path = public
+as $$
+begin
+  perform public.require_owner();
+  update public.app_settings
+     set nav_order = coalesce((
+           select array_agg(q.n order by q.ord)
+             from (select distinct on (trim(u.x)) trim(u.x) as n, u.ord
+                     from unnest(p_ids) with ordinality u(x, ord)
                     where trim(u.x) <> ''
                     order by trim(u.x), u.ord) q), '{}')
    where id = 1;
@@ -1571,7 +1594,7 @@ grant update (position, serial, assembled, tested, note) on public.order_units t
 -- резерв і налаштування: токен бота з таблиці не читається — лише маска з admin_settings()
 revoke all on public.reserved_qty, public.app_settings from anon, authenticated;
 grant select on public.reserved_qty to authenticated;
-grant select (id, org_name, app_url, backup_at, updated_at, category_order) on public.app_settings to authenticated;
+grant select (id, org_name, app_url, backup_at, updated_at, category_order, nav_order) on public.app_settings to authenticated;
 
 -- функції працюють від імені власника схеми (обходять revoke вище),
 -- але самі перевіряють auth.uid()
@@ -1589,6 +1612,7 @@ alter function public.purge_order(uuid) security definer;
 alter function public.purge_trash() security definer;
 alter function public.set_item_order(uuid[]) security definer;
 alter function public.set_category_order(text[]) security definer;
+alter function public.set_nav_order(text[]) security definer;
 revoke execute on function public.post_operation(text, jsonb, text, text, uuid, numeric, uuid, uuid) from public, anon;
 revoke execute on function public.cancel_operation(uuid) from public, anon;
 revoke execute on function public.move_order(uuid, text, uuid, text) from public, anon;
@@ -1603,6 +1627,7 @@ revoke execute on function public.purge_order(uuid) from public, anon;
 revoke execute on function public.purge_trash() from public, anon;
 revoke execute on function public.set_item_order(uuid[]) from public, anon;
 revoke execute on function public.set_category_order(text[]) from public, anon;
+revoke execute on function public.set_nav_order(text[]) from public, anon;
 grant  execute on function public.post_operation(text, jsonb, text, text, uuid, numeric, uuid, uuid) to authenticated;
 grant  execute on function public.cancel_operation(uuid) to authenticated;
 grant  execute on function public.move_order(uuid, text, uuid, text) to authenticated;
@@ -1617,6 +1642,7 @@ grant  execute on function public.purge_order(uuid) to authenticated;
 grant  execute on function public.purge_trash() to authenticated;
 grant  execute on function public.set_item_order(uuid[]) to authenticated;
 grant  execute on function public.set_category_order(text[]) to authenticated;
+grant  execute on function public.set_nav_order(text[]) to authenticated;
 revoke execute on function public.my_perms() from public, anon;
 revoke execute on function public.has_perm(text) from public, anon;
 revoke execute on function public.is_active() from public, anon;

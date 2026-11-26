@@ -1,33 +1,42 @@
 // Дозамовити, етикетки, імпорт/експорт Excel, профіль
 import { api, isDemo } from '../api.js';
 import { esc, fmtQty, parseNum, norm, toast, confirmDialog, promptDialog, downloadXlsx, readSheet, todayIso } from '../util.js';
-import { canManageUsers, state, go, reloadData, activeItems, isLow, searchItems, hydratePhotos, thumb, myDepartment, depName, can } from '../core.js';
+import { canManageUsers, canOrder, state, go, reloadData, activeItems, isLow, searchItems, hydratePhotos, thumb, myDepartment, depName, can } from '../core.js';
+import { restSections, navOrdering, setNavOrdering, mountNavOrder, wide } from '../nav.js';
+import { ICON_GRIP } from '../sortable.js';
 import { printLabels } from './stock.js';
 import { exportJournal } from './ops.js';
 import { exportOrders } from './orders.js';
 import { pending, outboxBannerText } from '../outbox.js';
 import { lastBackupText } from './settings.js';
 
+// Розділи на сторінці «Ще»: повна назва і підпис. Сюди потрапляють ті, яким не вистачило
+// місця на нижній панелі телефона (на широкому екрані всі розділи — у бічному меню).
+const SECTION_INFO = {
+  users: ['Користувачі та ролі', () => (canManageUsers() ? 'додати людей, права доступу, блокування' : 'список людей і ролей — лише перегляд')],
+  notifications: ['Сповіщення Telegram', () => 'нові замовлення, передачі, мало на складі, прострочені'],
+  backups: ['Резервні копії', () => (isDemo ? 'завантажити копію даних' : esc(lastBackupText(state.settings?.backup_at)))],
+  departments: ['Відділи', () => { const dep = myDepartment(); return dep ? `мій відділ: ${esc(depName(dep))}` : 'свій відділ ще не вибрано'; }],
+  reorder: ['Дозамовити', () => { const low = activeItems().filter(isLow).length; return low ? `${low} позицій нижче мінімуму` : 'усе в нормі'; }],
+  inventory: ['Інвентаризація', () => 'перерахунок фактичної кількості'],
+  labels: ['Етикетки з QR-кодом', () => 'друк наліпок для полиць і коробок'],
+  import: ['Імпорт з Excel', () => 'завантажити список позицій і залишків'],
+};
+
 export function viewMore(ctx) {
+  if (navOrdering() && !wide.matches) { viewNavOrder(ctx); return; }
   ctx.header({ title: 'Ще' });
   const me = state.profiles[state.me] || '';
-  const low = activeItems().filter(isLow).length;
-  const dep = myDepartment();
   const queued = pending().length;
   ctx.main.innerHTML = `
     ${state.perms.size ? '' : `<div class="card hint">Вам ще не надали прав. Зверніться до адміністратора складу —
       він відкриє потрібні розділи в «Ще → Користувачі».</div>`}
     <div class="menu">
       ${queued ? `<a href="#/outbox" class="menu-item outbox-item"><b>Черга відправки</b><span class="muted">${esc(outboxBannerText())}</span></a>` : ''}
-      ${can('admin') ? `<a href="#/users" class="menu-item"><b>Користувачі та ролі</b><span class="muted">${canManageUsers() ? 'додати людей, права доступу, блокування' : 'список людей і ролей — лише перегляд'}</span></a>
-      <a href="#/notifications" class="menu-item"><b>Сповіщення Telegram</b><span class="muted">нові замовлення, передачі, мало на складі, прострочені</span></a>
-      <a href="#/backups" class="menu-item"><b>Резервні копії</b><span class="muted">${isDemo ? 'завантажити копію даних' : esc(lastBackupText(state.settings?.backup_at))}</span></a>` : ''}
-      <a href="#/departments" class="menu-item"><b>Відділи</b><span class="muted">${dep ? `мій відділ: ${esc(depName(dep))}` : 'свій відділ ще не вибрано'}</span></a>
-      ${can('stock.view') ? '' : '<!--'}<a href="#/reorder" class="menu-item"><b>Дозамовити</b><span class="muted">${low ? `${low} позицій нижче мінімуму` : 'усе в нормі'}</span></a>
-${can('stock.view') ? '' : '-->'}
-      ${can('ops.edit') ? '<a href="#/inventory" class="menu-item only-wide"><b>Інвентаризація</b><span class="muted">перерахунок фактичної кількості</span></a>' : ''}
-      ${can('stock.view') ? '<a href="#/labels" class="menu-item"><b>Етикетки з QR-кодом</b><span class="muted">друк наліпок для полиць і коробок</span></a>' : ''}
-      ${can('stock.edit') ? '<a href="#/import" class="menu-item"><b>Імпорт з Excel</b><span class="muted">завантажити список позицій і залишків</span></a>' : ''}
+      ${restSections().map(([k, href, label]) => `<a href="${href}" class="menu-item"><b>${SECTION_INFO[k]?.[0] || label}</b><span class="muted">${SECTION_INFO[k]?.[1]() || ''}</span></a>`).join('')}
+      ${canOrder() ? `<button class="menu-item" data-x="navorder"><b>Порядок меню</b><span class="muted">${navOrdering()
+        ? 'переставляйте розділи в меню ліворуч; натисніть тут або «Готово», щоб завершити'
+        : 'у якому порядку стоять розділи — однаково для всіх користувачів'}</span></button>` : ''}
       ${can('stock.view') ? '<button class="menu-item" data-x="stock"><b>Залишки в Excel</b><span class="muted">поточний стан складу</span></button>' : ''}
       ${can('ops.view') ? '<button class="menu-item" data-x="journal"><b>Журнал в Excel</b><span class="muted">усі операції (з фільтром журналу)</span></button>' : ''}
       ${can('orders.view') ? '<button class="menu-item" data-x="orders"><b>Замовлення в Excel</b><span class="muted">усі замовлення зі статусами</span></button>' : ''}
@@ -43,6 +52,7 @@ ${can('stock.view') ? '' : '-->'}
     const b = e.target.closest('[data-x]');
     if (!b) return;
     const x = b.dataset.x;
+    if (x === 'navorder') setNavOrdering(!navOrdering());
     if (x === 'stock') exportStock();
     if (x === 'journal') exportJournal();
     if (x === 'orders') exportOrders();
@@ -64,6 +74,17 @@ ${can('stock.view') ? '' : '-->'}
       location.reload();
     }
   });
+}
+
+// Порядок меню на телефоні: список розділів з ручками і стрілками (на широкому екрані — просто в бічному меню)
+function viewNavOrder(ctx) {
+  ctx.header({ title: 'Порядок меню', actions: '<button class="btn primary sm" data-done>Готово</button>' });
+  ctx.main.innerHTML = `
+    <p class="muted small order-hint">Тягніть за ${ICON_GRIP} або натискайте стрілки. Порядок зберігається одразу й однаковий у всіх.
+      На телефоні перші чотири доступні людині розділи стоять на нижній панелі, решта — у «Ще».</p>
+    <div id="navlist" class="list"></div>`;
+  mountNavOrder(ctx.main.querySelector('#navlist'));
+  ctx.headerEl.querySelector('[data-done]').addEventListener('click', () => setNavOrdering(false));
 }
 
 export function exportStock() {

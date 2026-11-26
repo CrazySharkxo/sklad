@@ -205,15 +205,18 @@ class SupaApi {
   // несекретна частина — для всіх (шапка документів)
   async settings() {
     const read = (cols) => this.q(this.sb.from('app_settings').select(cols).eq('id', 1));
+    // база зі старою схемою ще без порядку меню чи категорій — читаємо, як раніше
+    const tries = ['org_name, app_url, backup_at, category_order, nav_order', 'org_name, app_url, backup_at, category_order', 'org_name, app_url, backup_at'];
     let rows;
-    try {
-      rows = await read('org_name, app_url, backup_at, category_order');
-    } catch (e) {
-      // база зі старою схемою ще без порядку категорій — читаємо, як раніше
-      if (/Немає зʼєднання/.test(e.message)) throw e;
-      rows = await read('org_name, app_url, backup_at');
+    for (const [n, cols] of tries.entries()) {
+      try {
+        rows = await read(cols);
+        break;
+      } catch (e) {
+        if (/Немає зʼєднання/.test(e.message) || n === tries.length - 1) throw e;
+      }
     }
-    return { org_name: '', app_url: '', backup_at: null, category_order: [], ...rows?.[0] };
+    return { org_name: '', app_url: '', backup_at: null, category_order: [], nav_order: [], ...rows?.[0] };
   }
   async adminSettings() { return await this.q(this.sb.rpc('admin_settings')); }
   async saveSettings(patch) { await this.q(this.sb.rpc('admin_save_settings', { p: patch })); }
@@ -302,7 +305,9 @@ class SupaApi {
     for (const r of rows) { r.qty = Number(r.qty); r.min_qty = Number(r.min_qty); r.reserved = Number(r.reserved) || 0; }
     return sortItems(rows);
   }
-  // порядок у «Залишках», спільний для всіх: ids / names — увесь новий порядок одним викликом
+  // порядок у «Залишках» і порядок меню, спільні для всіх: ids / names — увесь новий порядок одним викликом;
+  // міняє лише головний адміністратор (require_owner у schema.sql)
+  async setNavOrder(ids) { await this.q(this.sb.rpc('set_nav_order', { p_ids: ids })); }
   async setItemOrder(ids) { await this.q(this.sb.rpc('set_item_order', { p_ids: ids })); }
   async setCategoryOrder(names) { await this.q(this.sb.rpc('set_category_order', { p_names: names })); }
   async saveItem(item) {
@@ -643,7 +648,7 @@ class LocalApi {
   // ---------- налаштування (у демо сповіщення не надсилаються) ----------
   async settings() {
     const s = this.load().settings;
-    return { org_name: s.org_name, app_url: s.app_url, backup_at: s.backup_at, category_order: s.category_order || [] };
+    return { org_name: s.org_name, app_url: s.app_url, backup_at: s.backup_at, category_order: s.category_order || [], nav_order: s.nav_order || [] };
   }
   async adminSettings() {
     const s = this.load().settings;
@@ -818,18 +823,22 @@ class LocalApi {
     const d = this.load();
     return sortItems(d.items.map((i) => ({ ...i, qty: this.qtyOf(d, i.id), reserved: this.reservedOf(d, i.id) })));
   }
-  requireStockEdit(d) {
-    if (!this.permsOf(d, DEMO_USER).some((x) => x === 'admin' || x === 'stock.edit')) throw new Error('Немає права змінювати позиції складу');
-  }
+  // порядок позицій, категорій і меню — лише головний адміністратор, як на сервері
   async setItemOrder(ids) {
     const d = this.load();
-    this.requireStockEdit(d);
+    this.requireOwner(d);
     permuteItems(d.items, ids);
+    this.save(d);
+  }
+  async setNavOrder(ids) {
+    const d = this.load();
+    this.requireOwner(d);
+    d.settings.nav_order = [...new Set(ids.map((n) => String(n ?? '').trim()).filter(Boolean))];
     this.save(d);
   }
   async setCategoryOrder(names) {
     const d = this.load();
-    this.requireStockEdit(d);
+    this.requireOwner(d);
     d.settings.category_order = [...new Set(names.map((n) => String(n ?? '').trim()).filter(Boolean))];
     this.save(d);
   }

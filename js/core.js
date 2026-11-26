@@ -17,7 +17,7 @@ export const state = {
   perms: new Set(),  // права поточного користувача
   roles: [],
   owner: undefined,  // id головного адміністратора; null — не призначено; undefined — стара схема бази, без головного
-  settings: { org_name: '', app_url: '', backup_at: null, category_order: [] },  // несекретні налаштування (шапка документів, порядок категорій)
+  settings: { org_name: '', app_url: '', backup_at: null, category_order: [], nav_order: [] },  // несекретні налаштування (шапка документів, порядок категорій і меню)
   me: null,
   loaded: false,
   offline: false,    // дані взято з кешу на пристрої, сервер недоступний
@@ -96,6 +96,8 @@ export const can = (p) => state.perms.has('admin') || state.perms.has(p);
 // На базі зі старою схемою головного ще немає як поняття — тоді, як раніше, будь-який адміністратор.
 export const isOwner = (id) => !!id && state.owner === id;
 export const canManageUsers = () => can('admin') && (state.owner === undefined || state.owner === state.me);
+// Порядок меню, позицій і категорій теж міняє лише головний (на старій схемі — будь-який адміністратор)
+export const canOrder = canManageUsers;
 export const roleName = (id) => state.roles.find((r) => r.id === id)?.name || 'без ролі';
 
 // ------------------------------------------------------------------
@@ -215,6 +217,12 @@ export function applyItemOrder(ids) {
 export function applyCategoryOrder(names) {
   const old = state.settings;
   state.settings = { ...old, category_order: names };
+  return () => { state.settings = old; };
+}
+// ids — ключі розділів меню в новому порядку (js/nav.js)
+export function applyNavOrder(ids) {
+  const old = state.settings;
+  state.settings = { ...old, nav_order: ids };
   return () => { state.settings = old; };
 }
 export const locations = () => [...new Set(state.items.map((i) => i.location).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk'));

@@ -4,6 +4,7 @@
 
 Проходить робочий цикл: позиції → прихід → видаток (зокрема понад залишок) →
 комплект → інвентаризація → журнал і скасування → дозамовлення → Excel експорт/імпорт.
+Основний екран — телефон 400×860; бічне меню перевіряється на другій сторінці 1280×800.
 """
 import functools
 import http.server
@@ -55,7 +56,16 @@ def main() -> int:
             t.wait_for()
             return t.inner_text()
 
+        # стартова сторінка — перший розділ меню за порядком: за замовчуванням «Комплекти»
         page.goto(url)
+        expect(page.locator("#top h1")).to_have_text("Комплекти")
+        assert page.url.endswith("#/kits"), page.url
+        tabs = lambda pg: pg.eval_on_selector_all("#nav a[data-tab]", "els => els.map((e) => e.dataset.tab)")
+        ALL = ["kits", "stock", "orders", "journal", "inventory", "reorder", "departments", "labels", "import",
+               "users", "notifications", "backups"]
+        assert tabs(page) == ALL[:4] + ["more"], tabs(page)  # на телефоні — перші чотири + «Ще»
+        expect(page.locator("#nav a.on")).to_have_attribute("data-tab", "kits")
+        page.goto(url + "#/stock")
         expect(page.locator(".empty-state")).to_contain_text("Склад порожній")
         page.screenshot(path=str(SHOTS / "01_empty.png"))
 
@@ -673,6 +683,158 @@ def main() -> int:
         expect(page.locator("#list a.row")).to_have_count(6)
         assert titles() == sorted(e) and cat_chips() == sorted(c), (titles(), cat_chips())
 
+        # --- меню: порядок за замовчуванням, усі розділи в бічному меню, порядок міняє головний ---
+        more_links = lambda pg: pg.eval_on_selector_all("main .menu a.menu-item", "els => els.map((e) => e.getAttribute('href').slice(2))")
+        sort_ids = lambda pg, box: pg.eval_on_selector_all(f"{box} > [data-sort]", "els => els.map((e) => e.dataset.id)")
+        saved_nav = lambda: page.evaluate("JSON.parse(localStorage.getItem('sklad-demo-v1')).settings.nav_order || null")
+        assert tabs(page) == ALL[:4] + ["more"], tabs(page)
+        assert page.locator("#nav a[data-tab] span").all_inner_texts() == ["Комплекти", "Залишки", "Замовлення", "Журнал", "Ще"]
+        # нижня панель на 400 px: п'ять пунктів в один ряд у межах екрана, підписи не вилазять за свій пункт
+        bar = page.eval_on_selector_all("#nav a[data-tab]", """els => els.map((e) => {
+            const r = e.getBoundingClientRect(), t = e.querySelector('span').getBoundingClientRect();
+            return { l: r.left, r: r.right, top: r.top, w: r.width, in: t.left >= r.left - 0.5 && t.right <= r.right + 0.5 }; })""")
+        assert len(bar) == 5 and len({b["top"] for b in bar}) == 1, bar
+        assert bar[0]["l"] >= 0 and bar[-1]["r"] <= 400 and all(b["in"] and abs(b["w"] - 80) < 1 for b in bar), bar
+        assert page.locator(".nav-order").count() == 0  # кнопка порядку — не на нижній панелі
+        # решта розділів на телефоні — на сторінці «Ще», у тому самому порядку; відкритий розділ, якого на панелі немає, підсвічує «Ще»
+        page.goto(url + "#/more")
+        assert more_links(page) == ALL[4:], more_links(page)
+        expect(page.locator("[data-x=navorder]")).to_have_count(1)
+        page.goto(url + "#/reorder")
+        expect(page.locator("#nav a.on")).to_have_attribute("data-tab", "more")
+
+        # широкий екран: у бічному меню всі розділи, «Ще» — останнє, на сторінці «Ще» лишились тільки дії
+        wide = ctx.new_page()
+        wide.set_viewport_size({"width": 1280, "height": 800})
+        wide.on("pageerror", lambda e: errors.append(f"wide pageerror: {e}"))
+        wide.on("console", lambda m: errors.append(f"wide console.{m.type}: {m.text}") if m.type == "error" else None)
+        wide.goto(url)
+        expect(wide.locator("#top h1")).to_have_text("Комплекти")
+        assert tabs(wide) == ALL + ["more"], tabs(wide)
+        assert wide.locator("#nav a[data-tab] span").all_inner_texts() == [
+            "Комплекти", "Залишки", "Замовлення", "Журнал", "Інвентар", "Дозамовити", "Відділи", "Етикетки", "Імпорт",
+            "Користувачі", "Сповіщення", "Резервні копії", "Ще"]
+        expect(wide.locator("#nav .nav-order")).to_have_text("Порядок меню")
+        # усе меню вміщається по висоті 800 px і жоден підпис не обрізано
+        fit = wide.evaluate("""() => { const n = document.getElementById('nav');
+            const cut = [...n.querySelectorAll('a[data-tab] span, .nav-order span')].filter((e) => e.getBoundingClientRect().right > n.getBoundingClientRect().right - 8);
+            return { sh: n.scrollHeight, ch: n.clientHeight, bottom: n.querySelector('.nav-order').getBoundingClientRect().bottom, cut: cut.map((e) => e.textContent) }; }""")
+        assert fit["sh"] <= fit["ch"] and fit["bottom"] <= 800 and not fit["cut"], fit
+        wide.goto(url + "#/users")
+        expect(wide.locator("#nav a.on")).to_have_attribute("data-tab", "users")
+        expect(wide.locator("#nav a.on")).to_have_count(1)
+        wide.screenshot(path=str(SHOTS / "34_sidebar_full.png"))
+        wide.goto(url + "#/roles")
+        expect(wide.locator("#nav a.on")).to_have_attribute("data-tab", "users")
+        wide.goto(url + "#/more")
+        assert more_links(wide) == [], more_links(wide)
+        expect(wide.locator("main [data-x=stock]")).to_have_count(1)
+        expect(wide.locator("main [data-x=name]")).to_have_count(1)
+        expect(wide.locator("main")).to_contain_text("версія 2026-")
+        # низьке вікно: меню прокручується, до «Ще» і кнопки порядку можна дістатись
+        wide.set_viewport_size({"width": 1280, "height": 420})
+        sc = wide.evaluate("() => { const n = document.getElementById('nav'); return [n.scrollHeight > n.clientHeight, getComputedStyle(n).overflowY]; }")
+        assert sc == [True, "auto"], sc
+        wide.locator("#nav .nav-order").scroll_into_view_if_needed()
+        bb = wide.locator("#nav .nav-order").bounding_box()
+        assert bb["y"] >= 0 and bb["y"] + bb["height"] <= 420, bb
+        wide.set_viewport_size({"width": 1280, "height": 800})
+
+        # режим «Порядок меню» в бічному меню: стрілка і перетягування; зберігається одразу
+        assert saved_nav() is None, saved_nav()
+        wide.locator("#nav [data-nav-order=on]").click()
+        expect(wide.locator("#nav a[data-tab]")).to_have_count(0)  # у режимі пункти не відкривають розділи
+        assert sort_ids(wide, "#nav-list") == ALL, sort_ids(wide, "#nav-list")
+        expect(wide.locator("#nav .nav-fixed")).to_contain_text("Ще")
+        assert wide.locator("#nav-list [data-grip]").first.evaluate("(g) => getComputedStyle(g).touchAction") == "none"
+        expect(wide.locator("#nav-list > [data-sort]").first.locator("[data-mv='-1']")).to_be_disabled()
+        wide.locator("#nav-list > [data-sort]").first.locator("[data-mv='1']").click()
+        order = ["stock", "kits"] + ALL[2:]
+        assert sort_ids(wide, "#nav-list") == order, sort_ids(wide, "#nav-list")
+        gx, gy = center(wide.locator("#nav-list [data-id=users] [data-grip]"))
+        top_row = wide.locator("#nav-list > [data-sort]").first.bounding_box()
+        wide.mouse.move(gx, gy)
+        wide.mouse.down()
+        wide.mouse.move(gx, top_row["y"] + 4, steps=15)
+        expect(wide.locator("#nav-list .dragging")).to_have_count(1)
+        expect(wide.locator("#nav-list .dragging")).to_have_attribute("data-id", "users")
+        # у режимі порядку теж нічого не обрізано: рядки й кнопки в межах меню, меню вміщається
+        fit = wide.evaluate("""() => { const n = document.getElementById('nav'), nr = n.getBoundingClientRect();
+            const out = [...n.querySelectorAll('[data-sort], [data-mv], [data-nav-order]')].filter((e) => { const r = e.getBoundingClientRect(); return r.left < nr.left || r.right > nr.right || r.bottom > innerHeight; });
+            const cut = [...n.querySelectorAll('.row-title')].filter((e) => e.scrollWidth > e.clientWidth);
+            return { sh: n.scrollHeight, ch: n.clientHeight, out: out.length, cut: cut.map((e) => e.textContent) }; }""")
+        assert fit["sh"] <= fit["ch"] and not fit["out"] and not fit["cut"], fit
+        wide.screenshot(path=str(SHOTS / "35_nav_reorder.png"))
+        wide.mouse.up()
+        expect(wide.locator(".dragging")).to_have_count(0)
+        order = ["users"] + [k for k in order if k != "users"]
+        assert sort_ids(wide, "#nav-list") == order, sort_ids(wide, "#nav-list")
+        expect(wide.locator(".toast")).to_have_count(0)
+        wide.locator("#nav [data-nav-order=off]").click()
+        assert tabs(wide) == order + ["more"], tabs(wide)
+        assert saved_nav() == order, saved_nav()
+        # порядок спільний: телефон поруч показує його сам; після перезавантаження він на місці, стартова — перший розділ
+        expect(page.locator("#nav a[data-tab]").first).to_have_attribute("data-tab", "users")
+        assert tabs(page) == order[:4] + ["more"], tabs(page)
+        wide.reload()
+        expect(wide.locator("#nav a[data-tab]").first).to_have_attribute("data-tab", "users")
+        assert tabs(wide) == order + ["more"], tabs(wide)
+        wide.goto(url)
+        expect(wide.locator("#top h1")).to_have_text("Користувачі")
+
+        # на телефоні порядок міняється на сторінці «Ще»: список розділів з ручками і стрілками
+        page.goto(url + "#/more")
+        page.reload()
+        assert tabs(page) == order[:4] + ["more"] and more_links(page) == order[4:], (tabs(page), more_links(page))
+        page.locator("[data-x=navorder]").click()
+        expect(page.locator("#top h1")).to_have_text("Порядок меню")
+        assert sort_ids(page, "#navlist") == order, sort_ids(page, "#navlist")
+        assert page.locator("#navlist [data-grip]").first.evaluate("(g) => getComputedStyle(g).touchAction") == "none"
+        page.locator("#navlist [data-id=journal] [data-mv='-1']").click()
+        n = order.index("journal")
+        order[n - 1], order[n] = order[n], order[n - 1]
+        assert sort_ids(page, "#navlist") == order, sort_ids(page, "#navlist")
+        assert tabs(page) == order[:4] + ["more"], tabs(page)   # нижня панель одразу в новому порядку
+        expect(page.locator(".toast")).to_have_count(0, timeout=15000)
+        gx, gy = center(page.locator("#navlist [data-id=import] [data-grip]"))
+        top_row = page.locator("#navlist > [data-sort]").first.bounding_box()
+        page.mouse.move(gx, gy)
+        page.mouse.down()
+        page.mouse.move(gx, top_row["y"] + 6, steps=15)
+        expect(page.locator("#navlist .dragging .row-title")).to_have_text("Імпорт")
+        page.screenshot(path=str(SHOTS / "36_nav_reorder_phone.png"))
+        page.mouse.up()
+        order = ["import"] + [k for k in order if k != "import"]
+        assert sort_ids(page, "#navlist") == order, sort_ids(page, "#navlist")
+        assert tabs(page) == order[:4] + ["more"], tabs(page)
+        page.locator("[data-done]").click()
+        expect(page.locator("#top h1")).to_have_text("Ще")
+        assert more_links(page) == order[4:], more_links(page)
+        assert saved_nav() == order, saved_nav()
+        page.reload()
+        expect(page.locator("#nav a[data-tab]").first).to_have_attribute("data-tab", "import")
+        assert tabs(page) == order[:4] + ["more"] and more_links(page) == order[4:], (tabs(page), more_links(page))
+        expect(wide.locator("#nav a[data-tab]").first).to_have_attribute("data-tab", "import")  # і на ПК — без перезавантаження
+        assert tabs(wide) == order + ["more"], tabs(wide)
+        # пішли з режиму порядку на інший екран — режим вимкнувся
+        page.locator("[data-x=navorder]").click()
+        expect(page.locator("#navlist")).to_have_count(1)
+        page.goto(url + "#/stock")
+        page.goto(url + "#/more")
+        expect(page.locator("#top h1")).to_have_text("Ще")
+        expect(page.locator("#navlist")).to_have_count(0)
+        # невідомий ключ у збереженому порядку пропускається, розділи, яких у ньому немає, стають у кінець перед «Ще»
+        page.evaluate("async () => { const { api } = await import('./js/api.js'); await api.setNavOrder(['nema-takoho', 'journal', 'more', 'journal', 'stock']); }")
+        wide.reload()
+        expect(wide.locator("#nav a[data-tab]").first).to_have_attribute("data-tab", "journal")
+        assert tabs(wide) == ["journal", "stock"] + [k for k in ALL if k not in ("journal", "stock")] + ["more"], tabs(wide)
+        # порожній збережений порядок — порядок за замовчуванням
+        page.evaluate("async () => { const { api } = await import('./js/api.js'); await api.setNavOrder([]); }")
+        page.reload()
+        wide.reload()
+        expect(wide.locator("#nav a[data-tab]").first).to_have_attribute("data-tab", "kits")
+        assert tabs(wide) == ALL + ["more"] and tabs(page) == ALL[:4] + ["more"], (tabs(wide), tabs(page))
+
         # --- користувачі та ролі (у демо — записи без входу) ---
         page.goto(url + "#/more")
         page.locator("a[href='#/users']").click()
@@ -774,6 +936,7 @@ def main() -> int:
         page.reload()
         expect(page.locator(".row").first).to_be_visible()
         expect(page.locator("#nav [data-tab=inventory]")).to_have_count(0)
+        assert tabs(page) == ["kits", "stock", "orders", "journal", "more"], tabs(page)
         expect(page.locator("[data-new]")).to_have_count(0)
         expect(page.locator("[data-order]")).to_have_count(0)
         expect(page.locator(".bottom-actions")).to_have_count(0)
@@ -793,10 +956,40 @@ def main() -> int:
         expect(page.locator("#top h1")).to_have_text("Немає доступу")
         page.goto(url + "#/more")
         expect(page.locator("a[href='#/users']")).to_have_count(0)
+        assert more_links(page) == ["reorder", "departments", "labels"], more_links(page)  # без інвентаризації, імпорту й адмінського
+        expect(page.locator("[data-x=navorder]")).to_have_count(0)                          # порядок меню — не для нього
         page.screenshot(path=str(SHOTS / "22_viewer.png"), full_page=True)
+        # те саме в бічному меню: лише дозволені розділи, без кнопки порядку
+        wide.goto(url + "#/stock")
+        wide.reload()
+        expect(wide.locator("#list .row").first).to_be_visible()
+        assert tabs(wide) == ["kits", "stock", "orders", "journal", "reorder", "departments", "labels", "more"], tabs(wide)
+        expect(wide.locator(".nav-order")).to_have_count(0)
+        expect(wide.locator("[data-order]")).to_have_count(0)
+        wide.goto(url + "#/users")
+        expect(wide.locator("#top h1")).to_have_text("Немає доступу")
+
+        # --- звичайний користувач із правом «Зміна» складу: позиції додає, але порядок — не його ---
+        page.evaluate(set_role, "Старший користувач")
+        page.goto(url + "#/stock")
+        page.reload()
+        expect(page.locator("#list a.row").first).to_be_visible()
+        expect(page.locator("[data-new]")).to_have_count(1)
+        expect(page.locator("[data-order]")).to_have_count(0)
+        page.goto(url + "#/more")
+        assert more_links(page) == ["inventory", "reorder", "departments", "labels", "import"], more_links(page)
+        expect(page.locator("[data-x=navorder]")).to_have_count(0)
+        wide.goto(url + "#/stock")
+        wide.reload()
+        expect(wide.locator("[data-new]")).to_have_count(1)
+        expect(wide.locator("[data-order]")).to_have_count(0)
+        expect(wide.locator(".nav-order")).to_have_count(0)
+        assert tabs(wide) == ALL[:9] + ["more"], tabs(wide)
+
         page.evaluate(set_role, "Адміністратор")
         page.reload()
         expect(page.locator("a[href='#/users']")).to_have_count(1)
+        expect(page.locator("[data-x=navorder]")).to_have_count(1)
 
         # --- роль «Адміністратор», але не головний: списки лише для читання ---
         petro = page.evaluate("""() => {
@@ -809,6 +1002,19 @@ def main() -> int:
         }""")
         page.reload()
         expect(page.locator("a[href='#/users']")).to_contain_text("лише перегляд")
+        # порядок меню, позицій і категорій — лише в головного: у іншого адміністратора кнопок немає
+        expect(page.locator("[data-x=navorder]")).to_have_count(0)
+        page.goto(url + "#/stock")
+        expect(page.locator("#list a.row").first).to_be_visible()
+        expect(page.locator("[data-new]")).to_have_count(1)
+        expect(page.locator("[data-order]")).to_have_count(0)
+        wide.goto(url + "#/stock")
+        wide.reload()
+        expect(wide.locator("#list a.row").first).to_be_visible()
+        assert tabs(wide) == ALL + ["more"], tabs(wide)                       # розділи всі, як у адміністратора
+        expect(wide.locator(".nav-order")).to_have_count(0)
+        expect(wide.locator("[data-order]")).to_have_count(0)
+        page.goto(url + "#/more")
         expect(page.locator("a[href='#/notifications']")).to_have_count(1)   # решта адмінського на місці
         expect(page.locator("a[href='#/backups']")).to_have_count(1)
         page.locator("a[href='#/users']").click()
@@ -837,6 +1043,7 @@ def main() -> int:
             const { api } = await import('./js/api.js');
             const roles = await api.roles();
             const me = '00000000-0000-0000-0000-00000000demo';
+            const before = JSON.parse(localStorage.getItem('sklad-demo-v1'));
             const out = [];
             for (const f of [
               () => api.createUser({ email: 'x@example.com', password: 'secret1', name: 'X' }),
@@ -847,12 +1054,17 @@ def main() -> int:
               () => api.saveRole({ name: 'Нова', perms: [] }),
               () => api.saveRole({ id: roles[0].id, name: roles[0].name, perms: ['admin'] }),
               () => api.deleteRole(roles[0].id),
+              () => api.setNavOrder(['stock', 'kits']),
+              () => api.setItemOrder(before.items.map((i) => i.id).reverse()),
+              () => api.setCategoryOrder(['Яяя']),
             ]) { try { await f(); out.push('ok'); } catch (e) { out.push(e.message); } }
             const d = JSON.parse(localStorage.getItem('sklad-demo-v1'));
-            return { out, users: Object.keys(d.users).length, roles: d.roles.length, owner: d.owner };
+            const same = JSON.stringify(d.items.map((i) => [i.id, i.sort_order])) === JSON.stringify(before.items.map((i) => [i.id, i.sort_order]))
+              && JSON.stringify(d.settings) === JSON.stringify(before.settings);
+            return { out, users: Object.keys(d.users).length, roles: d.roles.length, owner: d.owner, same };
         }""", petro)
-        assert denied["out"] == ["Права надає лише головний адміністратор"] * 8, denied
-        assert denied["users"] == 2 and denied["roles"] == 7 and denied["owner"] == petro, denied
+        assert denied["out"] == ["Права надає лише головний адміністратор"] * 11, denied
+        assert denied["users"] == 2 and denied["roles"] == 7 and denied["owner"] == petro and denied["same"], denied
 
         # --- демо-дані, збережені до появи головного й нових ролей: з'являються самі, видалена роль не вертається ---
         page.evaluate("""() => {

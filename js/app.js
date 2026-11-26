@@ -1,7 +1,8 @@
 // Точка входу: вхід, маршрутизація, макет, живе оновлення
 import { api, isDemo } from './api.js';
 import { esc, toast, debounce } from './util.js';
-import { state, reloadData, waitingForMe, can, ICON_BACK } from './core.js';
+import { state, reloadData, can, ICON_BACK } from './core.js';
+import { renderNav, updateBadge, setNavTab, homeHash } from './nav.js';
 import { viewStock, viewItem, viewItemEdit } from './views/stock.js';
 import { viewOp, viewJournal } from './views/ops.js';
 import { viewKits, viewKit, viewKitEdit } from './views/kits.js';
@@ -18,11 +19,11 @@ const ROUTES = [
   [/^\/stock$/, (c) => viewStock(c), 'stock', true, 'stock.view'],
   [/^\/orders$/, (c) => viewOrders(c), 'orders', true, 'orders.view'],
   [/^\/order\/([\w-]+)$/, (c, m, q) => viewOrder(c, m[1], q), 'orders', true, 'orders.view'],
-  [/^\/notifications$/, (c) => viewNotifications(c), 'more', false, 'admin'],
-  [/^\/backups$/, (c) => viewBackups(c), 'more', false, 'admin'],
+  [/^\/notifications$/, (c) => viewNotifications(c), 'notifications', false, 'admin'],
+  [/^\/backups$/, (c) => viewBackups(c), 'backups', false, 'admin'],
   [/^\/outbox$/, (c) => viewOutbox(c), 'more', false, 'ops.edit'],
   [/^\/order-edit\/([\w-]+)$/, (c, m) => viewOrderEdit(c, m[1]), 'orders', false, 'orders.edit'],
-  [/^\/departments$/, (c) => viewDepartments(c), 'more', true, null],
+  [/^\/departments$/, (c) => viewDepartments(c), 'departments', true, null],
   [/^\/item\/([\w-]+)$/, (c, m) => viewItem(c, m[1]), 'stock', true, 'stock.view'],
   [/^\/item-edit\/([\w-]+)$/, (c, m, q) => viewItemEdit(c, m[1], q), 'stock', false, 'stock.edit'],
   [/^\/op\/(in|out)$/, (c, m, q) => viewOp(c, m[1], q), 'stock', false, 'ops.edit'],
@@ -31,51 +32,17 @@ const ROUTES = [
   [/^\/kit\/([\w-]+)$/, (c, m) => viewKit(c, m[1]), 'kits', true, 'kits.view'],
   [/^\/kit-edit\/([\w-]+)$/, (c, m) => viewKitEdit(c, m[1]), 'kits', false, 'kits.edit'],
   [/^\/inventory$/, (c) => viewInventory(c), 'inventory', false, 'ops.edit'],
-  [/^\/reorder$/, (c) => viewReorder(c), 'more', true, 'stock.view'],
-  [/^\/labels$/, (c) => viewLabels(c), 'more', false, 'stock.view'],
-  [/^\/import$/, (c) => viewImport(c), 'more', false, 'stock.edit'],
-  [/^\/users$/, (c) => viewUsers(c), 'more', false, 'admin'],
-  [/^\/user\/([\w-]+)$/, (c, m) => viewUserEdit(c, m[1]), 'more', false, 'admin'],
-  [/^\/roles$/, (c) => viewRoles(c), 'more', false, 'admin'],
-  [/^\/role\/([\w-]+)$/, (c, m) => viewRoleEdit(c, m[1]), 'more', false, 'admin'],
+  [/^\/reorder$/, (c) => viewReorder(c), 'reorder', true, 'stock.view'],
+  [/^\/labels$/, (c) => viewLabels(c), 'labels', false, 'stock.view'],
+  [/^\/import$/, (c) => viewImport(c), 'import', false, 'stock.edit'],
+  [/^\/users$/, (c) => viewUsers(c), 'users', false, 'admin'],
+  [/^\/user\/([\w-]+)$/, (c, m) => viewUserEdit(c, m[1]), 'users', false, 'admin'],
+  [/^\/roles$/, (c) => viewRoles(c), 'users', false, 'admin'],
+  [/^\/role\/([\w-]+)$/, (c, m) => viewRoleEdit(c, m[1]), 'users', false, 'admin'],
   [/^\/more$/, (c) => viewMore(c), 'more', false, null],
 ];
 
-// [вкладка, адреса, назва, іконка, лише на широкому екрані]
-const NAV = [
-  ['orders', '#/orders', 'Замовлення', '<path d="M9 3h6v4H9zM9 5H5v16h14V5h-4M8 12h8M8 16h5"/>', false, 'orders.view'],
-  ['stock', '#/stock', 'Залишки', '<path d="M21 8l-9-5-9 5v8l9 5 9-5V8zM12 13L3.5 8.3M12 13l8.5-4.7M12 13v8"/>', false, 'stock.view'],
-  ['journal', '#/journal', 'Журнал', '<path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>', false, 'ops.view'],
-  ['kits', '#/kits', 'Комплекти', '<path d="M4 7h7v7H4zM13 4h7v7h-7zM13 13h7v7h-7zM4 16h7v4H4z"/>', false, 'kits.view'],
-  // на телефоні інвентаризація — у «Ще», щоб нижнє меню не тіснилося
-  ['inventory', '#/inventory', 'Інвентар', '<path d="M9 5h10M9 12h10M9 19h10M4 5l1 1 2-2M4 12l1 1 2-2M4 19l1 1 2-2"/>', true, 'ops.edit'],
-  ['more', '#/more', 'Ще', '<path d="M5 12h.01M12 12h.01M19 12h.01"/>', false, null],
-];
-
-// скільки замовлень чекає на мій відділ — число на вкладці
-function updateBadge() {
-  const el = document.querySelector('#nav [data-tab="orders"] .nav-badge');
-  if (!el) return;
-  const n = waitingForMe().length;
-  el.textContent = n > 99 ? '99+' : String(n);
-  el.hidden = !n;
-}
-
-const allowedNav = () => NAV.filter(([, , , , , perm]) => !perm || can(perm));
-// перша дозволена вкладка — туди ведемо замість порожньої адреси
-const homeHash = () => (can('stock.view') ? '#/stock' : allowedNav()[0]?.[1] || '#/more');
-
-let currentTab = null;
-function renderNav() {
-  const nav = document.getElementById('nav');
-  if (!nav) return;
-  nav.innerHTML = `<div class="brand"><svg viewBox="0 0 24 24"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8zM12 13L3.5 8.3M12 13l8.5-4.7M12 13v8"/></svg>Склад</div>
-    ${allowedNav().map(([k, href, label, icon, wide]) => `<a href="${href}" data-tab="${k}"${wide ? ' class="nav-wide"' : ''}><svg viewBox="0 0 24 24" aria-hidden="true">${icon}</svg><span>${label}</span>${k === 'orders' ? '<b class="nav-badge" hidden></b>' : ''}</a>`).join('')}`;
-  nav.querySelectorAll('a').forEach((a) => a.classList.toggle('on', a.dataset.tab === currentTab));
-  updateBadge();
-}
-// права могли змінитися (адміністратор щойно змінив) — меню перебудовуємо разом із даними
-document.addEventListener('sklad:data', renderNav);
+// розділи меню, їх порядок і стартова сторінка — js/nav.js
 
 const app = document.getElementById('app');
 let current = null; // { token, route, ctx }
@@ -147,9 +114,8 @@ function route() {
     };
     live = false;
   }
-  currentTab = tab;
-  document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab));
-  current = { token: my, live, ctx, rerender: () => fn(ctx, path.match(re), query) };
+  setNavTab(tab);
+  current = { token: my, live, ctx, path, rerender: () => fn(ctx, path.match(re), query) };
   main.innerHTML = '';
   window.scrollTo(0, 0);
   Promise.resolve(fn(ctx, path.match(re), query)).catch((e) => {
@@ -174,6 +140,11 @@ const onRemoteChange = debounce(async () => {
     window.scrollTo(0, y);
   }
 }, 700);
+
+// сторінка «Ще» показує розділи, яким не вистачило місця в меню, і режим «Порядок меню»
+document.addEventListener('sklad:nav', () => {
+  if (current && current.token === token && current.path === '/more') current.rerender();
+});
 
 function loginView() {
   app.innerHTML = `

@@ -1,13 +1,14 @@
 // Залишки, картка позиції, створення/редагування позиції
-import { api, isDemo, TRASH_DAYS } from '../api.js';
+import { api, TRASH_DAYS } from '../api.js';
 import { esc, norm, fmtQty, fmtSigned, fmtDate, parseNum, round, compressImage, toast, confirmDialog, OP_TYPES, qrSvg, labelPayload } from '../util.js';
 import { scanCode } from '../scanner.js';
 import { postOrQueue } from '../outbox.js';
 import {
   state, go, reloadData, activeItems, isLow, categories, locations, units, searchItems, findByCode, resolveCode,
   hydratePhotos, thumb, comboInput, userName, ICON_SCAN, ICON_PLUS, trashRow, bindTrash, trashNote, TRASH_EMPTY, can,
-  reservedOf, freeQty, reservingOrders, applyItemOrder, applyCategoryOrder,
+  reservedOf, freeQty, reservingOrders, applyItemOrder, applyCategoryOrder, canOrder,
 } from '../core.js';
+import { sortable, commitOrder, afterDrag, ICON_GRIP } from '../sortable.js';
 
 // пошук і фільтр запамʼятовуються в межах сесії
 const ui = { q: '', cat: '', low: false, archived: false, trash: false, order: false };
@@ -16,13 +17,14 @@ addEventListener('hashchange', () => { if (location.hash !== '#/stock') ui.order
 
 export function viewStock(ctx) {
   // зміни від інших не перемальовують екран під пальцем — лише після відпускання
-  if (drag) { drag.after = () => viewStock(ctx); return; }
-  if (!can('stock.edit')) ui.order = false;
+  if (afterDrag('stock', () => viewStock(ctx))) return;
+  // порядок позицій і категорій міняє лише головний адміністратор
+  if (!canOrder()) ui.order = false;
   if (ui.order) { viewStockOrder(ctx); return; }
   ctx.header({
     title: 'Залишки',
-    actions: can('stock.edit') ? `${activeItems().length > 1 ? '<button class="btn ghost sm" data-order>Порядок</button>' : ''}
-      <button class="btn primary sm" data-new>${ICON_PLUS}<span>Позиція</span></button>` : '',
+    actions: `${canOrder() && activeItems().length > 1 ? '<button class="btn ghost sm" data-order>Порядок</button>' : ''}
+      ${can('stock.edit') ? `<button class="btn primary sm" data-new>${ICON_PLUS}<span>Позиція</span></button>` : ''}`,
   });
   const cats = categories();
   const lowCount = activeItems().filter(isLow).length;
@@ -125,14 +127,11 @@ export function viewStock(ctx) {
 
 // ------------------------------------------------------------------
 // Режим «Порядок»: позиції й кнопки категорій перетягуються за ручку або
-// пересуваються стрілками. Порядок спільний для всіх і зберігається після
-// кожного відпускання; дотик до рядка картку не відкриває.
+// пересуваються стрілками (js/sortable.js). Порядок спільний для всіх, міняє його
+// лише головний адміністратор; зберігається після кожного відпускання;
+// дотик до рядка картку не відкриває.
 // ------------------------------------------------------------------
-const ICON_GRIP = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01"/></svg>';
 const ORDER_LIMIT = 300;
-let drag = null;                  // триває перетягування: { after } — що зробити після відпускання
-let saving = Promise.resolve();   // збереження йдуть по черзі
-let failures = 0;                 // після невдачі вже поставлені в чергу збереження не відправляються
 
 function viewStockOrder(ctx) {
   ctx.header({ title: 'Залишки — порядок', actions: '<button class="btn primary sm" data-done>Готово</button>' });
@@ -170,24 +169,7 @@ function viewStockOrder(ctx) {
     viewStock(ctx);
     window.scrollTo(0, y);
   };
-  // новий порядок уже на екрані; apply оновлює стан і повертає «як було», send зберігає в базі
-  const commit = (apply, send) => {
-    if (!isDemo && (!navigator.onLine || state.offline)) {
-      toast('Немає мережі — порядок не збережено', 'err', 5000);
-      redraw();
-      return;
-    }
-    const undo = apply();
-    const mine = failures;
-    saving = saving.then(() => (mine === failures ? send() : null)).catch((err) => {
-      failures += 1;
-      undo();
-      toast(err.message, 'err', 8000);
-      redraw();
-      // кілька перестановок поспіль могли розійтися з базою — звіряємось
-      reloadData().then(redraw, () => {});
-    });
-  };
+  const commit = (apply, send) => commitOrder(apply, send, redraw);
   sortable(chipsEl, {
     horizontal: true,
     cancel: redraw,
@@ -210,119 +192,6 @@ function viewStockOrder(ctx) {
     viewStock(ctx);
   });
   ctx.headerEl.querySelector('[data-done]').addEventListener('click', () => { ui.order = false; viewStock(ctx); });
-}
-
-// Перестановка дітей box, позначених [data-sort]: перетягуванням за [data-grip]
-// (Pointer Events — миша, палець, стилус) і кнопками [data-mv="-1|1"].
-// Елемент, який тягнуть, у DOM не рухається (інакше браузер відпустив би вказівник) —
-// місцями міняються сусіди. drop() — порядок змінився; cancel() — жест перервано.
-function sortable(box, { horizontal = false, drop, cancel }) {
-  const items = () => [...box.querySelectorAll(':scope > [data-sort]')];
-  const ends = () => {
-    const els = items();
-    els.forEach((el, n) => {
-      const [up, down] = el.querySelectorAll('[data-mv]');
-      up.disabled = n === 0;
-      down.disabled = n === els.length - 1;
-    });
-  };
-  // el стає по той бік від t; усі, хто між ними, зсуваються на одне місце
-  const moveTo = (el, t) => {
-    if (el.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING) {
-      for (let n = el.nextElementSibling; n; n = el.nextElementSibling) { box.insertBefore(n, el); if (n === t) break; }
-    } else {
-      for (let n = el.previousElementSibling; n; n = el.previousElementSibling) { box.insertBefore(n, el.nextSibling); if (n === t) break; }
-    }
-  };
-  ends();
-
-  box.addEventListener('click', (e) => {
-    const b = e.target.closest('[data-mv]');
-    const el = b?.closest('[data-sort]');
-    if (!el || el.parentNode !== box) return;
-    const els = items();
-    const t = els[els.indexOf(el) + Number(b.dataset.mv)];
-    if (!t) return;
-    moveTo(el, t);
-    ends();
-    (b.disabled ? el.querySelector('[data-mv]:not(:disabled)') : b)?.focus();
-    drop();
-  });
-
-  box.addEventListener('pointerdown', (e) => {
-    const grip = e.target.closest('[data-grip]');
-    const el = grip?.closest('[data-sort]');
-    if (!el || el.parentNode !== box || drag || (e.pointerType === 'mouse' && e.button !== 0)) return;
-    const before = items();
-    const x0 = e.clientX;
-    const y0 = e.clientY;
-    let x = x0;
-    let y = y0;
-    let active = false;
-    let raf = 0;
-    const hit = () => {
-      const r0 = box.getBoundingClientRect();
-      // у списку важить лише висота: палець може зʼїхати з ручки вбік
-      const t = document.elementFromPoint(horizontal ? x : r0.left + r0.width / 2, y)?.closest('[data-sort]');
-      if (!t || t === el || t.parentNode !== box) return;
-      const r = t.getBoundingClientRect();
-      const d = el.getBoundingClientRect();
-      const after = !!(el.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING);
-      // сусід поступається місцем, коли вказівник перейшов його середину — інакше елементи різного розміру смикались би
-      if (!horizontal && (after ? y < r.top + r.height / 2 : y > r.top + r.height / 2)) return;
-      const sameLine = r.top < d.bottom && r.bottom > d.top;
-      if (horizontal && sameLine && (after ? x < r.left + r.width / 2 : x > r.left + r.width / 2)) return;
-      moveTo(el, t);
-      ends();
-    };
-    // біля верхнього й нижнього краю екрана сторінка сама прокручується
-    const scroll = () => {
-      const zone = 110;
-      const bottom = window.innerHeight - zone;
-      const dy = y < zone ? -Math.min(18, (zone - y) / 5) : y > bottom ? Math.min(18, (y - bottom) / 5) : 0;
-      if (active && dy) { window.scrollBy(0, dy); hit(); }
-      raf = requestAnimationFrame(scroll);
-    };
-    const move = (ev) => {
-      if (ev.pointerId !== e.pointerId) return;
-      x = ev.clientX;
-      y = ev.clientY;
-      if (!active) {
-        if (Math.hypot(x - x0, y - y0) < 5) return;
-        active = true;
-        el.classList.add('dragging');
-        if (!horizontal) raf = requestAnimationFrame(scroll);
-      }
-      ev.preventDefault();
-      hit();
-    };
-    const finish = (ev) => {
-      if (ev.pointerId !== e.pointerId) return;
-      grip.removeEventListener('pointermove', move);
-      grip.removeEventListener('pointerup', finish);
-      grip.removeEventListener('pointercancel', finish);
-      cancelAnimationFrame(raf);
-      el.classList.remove('dragging');
-      const { after } = drag;
-      drag = null;
-      if (active) {
-        // після перетягування браузер ще надішле click — він не має вибрати категорію
-        const eat = (c) => { c.stopPropagation(); c.preventDefault(); };
-        box.addEventListener('click', eat, { capture: true, once: true });
-        setTimeout(() => box.removeEventListener('click', eat, { capture: true }), 80);
-      }
-      const changed = items().some((n, k) => n !== before[k]);
-      if (ev.type === 'pointercancel') cancel();
-      else if (changed) drop();
-      after?.();
-    };
-    drag = { after: null };
-    try { grip.setPointerCapture(e.pointerId); } catch { /* вказівник уже відпущено */ }
-    grip.addEventListener('pointermove', move);
-    grip.addEventListener('pointerup', finish);
-    grip.addEventListener('pointercancel', finish);
-    if (e.pointerType === 'mouse') e.preventDefault(); // без виділення тексту під час перетягування
-  });
 }
 
 // скан: позиція → її картка; серійний номер виробу → замовлення з підсвіченим виробом

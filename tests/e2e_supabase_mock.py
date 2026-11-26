@@ -12,6 +12,11 @@ category_order і функцій порядку) працює як раніше,
 Головний адміністратор: на базі зі СТАРОЮ схемою (функції owner_id ще немає) адміністратор
 керує людьми, як раніше; на новій — керування лише в головного, інший адміністратор бачить
 список для читання.
+
+Порядок меню: на базі без nav_order / set_nav_order меню стоїть у порядку за замовчуванням,
+а спроба його змінити дає «Оновіть базу (schema.sql)»; на новій — зберігається одним викликом
+rpc/set_nav_order з p_ids; без мережі в чергу не ставиться; кнопки порядку (меню і «Залишків»)
+бачить лише головний адміністратор.
 """
 import base64
 import functools
@@ -53,7 +58,8 @@ def main() -> int:
     calls = []
     items = []
     # owner: "absent" — у базі ще немає функції owner_id (стара схема); інакше — id головного
-    db = {"new_schema": False, "category_order": [], "owner": "absent"}
+    # nav: чи є в базі app_settings.nav_order і set_nav_order (найновіша частина схеми)
+    db = {"new_schema": False, "category_order": [], "owner": "absent", "nav": False, "nav_order": []}
 
     def handle(route):
         req = route.request
@@ -71,6 +77,11 @@ def main() -> int:
             return route.fulfill(json=rows)
         if path.startswith("/rest/v1/app_settings"):
             row = {"org_name": "ТОВ Мок", "app_url": "", "backup_at": None}
+            if "nav_order" in path:
+                if not db["nav"]:
+                    return route.fulfill(status=400, json={"code": "42703", "details": None, "hint": None,
+                                                           "message": "column app_settings.nav_order does not exist"})
+                row["nav_order"] = db["nav_order"]
             if "category_order" in path:
                 if not db["new_schema"]:
                     return route.fulfill(status=400, json={"code": "42703", "details": None, "hint": None,
@@ -91,6 +102,14 @@ def main() -> int:
                     next(r for r in items if r["id"] == item_id)["sort_order"] = n + 1
             else:
                 db["category_order"] = body["p_names"]
+            return route.fulfill(status=204, body="")
+        if path.startswith("/rest/v1/rpc/set_nav_order"):
+            if not db["nav"]:
+                return route.fulfill(status=404, json={
+                    "code": "PGRST202", "hint": None,
+                    "details": "Searched for the function public.set_nav_order with parameter p_ids or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.",
+                    "message": "Could not find the function public.set_nav_order(p_ids) in the schema cache"})
+            db["nav_order"] = json.loads(req.post_data)["p_ids"]
             return route.fulfill(status=204, body="")
         if path.startswith(("/rest/v1/kits", "/rest/v1/operations", "/rest/v1/orders")):
             return route.fulfill(json=[])
@@ -152,6 +171,11 @@ def main() -> int:
         expect(page.locator(".toast.err")).to_have_text("Невірний email або пароль")
         page.fill("[name=password]", "secret1")
         page.click(".login button")
+        # стартова сторінка — перший розділ меню; база зі старою схемою (без nav_order) — порядок за замовчуванням
+        expect(page.locator("#top h1")).to_have_text("Комплекти")
+        tabs = lambda: page.eval_on_selector_all("#nav a[data-tab]", "els => els.map((e) => e.dataset.tab)")
+        assert tabs() == ["kits", "stock", "orders", "journal", "more"], tabs()
+        page.goto(url + "#/stock")
         expect(page.locator(".empty-state")).to_contain_text("Склад порожній")
         assert page.locator(".banner.demo").count() == 0
 
@@ -304,6 +328,97 @@ def main() -> int:
         page.goto(url + "#/more")
         expect(page.locator("a[href='#/notifications']")).to_have_count(1)  # решта адмінського лишилась
         assert not [c for c in calls if any(f"/rpc/admin_{x}" in c[1] for x in ("create_user", "update_user", "set_password", "delete_user"))]
+
+        # ---------- порядок меню ----------
+        ALL = ["kits", "stock", "orders", "journal", "inventory", "reorder", "departments", "labels", "import",
+               "users", "notifications", "backups"]
+        nav_rows = lambda: page.eval_on_selector_all("#navlist > [data-sort]", "els => els.map((e) => e.dataset.id)")
+
+        def more_page():
+            calls.clear()
+            page.goto(url + "#/more")
+            page.reload()
+            page.locator(".login, main .menu").first.wait_for()
+            if page.locator(".login").count():
+                page.fill("[name=email]", "ivan@example.com")
+                page.fill("[name=password]", "secret1")
+                page.click(".login button")
+            expect(page.locator("#top h1")).to_have_text("Ще")
+
+        # не головний адміністратор (головна — olena): кнопок порядку немає ні в «Ще», ні в «Залишках»
+        more_page()
+        expect(page.locator("[data-x=navorder]")).to_have_count(0)
+        page.goto(url + "#/stock")
+        expect(page.locator("#list a.row")).to_have_count(2)
+        expect(page.locator("[data-new]")).to_have_count(1)
+        expect(page.locator("[data-order]")).to_have_count(0)
+
+        # база, як вона є сьогодні: головний уже є, а nav_order / set_nav_order ще немає
+        db["owner"] = UID
+        more_page()
+        st = [c[1] for c in calls if c[1].startswith("/rest/v1/app_settings")]
+        assert "nav_order" in st[0] and "nav_order" not in st[1] and "category_order" in st[1], st  # без колонки — читаємо по-старому
+        assert tabs() == ALL[:4] + ["more"], tabs()
+        page.locator("[data-x=navorder]").click()
+        expect(page.locator("#top h1")).to_have_text("Порядок меню")
+        assert nav_rows() == ALL, nav_rows()
+        page.locator("#navlist > [data-sort]").first.locator("[data-mv='1']").click()
+        expect(page.locator(".toast.err").last).to_contain_text("Оновіть базу (schema.sql)")
+        expect(page.locator("#navlist > [data-sort]").first).to_have_attribute("data-id", "kits")  # повернулось як було
+        assert nav_rows() == ALL and tabs() == ALL[:4] + ["more"], (nav_rows(), tabs())
+        assert order_rpc("set_nav_order") == [{"p_ids": ["stock", "kits"] + ALL[2:]}], order_rpc("set_nav_order")
+        expect(page.locator("#top h1")).to_have_text("Порядок меню")                              # екран цілий
+        page.locator("[data-done]").click()
+        expect(page.locator("#top h1")).to_have_text("Ще")
+
+        # зовсім стара база (ні головного, ні порядку): як і з людьми — будь-який адміністратор бачить кнопку, збереження просить оновити базу
+        db.update(owner="absent", new_schema=False)
+        more_page()
+        st = [c[1] for c in calls if c[1].startswith("/rest/v1/app_settings")]
+        assert len(st) >= 3 and "nav_order" in st[0] and "category_order" in st[1] and "category_order" not in st[2], st
+        assert tabs() == ALL[:4] + ["more"], tabs()
+        expect(page.locator("[data-x=navorder]")).to_have_count(1)
+        page.locator("[data-x=navorder]").click()
+        page.locator("#navlist > [data-sort]").last.locator("[data-mv='-1']").click()
+        expect(page.locator(".toast.err").last).to_contain_text("Оновіть базу (schema.sql)")
+        expect(page.locator("#navlist > [data-sort]").last).to_have_attribute("data-id", "backups")
+
+        # після свіжого schema.sql: збережений порядок читається, головний міняє його одним викликом
+        db.update(owner=UID, new_schema=True, nav=True, nav_order=["orders", "stock", "nema-takoho"])
+        more_page()
+        order = ["orders", "stock"] + [k for k in ALL if k not in ("orders", "stock")]
+        assert tabs() == order[:4] + ["more"], tabs()
+        page.locator("[data-x=navorder]").click()
+        assert nav_rows() == order, nav_rows()
+        page.locator("#navlist > [data-sort]").first.locator("[data-mv='1']").click()
+        order[0], order[1] = order[1], order[0]
+        expect(page.locator("#navlist > [data-sort]").first).to_have_attribute("data-id", "stock")
+        for _ in range(50):
+            if order_rpc("set_nav_order"):
+                break
+            page.wait_for_timeout(100)
+        assert order_rpc("set_nav_order") == [{"p_ids": order}], order_rpc("set_nav_order")
+        assert db["nav_order"] == order, db["nav_order"]
+        assert tabs() == order[:4] + ["more"], tabs()
+        assert page.locator(".toast.err").count() == 0
+        sig4 = re.search(r"function public\.set_nav_order\((.*?)\)\s+returns", sql, re.S).group(1)
+        assert set(re.findall(r"\b(p_\w+)\s", sig4)) == {"p_ids"}, sig4
+        used = set(re.findall(r"\b(p_\w+):", re.search(r"rpc\('set_nav_order', \{(.*?)\}\)", js, re.S).group(1)))
+        assert used == {"p_ids"}, used
+        # без мережі порядок меню в чергу не ставиться
+        ctx.set_offline(True)
+        page.locator("#navlist > [data-sort]").first.locator("[data-mv='1']").click()
+        expect(page.locator(".toast.err").last).to_have_text("Немає мережі — порядок не збережено")
+        expect(page.locator("#navlist > [data-sort]").first).to_have_attribute("data-id", "stock")
+        assert len(order_rpc("set_nav_order")) == 1 and tabs() == order[:4] + ["more"]
+        ctx.set_offline(False)
+        more_page()
+        assert tabs() == order[:4] + ["more"], tabs()                # збережене пережило перезавантаження
+        assert not order_rpc("set_nav_order")
+        # головний на новій схемі бачить і «Порядок» у залишках
+        page.goto(url + "#/stock")
+        expect(page.locator("#list a.row")).to_have_count(2)
+        expect(page.locator("[data-order]")).to_have_count(1)
         # функції, на які спирається клієнт, є в schema.sql
         assert re.search(r"function public\.owner_id\(\)\s+returns uuid", sql), "owner_id у schema.sql"
         browser.close()

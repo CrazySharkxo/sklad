@@ -1107,29 +1107,101 @@ begin
   end;
   assert (public.admin_dump() -> 'settings' -> 'category_order') = '["Кабелі", "Мотори", "Електроніка"]'::jsonb, 'dump: порядок категорій';
   assert (public.admin_dump() -> 'items' -> 0) ? 'sort_order', 'dump: порядок позицій';
+
+  -- меню: ключі розділів зберігаються як є, без порожніх і повторів; які з них існують — справа застосунку
+  assert (select nav_order from public.app_settings) = '{}', 'меню: спершу порожньо';
+  perform public.set_nav_order(array['stock', ' kits ', '', 'stock', 'nema-takoho', 'orders']);
+  assert (select nav_order from public.app_settings) = array['stock', 'kits', 'nema-takoho', 'orders'], (select nav_order::text from public.app_settings);
+  perform public.set_nav_order(null);
+  assert (select nav_order from public.app_settings) = '{}', 'меню: null — порядок за замовчуванням';
+  perform public.set_nav_order(array['orders', 'stock', 'kits']);
+  begin
+    update public.app_settings set nav_order = '{}';
+    raise exception 'порядок меню змінено напряму';
+  exception when insufficient_privilege then null;
+  end;
+  assert (public.admin_dump() -> 'settings' -> 'nav_order') = '["orders", "stock", "kits"]'::jsonb, 'dump: порядок меню';
 end $$;
 
--- без права «змінювати позиції складу» порядок видно, але не змінити
+-- порядок (меню, позицій, категорій) видно всім активним, а міняє лише головний адміністратор:
+-- ні інший адміністратор, ні людина з правом «змінювати позиції складу» — ні
 reset role;
-update public.profiles set perms = array['stock.view'] where id = (select id from auth.users where email = 'view@example.com');
-select set_config('request.jwt.claim.sub', (select id::text from auth.users where email = 'view@example.com'), false);
-set role authenticated;
+create temp table ord_fixed as
+  select (select jsonb_agg(jsonb_build_array(id, sort_order) order by id) from public.items) as items,
+         (select category_order from public.app_settings) as cats, (select nav_order from public.app_settings) as nav;
+grant select on ord_fixed to authenticated;
+update public.profiles set perms = array['stock.view', 'stock.edit'] where id = (select id from auth.users where email = 'view@example.com');
 do $$ begin
+  assert (select p.active and not p.is_owner and 'admin' = any(coalesce(p.perms, r.perms))
+            from public.profiles p left join public.roles r on r.id = p.role_id
+           where p.id = '22222222-2222-2222-2222-222222222222'), 'olena має бути активним адміністратором, але не головною';
+end $$;
+-- :who — хто пробує; одна й та сама перевірка для обох
+create temp table ord_who (label text, uid uuid);
+grant select on ord_who to authenticated;
+insert into ord_who values ('інший адміністратор', '22222222-2222-2222-2222-222222222222'),
+                           ('користувач зі stock.edit', (select id from auth.users where email = 'view@example.com'));
+create function pg_temp.order_denied() returns void language plpgsql as $$
+declare v_who text := (select label from ord_who where uid = auth.uid());
+begin
+  assert v_who is not null and public.has_perm('stock.edit') and not public.is_owner(), 'хто це: ' || coalesce(v_who, '?');
+  assert (v_who like 'інший%') = public.has_perm('admin'), v_who;
   assert (select category_order from public.app_settings) = array['Кабелі', 'Мотори', 'Електроніка'], 'порядок категорій видно всім';
+  assert (select nav_order from public.app_settings) = array['orders', 'stock', 'kits'], 'порядок меню видно всім';
   assert (select count(sort_order) from public.stock) > 3, 'порядок позицій видно всім';
   begin
-    perform public.set_item_order(array['aaaaaaaa-0000-0000-0000-000000000031'::uuid]);
-    raise exception 'порядок позицій змінено без stock.edit';
-  exception when raise_exception then assert sqlerrm = 'Немає права змінювати позиції складу', sqlerrm;
+    perform public.set_nav_order(array['kits', 'stock']);
+    raise exception 'порядок меню змінив %', v_who;
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.set_item_order(array['aaaaaaaa-0000-0000-0000-000000000033'::uuid, 'aaaaaaaa-0000-0000-0000-000000000031'::uuid]);
+    raise exception 'порядок позицій змінив %', v_who;
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
   end;
   begin
     perform public.set_category_order(array['Мотори']);
-    raise exception 'порядок категорій змінено без stock.edit';
-  exception when raise_exception then assert sqlerrm = 'Немає права змінювати позиції складу', sqlerrm;
+    raise exception 'порядок категорій змінив %', v_who;
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
   end;
 end $$;
+grant execute on function pg_temp.order_denied() to authenticated;
+select set_config('request.jwt.claim.sub', '22222222-2222-2222-2222-222222222222', false);
+set role authenticated;
+select pg_temp.order_denied();
 reset role;
-update public.profiles set perms = array['stock.view', 'stock.edit'] where id = (select id from auth.users where email = 'view@example.com');
+select set_config('request.jwt.claim.sub', (select id::text from auth.users where email = 'view@example.com'), false);
+set role authenticated;
+select pg_temp.order_denied();
+reset role;
+do $$ begin
+  assert (select o.items = (select jsonb_agg(jsonb_build_array(id, sort_order) order by id) from public.items)
+             and o.cats = s.category_order and o.nav = s.nav_order
+            from ord_fixed o, public.app_settings s), 'відмова щось змінила';
+end $$;
+-- заблокований порядку меню не бачить (як і решти налаштувань)
+update public.profiles set active = false where id = (select id from auth.users where email = 'view@example.com');
+set role authenticated;
+do $$ begin
+  assert (select count(*) from public.app_settings) = 0, 'заблокований читає налаштування';
+end $$;
+reset role;
+update public.profiles set active = true where id = (select id from auth.users where email = 'view@example.com');
+-- головний може все три
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+do $$ begin
+  assert public.is_owner();
+  perform public.set_nav_order(array['kits', 'stock', 'orders']);
+  perform public.set_category_order(array['Мотори', 'Кабелі']);
+  perform public.set_item_order(array['aaaaaaaa-0000-0000-0000-000000000033'::uuid, 'aaaaaaaa-0000-0000-0000-000000000031'::uuid]);
+  assert (select nav_order from public.app_settings) = array['kits', 'stock', 'orders'];
+  assert (select category_order from public.app_settings) = array['Мотори', 'Кабелі'];
+  assert (select array_agg(id order by sort_order) from public.items
+           where id in ('aaaaaaaa-0000-0000-0000-000000000031', 'aaaaaaaa-0000-0000-0000-000000000033'))
+       = array['aaaaaaaa-0000-0000-0000-000000000033'::uuid, 'aaaaaaaa-0000-0000-0000-000000000031'::uuid];
+end $$;
+reset role;
 set role anon;
 do $$ begin
   begin
@@ -1140,6 +1212,11 @@ do $$ begin
   begin
     perform public.set_category_order('{}');
     raise exception 'anon викликав set_category_order';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    perform public.set_nav_order('{}');
+    raise exception 'anon викликав set_nav_order';
   exception when insufficient_privilege then null;
   end;
 end $$;

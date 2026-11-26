@@ -27,9 +27,11 @@ update public.profiles set created_at = '2022-01-01' where id = '11111111-1111-1
 update auth.users set created_at = '2022-01-01' where id = '11111111-1111-1111-1111-111111111111';
 create temp table mig_roles as select id, name, perms from public.roles;
 
--- стара схема: без sort_order, category_order і функцій порядку
+-- стара схема: без sort_order, category_order, nav_order і функцій порядку
 drop function public.set_item_order(uuid[]);
 drop function public.set_category_order(text[]);
+drop function public.set_nav_order(text[]);
+alter table public.app_settings drop column nav_order;
 drop trigger items_sort_new on public.items;
 drop function public.item_sort_new();
 drop trigger items_touch on public.items;
@@ -74,6 +76,7 @@ begin
        = (select array_agg(id order by name, created_at, id) from public.items), 'початковий порядок — за назвою';
   assert (select min(sort_order) = 1 and max(sort_order) = count(*) and count(distinct sort_order) = count(*) from public.items);
   assert (select category_order from public.app_settings) = '{}';
+  assert (select nav_order from public.app_settings) = '{}', 'після міграції порядок меню — за замовчуванням';
   -- головний — найстарший АКТИВНИЙ адміністратор, рівно один
   assert (select array_agg(id) from public.profiles where is_owner) = array['22222222-2222-2222-2222-222222222222'::uuid],
     'головний після міграції: ' || coalesce((select string_agg(id::text, ',') from public.profiles where is_owner), 'нема');
@@ -114,13 +117,36 @@ update public.profiles set created_at = '2019-01-01' where id = '11111111-1111-1
 select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
 set role authenticated;
 insert into public.items (id, name) values ('aaaaaaaa-0000-0000-0000-000000000041', 'Ааа після міграції');
+do $$ begin
+  assert (select sort_order = (select max(sort_order) from public.items) from public.items where id = 'aaaaaaaa-0000-0000-0000-000000000041');
+  -- старий клієнт ще показує «Порядок» кожному зі stock.edit: ivan (адміністратор, не головний) отримує відмову
+  begin
+    perform public.set_item_order(array['aaaaaaaa-0000-0000-0000-000000000041'::uuid]);
+    raise exception 'не головний змінив порядок позицій після міграції';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.set_category_order(array['Стара']);
+    raise exception 'не головний змінив порядок категорій після міграції';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  begin
+    perform public.set_nav_order(array['stock']);
+    raise exception 'не головний змінив порядок меню після міграції';
+  exception when raise_exception then assert sqlerrm = 'Права надає лише головний адміністратор', sqlerrm;
+  end;
+  assert (select nav_order from public.app_settings) = '{}', 'порядок меню читається';
+end $$;
+reset role;
+-- головна (olena) переставила: нова — першою; вибрала порядок категорій і меню
+select set_config('request.jwt.claim.sub', '22222222-2222-2222-2222-222222222222', false);
+set role authenticated;
 do $$
 declare v_first uuid := (select id from public.items order by sort_order limit 1);
 begin
-  assert (select sort_order = (select max(sort_order) from public.items) from public.items where id = 'aaaaaaaa-0000-0000-0000-000000000041');
-  -- користувач переставив: нова — першою; і вибрав порядок категорій
   perform public.set_item_order(array['aaaaaaaa-0000-0000-0000-000000000041', v_first]);
   perform public.set_category_order(array['Стара', 'Мотори']);
+  perform public.set_nav_order(array['orders', 'kits', 'stock']);
   assert (select id from public.items order by sort_order limit 1) = 'aaaaaaaa-0000-0000-0000-000000000041';
 end $$;
 reset role;
@@ -134,6 +160,7 @@ do $$ begin
            where i.sort_order <> o.sort_order or i.updated_at <> o.updated_at) = 0, 'повторний запуск збив порядок';
   assert (select count(*) from public.items) = (select count(*) from mig_order);
   assert (select category_order from public.app_settings) = array['Стара', 'Мотори'], 'повторний запуск збив порядок категорій';
+  assert (select nav_order from public.app_settings) = array['orders', 'kits', 'stock'], 'повторний запуск збив порядок меню';
   assert (select array_agg(id) from public.profiles where is_owner) = array['22222222-2222-2222-2222-222222222222'::uuid],
     'повторний запуск змінив головного';
   assert not exists (select 1 from public.roles where name = 'Звичайний користувач'), 'видалена роль воскресла';
