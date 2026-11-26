@@ -29,6 +29,7 @@ def main() -> int:
             ROOT / "supabase" / "schema.sql",
             ROOT / "supabase" / "schema.sql",  # повторний запуск має бути безпечним
             ROOT / "tests" / "schema_test.sql",
+            ROOT / "tests" / "schema_migrate_test.sql",  # зі старої схеми (без порядку позицій) на нову
         ]
         for f in steps:
             r = subprocess.run([psql, "-q", "-v", "ON_ERROR_STOP=1", "-f", str(f), "-d", uri],

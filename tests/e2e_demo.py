@@ -538,6 +538,141 @@ def main() -> int:
         f.locator("a", has_text="Скасувати").click()  # нічого не зберігаємо
         expect(page.locator("#top h1")).to_have_text("Залишки")
 
+        # --- порядок позицій і категорій: режим «Порядок», стрілки, перетягування, збереження ---
+        add_item("Мотор 2306 2400KV", cat="Мотори")  # друга позиція в категорії — для порядку всередині неї
+        page.goto(url + "#/stock")
+        titles = lambda: page.locator("#list .row-title").all_inner_texts()
+        cat_chips = lambda: page.eval_on_selector_all("#chips [data-cat]", "els => els.map((e) => e.dataset.cat).filter(Boolean)")
+        e = titles()
+        assert len(e) == 6 and e[-1] == "Мотор 2306 2400KV", e  # нова позиція — в кінці
+        c = cat_chips()
+        assert c == sorted(c) and len(c) == 4, c  # без збереженого порядку — за абеткою
+        page.locator("[data-order]").click()
+        expect(page.locator("#top h1")).to_have_text("Залишки — порядок")
+        expect(page.locator("#q")).to_have_count(0)
+        expect(page.locator(".sort-row")).to_have_count(6)
+        assert titles() == e and cat_chips() == c
+        # дотик до рядка в режимі картку не відкриває
+        page.locator(".sort-row .row-title").first.click()
+        page.locator(".sort-row .row-meta").nth(1).click()
+        expect(page.locator("#top h1")).to_have_text("Залишки — порядок")
+        assert page.url.endswith("#/stock"), page.url
+        # ручка не дає сторінці прокручуватись під пальцем
+        assert page.locator(".sort-row [data-grip]").first.evaluate("(g) => getComputedStyle(g).touchAction") == "none"
+        assert page.locator(".sort-chip [data-grip]").first.evaluate("(g) => getComputedStyle(g).touchAction") == "none"
+
+        # стрілка ▼ на першому рядку
+        expect(page.locator(".sort-row").first.locator("[data-mv='-1']")).to_be_disabled()
+        page.locator(".sort-row").first.locator("[data-mv='1']").click()
+        e = [e[1], e[0]] + e[2:]
+        assert titles() == e, titles()
+        expect(page.locator(".sort-row").first.locator("[data-mv='-1']")).to_be_disabled()
+        expect(page.locator(".sort-row").nth(1).locator("[data-mv='-1']")).to_be_enabled()
+
+        # перетягування мишею: останній рядок — на самий верх
+        def center(loc):
+            b = loc.bounding_box()
+            return b["x"] + b["width"] / 2, b["y"] + b["height"] / 2
+
+        expect(page.locator(".toast")).to_have_count(0, timeout=15000)  # сповіщення не має закривати знімок
+        gx, gy = center(page.locator(".sort-row").last.locator("[data-grip]"))
+        top_row = page.locator(".sort-row").first.bounding_box()
+        page.mouse.move(gx, gy)
+        page.mouse.down()
+        page.mouse.move(gx, top_row["y"] + 6, steps=15)
+        expect(page.locator(".sort-row.dragging")).to_have_count(1)
+        expect(page.locator(".sort-row.dragging .row-title")).to_have_text(e[-1])
+        page.screenshot(path=str(SHOTS / "30_reorder.png"))
+        page.mouse.up()
+        expect(page.locator(".dragging")).to_have_count(0)
+        e = [e[-1]] + e[:-1]
+        assert titles() == e, titles()
+        expect(page.locator("#top h1")).to_have_text("Залишки — порядок")
+
+        # порядок усередині категорії: дотик до назви категорії фільтрує, сусідні категорії лишаються де були
+        page.locator(".sort-chip[data-cat='Мотори'] [data-grip]").click()
+        expect(page.locator(".sort-chip.on")).to_have_attribute("data-cat", "Мотори")
+        motors = [t for t in e if t.startswith("Мотор")]
+        assert titles() == motors and len(motors) == 2, titles()
+        page.locator(".sort-row").last.locator("[data-mv='-1']").click()
+        assert titles() == motors[::-1], titles()
+        swap = dict(zip(motors, motors[::-1]))
+        e = [swap.get(t, t) for t in e]
+        page.locator("#chips .chip[data-cat='']").click()
+        assert titles() == e, titles()
+
+        # автопрокрутка: на низькому екрані перший рядок тягнемо до нижнього краю — сторінка їде сама
+        page.set_viewport_size({"width": 400, "height": 420})
+        page.evaluate("window.scrollTo(0, 0)")
+        gx, gy = center(page.locator(".sort-row").first.locator("[data-grip]"))
+        page.mouse.move(gx, gy)
+        page.mouse.down()
+        page.mouse.move(gx, 408, steps=10)
+        page.wait_for_function("window.scrollY > 40")
+        page.wait_for_function("window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2")
+        last = page.locator(".sort-row").last.bounding_box()
+        page.mouse.move(gx, last["y"] + last["height"] - 6, steps=5)
+        page.mouse.up()
+        e = e[1:] + [e[0]]
+        assert titles() == e, titles()
+        page.set_viewport_size({"width": 400, "height": 860})
+        page.evaluate("window.scrollTo(0, 0)")
+
+        # категорії: стрілка ▶ і перетягування останньої кнопки на перше місце
+        expect(page.locator(".sort-chip").first.locator("[data-mv='-1']")).to_be_disabled()
+        page.locator(".sort-chip").first.locator("[data-mv='1']").click()
+        c = [c[1], c[0]] + c[2:]
+        assert cat_chips() == c, cat_chips()
+        gx, gy = center(page.locator(".sort-chip").last.locator("[data-grip]"))
+        first_chip = page.locator(".sort-chip").first.bounding_box()
+        tx, ty = first_chip["x"] + first_chip["width"] * 0.25, first_chip["y"] + first_chip["height"] / 2
+        page.mouse.move(gx, gy)
+        page.mouse.down()
+        page.mouse.move(tx, ty, steps=15)
+        page.mouse.move(tx + 1, ty)
+        page.mouse.move(tx, ty)
+        page.mouse.up()
+        c = [c[-1]] + c[:-1]
+        assert cat_chips() == c, cat_chips()
+        expect(page.locator(".sort-chip.on")).to_have_count(0)  # відпускання після перетягування категорію не вибирає
+        assert titles() == e, titles()
+        expect(page.locator(".toast")).to_have_count(0)
+
+        # «Готово»: звичайний список у новому порядку, дотик знову відкриває картку
+        page.locator("[data-done]").click()
+        expect(page.locator("#top h1")).to_have_text("Залишки")
+        expect(page.locator("#list a.row")).to_have_count(6)
+        assert titles() == e and cat_chips() == c, (titles(), cat_chips())
+        page.locator("#list a.row").first.click()
+        expect(page.locator("#top h1")).to_have_text(e[0])
+        # порядок зберігся після перезавантаження; той самий — в інвентаризації й у списку категорій
+        page.goto(url + "#/stock")
+        page.reload()
+        expect(page.locator("#list a.row")).to_have_count(6)
+        assert titles() == e and cat_chips() == c, (titles(), cat_chips())
+        page.goto(url + "#/inventory")
+        assert page.locator(".inv-row .line-name b").all_inner_texts() == e
+        assert page.locator("#cat option").all_inner_texts()[1:] == c
+        # пішли з екрана в режимі «Порядок» — повернулись у звичайний список
+        page.goto(url + "#/stock")
+        page.locator("[data-order]").click()
+        expect(page.locator(".sort-row")).to_have_count(6)
+        page.goto(url + "#/journal")
+        page.goto(url + "#/stock")
+        expect(page.locator("#list a.row")).to_have_count(6)
+        # без права «Зміна» кнопки «Порядок» немає — перевіряється нижче разом з іншими обмеженнями
+
+        # демо-дані, збережені до появи порядку: позиції стають за назвою, як було досі
+        page.evaluate("""() => {
+            const d = JSON.parse(localStorage.getItem('sklad-demo-v1'));
+            for (const i of d.items) delete i.sort_order;
+            delete d.settings.category_order;
+            localStorage.setItem('sklad-demo-v1', JSON.stringify(d));
+        }""")
+        page.reload()
+        expect(page.locator("#list a.row")).to_have_count(6)
+        assert titles() == sorted(e) and cat_chips() == sorted(c), (titles(), cat_chips())
+
         # --- користувачі та ролі (у демо — записи без входу) ---
         page.goto(url + "#/more")
         page.locator("a[href='#/users']").click()
@@ -595,6 +730,7 @@ def main() -> int:
         expect(page.locator(".row").first).to_be_visible()
         expect(page.locator("#nav [data-tab=inventory]")).to_have_count(0)
         expect(page.locator("[data-new]")).to_have_count(0)
+        expect(page.locator("[data-order]")).to_have_count(0)
         expect(page.locator(".bottom-actions")).to_have_count(0)
         page.locator(".row").first.click()
         expect(page.locator("[data-del]")).to_have_count(0)

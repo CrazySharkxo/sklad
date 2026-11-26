@@ -22,6 +22,24 @@ function cleanItem(item) {
   return r;
 }
 
+// Порядок позицій у «Залишках»: збережене місце (sort_order), далі назва.
+// База зі старою схемою місць не віддає — тоді список лишається як прийшов, за назвою.
+const bySort = (a, b) => (a.sort_order ?? Infinity) - (b.sort_order ?? Infinity) || a.name.localeCompare(b.name, 'uk');
+export const sortItems = (rows) => (rows.some((r) => r.sort_order != null) ? rows.sort(bySort) : rows);
+
+// Та сама перестановка, що в set_item_order (supabase/schema.sql): позиції з ids стають
+// у новому порядку на ті місця, які самі займали; решта (архів, кошик, приховані
+// фільтром) лишається де була; місця перенумеровуються 1..N. all — усі позиції бази.
+export function permuteItems(all, ids) {
+  if (new Set(ids).size !== ids.length) throw new Error('Позиція в порядку повторюється');
+  const cur = all.slice().sort(bySort);
+  const byId = new Map(cur.map((i) => [i.id, i]));
+  const want = ids.filter((id) => byId.has(id));
+  const listed = new Set(want);
+  let k = 0;
+  cur.map((i) => (listed.has(i.id) ? byId.get(want[k++]) : i)).forEach((i, n) => { i.sort_order = n + 1; });
+}
+
 const ORDER_FIELDS = ['title', 'customer', 'qty', 'due_date', 'description'];
 
 function cleanOrder(o) {
@@ -64,6 +82,10 @@ function friendly(error) {
   const msg = error?.message || String(error);
   if (error?.code === '23505' && /departments/.test(msg)) return new Error('Такий відділ уже є');
   if (error?.code === '23505' && /roles/.test(msg)) return new Error('Така роль уже є');
+  // функції ще немає в базі: новий застосунок відкрили раніше, ніж запустили свіжий schema.sql
+  if (error?.code === 'PGRST202' || /Could not find the function/i.test(msg)) {
+    return new Error('Оновіть базу (schema.sql): запустіть свіжий supabase/schema.sql у Supabase → SQL Editor, без цього зміна не збережеться');
+  }
   if (error?.code === '42501' || /row-level security/i.test(msg)) return new Error('Немає права на цю дію — зверніться до адміністратора');
   if (error?.code === '23505' && /order_units/.test(msg)) return new Error('Такий серійний номер уже є в іншому виробі');
   if (error?.code === '23505') return new Error('Такий код уже є в іншої позиції');
@@ -174,8 +196,16 @@ class SupaApi {
   // ---------- налаштування, сповіщення ----------
   // несекретна частина — для всіх (шапка документів)
   async settings() {
-    const rows = await this.q(this.sb.from('app_settings').select('org_name, app_url, backup_at').eq('id', 1));
-    return rows?.[0] || { org_name: '', app_url: '', backup_at: null };
+    const read = (cols) => this.q(this.sb.from('app_settings').select(cols).eq('id', 1));
+    let rows;
+    try {
+      rows = await read('org_name, app_url, backup_at, category_order');
+    } catch (e) {
+      // база зі старою схемою ще без порядку категорій — читаємо, як раніше
+      if (/Немає зʼєднання/.test(e.message)) throw e;
+      rows = await read('org_name, app_url, backup_at');
+    }
+    return { org_name: '', app_url: '', backup_at: null, category_order: [], ...rows?.[0] };
   }
   async adminSettings() { return await this.q(this.sb.rpc('admin_settings')); }
   async saveSettings(patch) { await this.q(this.sb.rpc('admin_save_settings', { p: patch })); }
@@ -262,8 +292,11 @@ class SupaApi {
   async items() {
     const rows = await this.all(() => this.sb.from('stock').select('*').order('name'));
     for (const r of rows) { r.qty = Number(r.qty); r.min_qty = Number(r.min_qty); r.reserved = Number(r.reserved) || 0; }
-    return rows;
+    return sortItems(rows);
   }
+  // порядок у «Залишках», спільний для всіх: ids / names — увесь новий порядок одним викликом
+  async setItemOrder(ids) { await this.q(this.sb.rpc('set_item_order', { p_ids: ids })); }
+  async setCategoryOrder(names) { await this.q(this.sb.rpc('set_category_order', { p_names: names })); }
   async saveItem(item) {
     const row = cleanItem(item);
     if (item.id) {
@@ -417,6 +450,13 @@ class LocalApi {
       d.settings = { org_name: '', app_url: '', tg_chat: '', tg_orders: true, tg_low: true, tg_overdue: true, backup_at: null };
       try { this.save(d); } catch { /* */ }
     }
+    // демо-дані, збережені до появи порядку позицій: місця за назвою, як список сортувався досі
+    if (!d.settings.category_order || d.items.some((i) => i.sort_order == null)) {
+      d.settings.category_order = d.settings.category_order || [];
+      let n = d.items.reduce((m, i) => Math.max(m, i.sort_order || 0), 0);
+      for (const i of d.items.filter((x) => x.sort_order == null).sort((a, b) => a.name.localeCompare(b.name, 'uk'))) i.sort_order = ++n;
+      try { this.save(d); } catch { /* */ }
+    }
     return d;
   }
   // резерв: деталі активних замовлень мінус уже видане під них
@@ -556,7 +596,10 @@ class LocalApi {
   }
 
   // ---------- налаштування (у демо сповіщення не надсилаються) ----------
-  async settings() { const s = this.load().settings; return { org_name: s.org_name, app_url: s.app_url, backup_at: s.backup_at }; }
+  async settings() {
+    const s = this.load().settings;
+    return { org_name: s.org_name, app_url: s.app_url, backup_at: s.backup_at, category_order: s.category_order || [] };
+  }
   async adminSettings() {
     const s = this.load().settings;
     return { ...s, tg_token_set: !!s.tg_token, tg_token_hint: s.tg_token ? '…' + s.tg_token.slice(-4) : '', pg_net: false, pg_cron: false, overdue_sent_on: null };
@@ -728,7 +771,22 @@ class LocalApi {
 
   async items() {
     const d = this.load();
-    return d.items.map((i) => ({ ...i, qty: this.qtyOf(d, i.id), reserved: this.reservedOf(d, i.id) })).sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+    return sortItems(d.items.map((i) => ({ ...i, qty: this.qtyOf(d, i.id), reserved: this.reservedOf(d, i.id) })));
+  }
+  requireStockEdit(d) {
+    if (!this.permsOf(d, DEMO_USER).some((x) => x === 'admin' || x === 'stock.edit')) throw new Error('Немає права змінювати позиції складу');
+  }
+  async setItemOrder(ids) {
+    const d = this.load();
+    this.requireStockEdit(d);
+    permuteItems(d.items, ids);
+    this.save(d);
+  }
+  async setCategoryOrder(names) {
+    const d = this.load();
+    this.requireStockEdit(d);
+    d.settings.category_order = [...new Set(names.map((n) => String(n ?? '').trim()).filter(Boolean))];
+    this.save(d);
   }
   async saveItem(item) {
     const d = this.load();
@@ -740,8 +798,10 @@ class LocalApi {
     if (id) Object.assign(d.items.find((i) => i.id === id), row, { updated_at: new Date().toISOString() });
     else {
       id = crypto.randomUUID();
+      // нова позиція стає в кінець списку
       d.items.push({ category: '', unit: 'шт', location: '', min_qty: 0, note: '', photo_path: null, archived: false,
-        ...row, id, created_at: new Date().toISOString(), created_by: DEMO_USER });
+        ...row, id, sort_order: d.items.reduce((m, i) => Math.max(m, i.sort_order || 0), 0) + 1,
+        created_at: new Date().toISOString(), created_by: DEMO_USER });
     }
     this.save(d);
     return id;

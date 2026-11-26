@@ -204,6 +204,33 @@ create unique index items_code_uq
   on public.items (lower(code)) where code is not null and code <> '' and deleted_at is null;
 
 -- ---------------------------------------------------------------------
+--  Порядок позицій у «Залишках» — спільний для всіх. Міняє його лише
+--  set_item_order() (право «змінювати позиції складу»); нова позиція стає в кінець.
+--  Наявні позиції отримують місця за назвою — так список сортувався досі;
+--  повторний запуск чіпає лише ті, що ще без місця.
+-- ---------------------------------------------------------------------
+alter table public.items add column if not exists sort_order integer;
+update public.items i set sort_order = s.n
+  from (select id,
+               coalesce((select max(sort_order) from public.items), 0)
+                 + row_number() over (order by name, created_at, id) as n
+          from public.items where sort_order is null) s
+ where i.id = s.id;
+alter table public.items alter column sort_order set not null;
+
+create or replace function public.item_sort_new()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  if new.sort_order is null then
+    new.sort_order := coalesce((select max(sort_order) from public.items), 0) + 1;
+  end if;
+  return new;
+end $$;
+drop trigger if exists items_sort_new on public.items;
+create trigger items_sort_new before insert on public.items
+  for each row execute function public.item_sort_new();
+
+-- ---------------------------------------------------------------------
 --  Серійні номери готових виробів: у замовленні на N штук — N виробів,
 --  кожен зі своїм номером (друкується на QR-етикетці, скан відкриває
 --  замовлення), відмітками «зібрано» і «протестовано».
@@ -302,6 +329,9 @@ create table if not exists public.app_settings (
   updated_at       timestamptz not null default now()
 );
 insert into public.app_settings (id) values (1) on conflict (id) do nothing;
+-- порядок кнопок категорій у «Залишках» — спільний для всіх (set_category_order);
+-- категорії, яких тут немає, застосунок показує в кінці за абеткою
+alter table public.app_settings add column if not exists category_order text[] not null default '{}';
 
 -- у відділу може бути свій чат: туди йдуть замовлення, що приходять у цей відділ
 alter table public.departments add column if not exists tg_chat text not null default '';
@@ -817,13 +847,68 @@ begin
   return v_photo;
 end $$;
 
--- оновлення updated_at у позиціях
+-- ---------------------------------------------------------------------
+--  Порядок позицій і категорій у «Залишках» (один виклик на весь новий порядок)
+-- ---------------------------------------------------------------------
+-- p_ids — позиції в новому порядку. Вони переставляються між собою в межах тих
+-- місць, які займали; решта (архів, кошик, приховані фільтром, щойно додані
+-- кимось іншим) лишається де була. Заодно місця перенумеровуються 1..N.
+create or replace function public.set_item_order(p_ids uuid[])
+returns void
+language plpgsql
+set search_path = public
+as $$
+begin
+  perform public.require('stock.edit');
+  if (select count(*) <> count(distinct x) from unnest(p_ids) x) then
+    raise exception 'Позиція в порядку повторюється';
+  end if;
+  -- двоє впорядковують одночасно — по черзі, а не впереміш
+  lock table public.items in share row exclusive mode;
+  with cur as (
+         select id, row_number() over (order by sort_order, name, id) as rn from public.items),
+       want as (
+         select c.id, row_number() over (order by u.ord) as k
+           from unnest(p_ids) with ordinality u(id, ord)
+           join cur c on c.id = u.id),
+       slot as (
+         select c.rn, row_number() over (order by c.rn) as k
+           from cur c join want w on w.id = c.id),
+       fin as (
+         select c.id, coalesce(s.rn, c.rn)::integer as n
+           from cur c
+           left join want w on w.id = c.id
+           left join slot s on s.k = w.k)
+  update public.items i set sort_order = f.n
+    from fin f
+   where i.id = f.id and i.sort_order <> f.n;
+end $$;
+
+-- p_names — усі кнопки категорій у новому порядку (порожні й повтори відкидаються)
+create or replace function public.set_category_order(p_names text[])
+returns void
+language plpgsql
+set search_path = public
+as $$
+begin
+  perform public.require('stock.edit');
+  update public.app_settings
+     set category_order = coalesce((
+           select array_agg(q.n order by q.ord)
+             from (select distinct on (trim(u.x)) trim(u.x) as n, u.ord
+                     from unnest(p_names) with ordinality u(x, ord)
+                    where trim(u.x) <> ''
+                    order by trim(u.x), u.ord) q), '{}')
+   where id = 1;
+end $$;
+
+-- оновлення updated_at у позиціях (перестановка в списку — не зміна позиції)
 create or replace function public.touch_updated_at()
 returns trigger language plpgsql as $$
 begin new.updated_at := now(); return new; end $$;
 drop trigger if exists items_touch on public.items;
 create trigger items_touch before update on public.items
-  for each row execute function public.touch_updated_at();
+  for each row when (old.sort_order = new.sort_order) execute function public.touch_updated_at();
 drop trigger if exists orders_touch on public.orders;
 create trigger orders_touch before update on public.orders
   for each row execute function public.touch_updated_at();
@@ -1418,7 +1503,7 @@ grant update (position, serial, assembled, tested, note) on public.order_units t
 -- резерв і налаштування: токен бота з таблиці не читається — лише маска з admin_settings()
 revoke all on public.reserved_qty, public.app_settings from anon, authenticated;
 grant select on public.reserved_qty to authenticated;
-grant select (id, org_name, app_url, backup_at, updated_at) on public.app_settings to authenticated;
+grant select (id, org_name, app_url, backup_at, updated_at, category_order) on public.app_settings to authenticated;
 
 -- функції працюють від імені власника схеми (обходять revoke вище),
 -- але самі перевіряють auth.uid()
@@ -1434,6 +1519,8 @@ alter function public.purge_item(uuid) security definer;
 alter function public.restore_order(uuid) security definer;
 alter function public.purge_order(uuid) security definer;
 alter function public.purge_trash() security definer;
+alter function public.set_item_order(uuid[]) security definer;
+alter function public.set_category_order(text[]) security definer;
 revoke execute on function public.post_operation(text, jsonb, text, text, uuid, numeric, uuid, uuid) from public, anon;
 revoke execute on function public.cancel_operation(uuid) from public, anon;
 revoke execute on function public.move_order(uuid, text, uuid, text) from public, anon;
@@ -1446,6 +1533,8 @@ revoke execute on function public.purge_item(uuid) from public, anon;
 revoke execute on function public.restore_order(uuid) from public, anon;
 revoke execute on function public.purge_order(uuid) from public, anon;
 revoke execute on function public.purge_trash() from public, anon;
+revoke execute on function public.set_item_order(uuid[]) from public, anon;
+revoke execute on function public.set_category_order(text[]) from public, anon;
 grant  execute on function public.post_operation(text, jsonb, text, text, uuid, numeric, uuid, uuid) to authenticated;
 grant  execute on function public.cancel_operation(uuid) to authenticated;
 grant  execute on function public.move_order(uuid, text, uuid, text) to authenticated;
@@ -1458,6 +1547,8 @@ grant  execute on function public.purge_item(uuid) to authenticated;
 grant  execute on function public.restore_order(uuid) to authenticated;
 grant  execute on function public.purge_order(uuid) to authenticated;
 grant  execute on function public.purge_trash() to authenticated;
+grant  execute on function public.set_item_order(uuid[]) to authenticated;
+grant  execute on function public.set_category_order(text[]) to authenticated;
 revoke execute on function public.my_perms() from public, anon;
 revoke execute on function public.has_perm(text) from public, anon;
 revoke execute on function public.is_active() from public, anon;

@@ -1,5 +1,5 @@
 // Спільний стан і компоненти, якими користуються всі екрани
-import { api, isDemo, TRASH_DAYS } from './api.js';
+import { api, isDemo, TRASH_DAYS, sortItems, permuteItems } from './api.js';
 import { esc, fmtQty, fmtDate, norm, round, toast, confirmDialog } from './util.js';
 import { scanCode } from './scanner.js';
 import { applyPendingTo } from './outbox.js';
@@ -16,7 +16,7 @@ export const state = {
   trashOrders: [],
   perms: new Set(),  // права поточного користувача
   roles: [],
-  settings: { org_name: '', app_url: '', backup_at: null },  // несекретні налаштування (шапка документів)
+  settings: { org_name: '', app_url: '', backup_at: null, category_order: [] },  // несекретні налаштування (шапка документів, порядок категорій)
   me: null,
   loaded: false,
   offline: false,    // дані взято з кешу на пристрої, сервер недоступний
@@ -187,7 +187,29 @@ export function resolveCode(code) {
   const r = findUnit(c);
   return r ? { ...r, kind: 'unit' } : null;
 }
-export const categories = () => [...new Set(state.items.map((i) => i.category).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk'));
+// категорії: спершу в збереженому порядку (спільному для всіх), решта — в кінці за абеткою
+export const categories = () => {
+  const all = [...new Set(state.items.map((i) => i.category).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk'));
+  const saved = [...new Set(state.settings.category_order || [])].filter((c) => all.includes(c));
+  return [...saved, ...all.filter((c) => !saved.includes(c))];
+};
+// Новий порядок одразу на екрані, ще до відповіді сервера; обидві повертають «повернути як було».
+// ids — позиції в новому порядку (можна лише видиму частину списку, див. permuteItems)
+export function applyItemOrder(ids) {
+  const all = [...state.byId.values()];
+  const snap = { items: state.items, places: all.map((i) => [i, i.sort_order]) };
+  permuteItems(all, ids);
+  state.items = sortItems(state.items.slice());
+  return () => {
+    for (const [i, place] of snap.places) i.sort_order = place;
+    state.items = snap.items;
+  };
+}
+export function applyCategoryOrder(names) {
+  const old = state.settings;
+  state.settings = { ...old, category_order: names };
+  return () => { state.settings = old; };
+}
 export const locations = () => [...new Set(state.items.map((i) => i.location).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk'));
 export const units = () => [...new Set(['шт', 'м', 'кг', 'г', 'л', 'компл', 'уп', 'пара', ...state.items.map((i) => i.unit).filter(Boolean)])];
 

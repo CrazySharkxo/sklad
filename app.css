@@ -525,3 +525,33 @@ code { font-size: 13px; background: var(--bg); padding: 1px 5px; border-radius: 
   .sign i { flex: 1; border-bottom: 0.3mm solid #000; height: 6mm; }
   .muted-print { color: #666; text-align: center; }
 }
+
+/* ---------- режим «Порядок» у залишках: перетягування позицій і категорій ---------- */
+.order-hint { margin: 0 0 10px; }
+.order-hint svg { width: 16px; height: 16px; vertical-align: -3px; stroke-width: 2.8; }
+.grip svg, .chip-grip svg { stroke-width: 2.8; }
+.chips.sorting { flex-wrap: wrap; overflow: visible; }
+.sort-chip {
+  display: inline-flex; align-items: stretch; padding: 0; cursor: default; overflow: hidden;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+/* ручка: touch-action none — під пальцем сторінка не прокручується, рух дістається перетягуванню */
+.chip-grip { display: inline-flex; align-items: center; gap: 2px; padding: 8px 2px; cursor: grab; touch-action: none; }
+.chip-grip svg { width: 16px; height: 16px; opacity: .6; }
+.chip-mv { border: 0; background: transparent; color: inherit; padding: 0 9px; min-width: 34px; min-height: 36px; font-size: 11px; cursor: pointer; }
+.chip-mv:disabled { opacity: .25; cursor: default; }
+.sort-row {
+  padding: 4px 4px 4px 0; gap: 2px; min-height: 54px;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.sort-row .row-main { margin-right: 6px; }
+.sort-row .icon-btn { font-size: 13px; }
+.grip {
+  display: flex; align-items: center; justify-content: center; flex: none;
+  width: 46px; align-self: stretch; min-height: 44px; color: var(--muted); cursor: grab; touch-action: none;
+}
+.dragging, .dragging:hover {
+  border-color: var(--accent); background: var(--accent-soft); color: var(--text);
+  box-shadow: 0 6px 18px rgba(16, 24, 40, .22); position: relative; z-index: 2;
+}
+.dragging .grip, .dragging .chip-grip { cursor: grabbing; color: var(--accent); }

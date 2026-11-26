@@ -773,6 +773,116 @@ do $$ begin
 end $$;
 reset role;
 
+-- =====================================================================
+--  Порядок позицій і категорій у «Залишках»
+-- =====================================================================
+do $$ begin
+  assert (select count(*) = count(distinct sort_order) from public.items), 'місця позицій мають бути різні';
+  assert (select count(*) from information_schema.columns
+           where table_schema = 'public' and table_name = 'stock' and column_name = 'sort_order') = 1, 'stock без sort_order';
+end $$;
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+-- нова позиція стає в кінець, хоч би як називалась
+insert into public.items (id, name) values ('aaaaaaaa-0000-0000-0000-000000000031', 'Яяя порядок 1');
+insert into public.items (id, name) values ('aaaaaaaa-0000-0000-0000-000000000032', 'Ааа порядок 2');
+insert into public.items (id, name) values ('aaaaaaaa-0000-0000-0000-000000000033', 'Ммм порядок 3');
+create temp table ord_before as select id, sort_order, updated_at from public.items;
+do $$
+declare
+  a constant uuid := 'aaaaaaaa-0000-0000-0000-000000000031';
+  b constant uuid := 'aaaaaaaa-0000-0000-0000-000000000032';
+  c constant uuid := 'aaaaaaaa-0000-0000-0000-000000000033';
+  v_max int := (select max(sort_order) from public.items);
+begin
+  assert (select array_agg(id order by sort_order) from public.stock where id in (a, b, c)) = array[a, b, c], 'нові — в кінець, за часом створення';
+  assert (select sort_order from public.items where id = c) = v_max;
+  -- напряму місце не змінити й не задати — лише функцією
+  begin
+    update public.items set sort_order = 1 where id = c;
+    raise exception 'sort_order змінено напряму';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    insert into public.items (name, sort_order) values ('з місцем', 1);
+    raise exception 'sort_order задано напряму';
+  exception when insufficient_privilege then null;
+  end;
+  -- перестановка трьох: решта позицій лишається на своїх місцях
+  perform public.set_item_order(array[c, a, b]);
+  assert (select array_agg(id order by sort_order) from public.items where id in (a, b, c)) = array[c, a, b], 'новий порядок';
+  assert (select count(*) from public.items i join ord_before o using (id)
+           where i.id not in (a, b, c) and i.sort_order <> o.sort_order) = 0, 'зачепило сторонні позиції';
+  assert (select count(*) = count(distinct sort_order) and max(sort_order) = count(*) and min(sort_order) = 1 from public.items), 'місця — 1..N без повторів';
+  -- перестановка — не зміна позиції: updated_at той самий
+  assert (select count(*) from public.items i join ord_before o using (id) where i.updated_at <> o.updated_at) = 0, 'updated_at змінився';
+  -- підмножина (як під фільтром категорії): міняються місцями лише названі
+  perform public.set_item_order(array[b, c]);
+  assert (select array_agg(id order by sort_order) from public.items where id in (a, b, c)) = array[b, a, c], 'підмножина';
+  -- невідомий id пропускається, повтор — помилка, порожній список нічого не міняє
+  perform public.set_item_order(array[a, gen_random_uuid(), b]);
+  assert (select array_agg(id order by sort_order) from public.items where id in (a, b, c)) = array[a, b, c], 'невідомий id';
+  perform public.set_item_order('{}');
+  perform public.set_item_order(null);
+  assert (select array_agg(id order by sort_order) from public.items where id in (a, b, c)) = array[a, b, c];
+  begin
+    perform public.set_item_order(array[a, b, a]);
+    raise exception 'повтор пройшов';
+  exception when raise_exception then assert sqlerrm = 'Позиція в порядку повторюється', sqlerrm;
+  end;
+  -- звичайна зміна позиції updated_at оновлює, місця не чіпає
+  update public.items set note = 'x' where id = a;
+  assert (select i.updated_at >= o.updated_at and i.sort_order = v_max - 2 from public.items i join ord_before o using (id) where i.id = a);
+
+  -- категорії: порядок зберігається як є, без порожніх і повторів
+  assert (select category_order from public.app_settings) = '{}', 'спершу порожньо';
+  perform public.set_category_order(array['Кабелі', ' Мотори ', '', 'Кабелі', 'Електроніка']);
+  assert (select category_order from public.app_settings) = array['Кабелі', 'Мотори', 'Електроніка'], (select category_order::text from public.app_settings);
+  begin
+    update public.app_settings set category_order = '{}';
+    raise exception 'порядок категорій змінено напряму';
+  exception when insufficient_privilege then null;
+  end;
+  assert (public.admin_dump() -> 'settings' -> 'category_order') = '["Кабелі", "Мотори", "Електроніка"]'::jsonb, 'dump: порядок категорій';
+  assert (public.admin_dump() -> 'items' -> 0) ? 'sort_order', 'dump: порядок позицій';
+end $$;
+
+-- без права «змінювати позиції складу» порядок видно, але не змінити
+reset role;
+update public.profiles set perms = array['stock.view'] where id = (select id from auth.users where email = 'view@example.com');
+select set_config('request.jwt.claim.sub', (select id::text from auth.users where email = 'view@example.com'), false);
+set role authenticated;
+do $$ begin
+  assert (select category_order from public.app_settings) = array['Кабелі', 'Мотори', 'Електроніка'], 'порядок категорій видно всім';
+  assert (select count(sort_order) from public.stock) > 3, 'порядок позицій видно всім';
+  begin
+    perform public.set_item_order(array['aaaaaaaa-0000-0000-0000-000000000031'::uuid]);
+    raise exception 'порядок позицій змінено без stock.edit';
+  exception when raise_exception then assert sqlerrm = 'Немає права змінювати позиції складу', sqlerrm;
+  end;
+  begin
+    perform public.set_category_order(array['Мотори']);
+    raise exception 'порядок категорій змінено без stock.edit';
+  exception when raise_exception then assert sqlerrm = 'Немає права змінювати позиції складу', sqlerrm;
+  end;
+end $$;
+reset role;
+update public.profiles set perms = array['stock.view', 'stock.edit'] where id = (select id from auth.users where email = 'view@example.com');
+set role anon;
+do $$ begin
+  begin
+    perform public.set_item_order('{}');
+    raise exception 'anon викликав set_item_order';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    perform public.set_category_order('{}');
+    raise exception 'anon викликав set_category_order';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+reset role;
+
 -- realtime підключено
 do $$ begin
   assert (select count(*) from pg_publication_tables where pubname = 'supabase_realtime') = 14;
