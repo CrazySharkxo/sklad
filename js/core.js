@@ -282,6 +282,7 @@ export function thumb(path, cls = 'thumb') {
 // ------------------------------------------------------------------
 // Вибір позиції: поле пошуку з підказками + кнопка сканера
 // ------------------------------------------------------------------
+const PICKER_FIRST = 50;  // стільки позицій показує порожнє поле (список прокручується)
 export function itemPicker(container, onPick, { placeholder = 'Додати позицію: назва або код…', showQty = true } = {}) {
   container.classList.add('picker');
   container.innerHTML = `<div class="picker-row">
@@ -292,41 +293,65 @@ export function itemPicker(container, onPick, { placeholder = 'Додати по
   const list = container.querySelector('.picker-list');
   let found = [];
   let active = 0;
+  let hideTimer = 0;
+  let quiet = false;   // фокус повернули самі після вибору — список знову не розкриваємо
 
+  const hide = () => { list.hidden = true; found = []; active = -1; };
+  // Порожнє поле — перші позиції в порядку складу (видно, що можна вибрати), без підсвіченої:
+  // Enter у порожньому полі нічого не додає. Далі — пошук за введеним.
   const render = () => {
+    clearTimeout(hideTimer);
     const q = input.value.trim();
-    if (!q) { list.hidden = true; return; }
-    const exact = findByCode(q);
-    found = searchItems(q).slice(0, 8);
-    if (exact && !found.includes(exact)) found.unshift(exact);
-    active = 0;
+    let more = 0;
+    if (q) {
+      const exact = findByCode(q);
+      found = searchItems(q).slice(0, 8);
+      if (exact && !found.includes(exact)) found.unshift(exact);
+      active = 0;
+    } else {
+      const all = activeItems();
+      found = all.slice(0, PICKER_FIRST);
+      more = all.length - found.length;
+      active = -1;
+    }
     list.hidden = false;
     list.innerHTML = found.length
-      ? found.map((i, n) => `<button type="button" class="picker-opt${n === 0 ? ' on' : ''}" data-id="${i.id}">
+      ? found.map((i, n) => `<button type="button" class="picker-opt${n === active ? ' on' : ''}" data-id="${i.id}" tabindex="-1">
           <span>${esc(i.name)}${i.code ? ` <small>${esc(i.code)}</small>` : ''}</span>
           ${showQty ? `<small class="muted">${fmtQty(i.qty)} ${esc(i.unit)}${reservedOf(i) ? ` · вільно ${fmtQty(freeQty(i))}` : ''}</small>` : ''}</button>`).join('')
-      : '<div class="picker-empty">Нічого не знайдено</div>';
+        + (more > 0 ? `<div class="picker-empty">…і ще ${more} — введіть назву або код</div>` : '')
+      : `<div class="picker-empty">${q ? 'Нічого не знайдено' : 'На складі ще немає позицій'}</div>`;
+    list.scrollTop = 0;
   };
   const choose = (item) => {
     input.value = '';
-    list.hidden = true;
+    hide();
     onPick(item);
+    quiet = true;
     input.focus();
+    quiet = false;
   };
   input.addEventListener('input', render);
+  input.addEventListener('focus', () => { if (!quiet) render(); });
+  input.addEventListener('click', () => { if (list.hidden) render(); });  // повторний клік у вже сфокусоване поле
   input.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault();
+      if (list.hidden) render();
       if (!found.length) return;
-      active = (active + (e.key === 'ArrowDown' ? 1 : found.length - 1)) % found.length;
-      list.querySelectorAll('.picker-opt').forEach((b, n) => b.classList.toggle('on', n === active));
+      const down = e.key === 'ArrowDown';
+      active = active < 0 ? (down ? 0 : found.length - 1) : (active + (down ? 1 : found.length - 1)) % found.length;
+      list.querySelectorAll('.picker-opt').forEach((b, n) => {
+        b.classList.toggle('on', n === active);
+        if (n === active) b.scrollIntoView({ block: 'nearest' });
+      });
     } else if (e.key === 'Enter') {
       e.preventDefault();
       const exact = findByCode(input.value);
       if (exact) choose(exact);
       else if (found[active]) choose(found[active]);
     } else if (e.key === 'Escape') {
-      list.hidden = true;
+      hide();
     }
   });
   // mousedown не забирає фокус у поля, тож blur не ховає список раніше за клік
@@ -335,7 +360,7 @@ export function itemPicker(container, onPick, { placeholder = 'Додати по
     const b = e.target.closest('[data-id]');
     if (b) choose(state.byId.get(b.dataset.id));
   });
-  input.addEventListener('blur', () => setTimeout(() => { list.hidden = true; }, 150));
+  input.addEventListener('blur', () => { clearTimeout(hideTimer); hideTimer = setTimeout(hide, 150); });
   container.querySelector('.scan-btn').addEventListener('click', async () => {
     const code = await scanCode();
     if (!code) return;

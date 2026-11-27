@@ -4,7 +4,8 @@
 
 Проходить робочий цикл: позиції → прихід → видаток (зокрема понад залишок) →
 комплект → інвентаризація → журнал і скасування → дозамовлення → Excel експорт/імпорт.
-Основний екран — телефон 400×860; бічне меню перевіряється на другій сторінці 1280×800.
+Основний екран — телефон 400×860; бічне меню перевіряється на другій сторінці 1280×800;
+вибір компонента комплекту зі списку — на 1900×1000.
 """
 import functools
 import http.server
@@ -1110,6 +1111,55 @@ def main() -> int:
         page.locator(".order-row").first.click()
         expect(page.locator("#events .ev")).to_have_count(4)
         page.screenshot(path=str(SHOTS / "16_desktop_order.png"), full_page=True)
+
+        # --- широкий екран: новий комплект, компонент вибирають зі списку мишею ---
+        page.set_viewport_size({"width": 1900, "height": 1000})
+        add_item("imx290", init="5")
+        add_item("Сд карта", init="5")
+        page.locator("#nav a[data-tab=kits]").click()
+        page.locator("#top a[href='#/kit-edit/new']").click()
+        page.locator("[name=name]").fill("Камера у зборі")
+        pick = page.locator("#picker input")
+        plist = page.locator("#picker .picker-list")
+        expect(plist).to_be_hidden()
+        pick.click()  # порожнє поле: список позицій видно одразу, без введення
+        expect(plist).to_be_visible()
+        expect(plist.locator(".picker-opt", has_text="imx290")).to_have_count(1)
+        expect(plist.locator(".picker-opt", has_text="Сд карта")).to_have_count(1)
+        expect(plist.locator(".picker-opt.on")).to_have_count(0)  # нічого не підсвічено — Enter у порожньому полі не додає
+        pick.press("Enter")
+        expect(page.locator("#lines .line")).to_have_count(0)
+        # список не обрізано і не перекрито: у центрі першого рядка — сам рядок
+        ob = plist.locator(".picker-opt").first.bounding_box()
+        assert page.evaluate("""([x, y]) => !!document.elementFromPoint(x, y)?.closest('#picker .picker-opt')""",
+                             [ob["x"] + ob["width"] / 2, ob["y"] + ob["height"] / 2])
+        page.screenshot(path=str(SHOTS / "35_kit_picker_wide.png"))
+        pick.press("Escape")
+        expect(plist).to_be_hidden()
+        pick.click()  # повторний клік у вже сфокусоване поле знову відкриває список
+        expect(plist).to_be_visible()
+        pick.press_sequentially("imx")
+        expect(plist.locator(".picker-opt")).to_have_count(1)
+        plist.locator(".picker-opt").click()
+        expect(page.locator("#lines .line")).to_have_count(1)
+        expect(page.locator("#lines .line-name")).to_have_text("imx290")
+        expect(plist).to_be_hidden()  # після вибору список не розкривається сам і не закриває рядки
+        expect(pick).to_be_focused()
+        pick.press_sequentially("Сд")
+        expect(plist.locator(".picker-opt")).to_have_count(1)
+        plist.locator(".picker-opt", has_text="Сд карта").click()
+        expect(page.locator("#lines .line")).to_have_count(2)
+        page.locator("#lines .qty").last.fill("2")
+        page.locator("#save").click()
+        assert "Комплект збережено" in toast_text()
+        expect(page.locator("#top h1")).to_have_text("Камера у зборі")
+        expect(page.locator(".kit-issue")).to_contain_text("можна видати: 2")  # Сд карта: 5 / 2
+        expect(page.locator("#tbl tbody tr")).to_have_count(2)
+        expect(page.locator("#tbl")).to_contain_text("imx290")
+        page.locator("#nav a[data-tab=kits]").click()
+        krow = page.locator("a.row", has=page.locator(".row-title", has_text="Камера у зборі"))
+        expect(krow.locator(".row-meta")).to_contain_text("2 компонент(ів)")
+        page.set_viewport_size({"width": 1280, "height": 800})
 
         # --- темна тема ---
         dark = browser.new_context(viewport={"width": 400, "height": 860}, color_scheme="dark")
