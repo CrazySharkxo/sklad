@@ -1161,6 +1161,170 @@ def main() -> int:
         expect(krow.locator(".row-meta")).to_contain_text("2 компонент(ів)")
         page.set_viewport_size({"width": 1280, "height": 800})
 
+        # --- планування комплекту, нестача під замовлення, комплект у замовлення ---
+        page.set_viewport_size({"width": 400, "height": 860})
+        no_hscroll = lambda: page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        page.goto(url + "#/shortage")
+        expect(page.locator("#list")).not_to_contain_text("Завантаження")
+        base_short = page.locator(".short-card.bad").count()  # що вже бракувало до цього кроку
+        add_item("ПЛ рама", init="10")
+        add_item("ПЛ мотор", init="20")
+        add_item("ПЛ камера", init="3")
+        page.goto(url + "#/kit-edit/new")
+        page.locator("[name=name]").fill("ПЛ дрон")
+        pick = page.locator("#picker input")
+        for q, n in (("ПЛ рама", "1"), ("ПЛ мотор", "4"), ("ПЛ камера", "1")):
+            pick.fill(q)
+            pick.press("Enter")
+            page.locator(".line .qty").last.fill(n)
+        page.locator("#save").click()
+        assert "Комплект збережено" in toast_text()
+        kit_url = page.url
+        plan = lambda name, col: page.locator("#tbl tr", has_text=name).locator(f"[data-c={col}]")
+        # без резерву: одне число, за замовчуванням 1 комплект, усього вистачає
+        expect(page.locator(".kit-issue")).to_contain_text("можна видати: 3")  # камера: 3
+        expect(page.locator("#capfree")).to_have_count(0)
+        expect(page.locator(".issue-form [name=n]")).to_have_value("1")
+        expect(page.locator("#plansum")).to_have_text("Вистачає на всі 1 з 1")
+        expect(page.locator("#tbl tr.bad")).to_have_count(0)
+        page.locator(".issue-form [name=n]").fill("5")
+        for name, need, have, free, lack in (("ПЛ рама", "5", "10", "10", "—"), ("ПЛ мотор", "20", "20", "20", "—"), ("ПЛ камера", "5", "3", "3", "2")):
+            assert [plan(name, c).inner_text() for c in ("need", "have", "free", "lack")] == [need, have, free, lack], name
+        expect(page.locator("#tbl tr.bad")).to_have_count(1)
+        expect(page.locator("#tbl tr.bad")).to_contain_text("ПЛ камера")
+        expect(page.locator("#tbl .neck")).to_have_count(1)  # вузьке місце — камера
+        expect(page.locator("#tbl tr", has_text="ПЛ камера").locator(".neck")).to_have_count(1)
+        expect(page.locator("#plansum")).to_have_text("Вистачає на 3 з 5 · не вистачає 1 позиції")
+        # список нестачі: друк і Excel — лише те, чого бракує
+        page.locator("[data-short=print]").click()
+        expect(page.locator("#print-area .doc")).to_contain_text("Нестача: ПЛ дрон × 5")
+        expect(page.locator("#print-area .doc-tbl tbody tr")).to_have_count(1)
+        expect(page.locator("#print-area .doc-tbl tbody tr")).to_contain_text("ПЛ камера")
+        with page.expect_download() as dl:
+            page.locator("[data-short=xls]").click()
+        assert dl.value.suggested_filename.startswith("нестача_комплект_"), dl.value.suggested_filename
+        # кількість памʼятається для цього комплекту, доки програму не закрили
+        page.locator("#top a.back").click()
+        page.locator("a.row", has_text="ПЛ дрон").click()
+        expect(page.locator(".issue-form [name=n]")).to_have_value("5")
+
+        # замовлення: «Додати комплект» × кількість виробів, потім ще × 3 — кількості складаються
+        page.goto(url + "#/order-edit/new")
+        f = page.locator("#f")
+        f.locator("[name=title]").fill("ПЛ замовлення")
+        f.locator("[name=qty]").fill("2")
+        f.locator("[name=due_date]").fill("2031-01-15")
+        expect(page.locator("#kitn")).to_have_attribute("placeholder", "2")
+        part_qty = lambda name: page.locator("#parts .line", has_text=name).locator(".qty")
+        page.locator("#kit").select_option(label="ПЛ дрон")
+        assert "ПЛ дрон» × 2" in toast_text()
+        expect(page.locator("#parts .line")).to_have_count(3)
+        expect(part_qty("ПЛ мотор")).to_have_value("8")
+        page.locator("#kitn").fill("3")
+        page.locator("#kit").select_option(label="ПЛ дрон")
+        expect(page.locator("#parts .line")).to_have_count(3)  # ті самі рядки, не дублі
+        expect(part_qty("ПЛ рама")).to_have_value("5")
+        expect(part_qty("ПЛ мотор")).to_have_value("20")
+        expect(part_qty("ПЛ камера")).to_have_value("5")
+        expect(page.locator("#kitn")).to_have_value("")
+        assert no_hscroll()
+        expect(page.locator(".toast")).to_have_count(0, timeout=15000)  # сповіщення не має закривати знімок
+        page.evaluate("document.querySelector('.kit-add').scrollIntoView({ block: 'center' })")
+        page.screenshot(path=str(SHOTS / "43_order_add_kit.png"))
+        page.locator("#save").click()
+        expect(page.locator("#top h1")).to_contain_text("ПЛ замовлення")
+        order_hash = "#" + page.url.split("#")[1]
+        # картка замовлення: та сама нестача, що й на екрані «Під замовлення»
+        expect(page.locator("#parts tr.bad")).to_have_count(1)
+        expect(page.locator("#parts tr.bad")).to_contain_text("бракує 2")
+        expect(page.locator("#parts a[href='#/shortage']")).to_have_count(1)
+
+        # картка комплекту з резервом: обидва числа, нестача рахується від вільного
+        page.goto(kit_url)
+        expect(page.locator(".kit-issue")).to_contain_text("можна видати: 3")
+        expect(page.locator("#capfree")).to_contain_text("з урахуванням резерву під замовлення: 0")
+        for name, need, have, free, lack in (("ПЛ рама", "5", "10", "5", "—"), ("ПЛ мотор", "20", "20", "0", "20"), ("ПЛ камера", "5", "3", "0", "5")):
+            assert [plan(name, c).inner_text() for c in ("need", "have", "free", "lack")] == [need, have, free, lack], name
+        expect(page.locator("#plansum")).to_have_text("Вистачає на 0 з 5 · не вистачає 2 позицій")
+        assert no_hscroll()
+        expect(page.locator(".toast")).to_have_count(0, timeout=15000)  # сповіщення не має закривати знімок
+        page.screenshot(path=str(SHOTS / "40_kit_plan.png"), full_page=True)
+
+        # список замовлень веде на екран нестачі
+        page.goto(url + "#/orders")
+        expect(page.locator(".short-link.bad")).to_contain_text(f"Не вистачає на складі під замовлення: {base_short + 1} поз.")
+        page.locator(".short-link").click()
+        expect(page.locator("#top h1")).to_have_text("Нестача під замовлення")
+        expect(page.locator("#nav a.on")).to_have_attribute("data-tab", "more")  # вкладка розділу «Дозамовити» (на телефоні він у «Ще»)
+        expect(page.locator("#rtabs .chip.on")).to_have_text(f"Під замовлення · {base_short + 1}")
+        expect(page.locator(".short-card.bad")).to_have_count(base_short + 1)
+        card = page.locator(".short-card", has=page.locator(".short-name", has_text="ПЛ камера"))
+        assert [card.locator(f"[data-c={c}]").inner_text() for c in ("need", "have", "lack")] == ["5", "3", "2"]
+        expect(card.locator(".short-order")).to_have_count(1)
+        expect(card.locator(".short-order")).to_have_attribute("href", order_hash)
+        expect(card.locator(".short-order")).to_contain_text("ПЛ замовлення")
+        expect(card.locator(".short-order .so-need")).to_contain_text("треба 5")
+        expect(card.locator(".short-order .so-need")).to_contain_text("не вистачить 2")
+        expect(card.locator(".short-order em")).to_contain_text("до 15.01.2031")
+        expect(page.locator(".short-card", has_text="ПЛ мотор")).to_have_count(0)  # 20 з 20 — вистачає впритул
+        expect(page.locator("#note .hint")).to_have_count(0)  # адміністратор бачить усі замовлення
+        assert no_hscroll()
+        expect(page.locator(".toast")).to_have_count(0, timeout=15000)  # сповіщення не має закривати знімок
+        page.screenshot(path=str(SHOTS / "41_shortage.png"), full_page=True)
+        # число збігається з «вільно» в картці позиції: 3 − 5 = −2
+        card.locator(".short-name").click()
+        expect(page.locator(".badge.res")).to_contain_text("Зарезервовано під замовлення: 5")
+        expect(page.locator(".big-qty .free b")).to_have_text(re.compile(r"^[−-]2$"))
+        page.go_back()
+        # «усі позиції під замовлення» — і ті, яких вистачає
+        page.locator("#all").check()
+        expect(page.locator(".short-card", has_text="ПЛ мотор").locator(".short-lack.ok")).to_have_count(1)
+        expect(page.locator(".short-card", has_text="ПЛ рама").locator("[data-c=need]")).to_have_text("5")
+        page.locator("[data-out=print]").click()
+        expect(page.locator("#print-area .doc")).to_contain_text("Позиції під замовлення")
+        expect(page.locator("#print-area .doc-tbl tbody tr", has_text="ПЛ камера")).to_contain_text("№")
+        with page.expect_download() as dl:
+            page.locator("[data-out=xls]").click()
+        assert dl.value.suggested_filename.startswith("нестача_під_замовлення_"), dl.value.suggested_filename
+        page.set_viewport_size({"width": 1280, "height": 800})
+        assert no_hscroll()
+        page.screenshot(path=str(SHOTS / "42_shortage_wide.png"), full_page=True)
+        page.set_viewport_size({"width": 400, "height": 860})
+        page.locator("#all").uncheck()
+        # вкладка «Нижче мінімуму» поруч
+        page.locator("#rtabs [data-rtab=low]").click()
+        expect(page.locator("#top h1")).to_have_text("Дозамовити")
+        expect(page.locator("#rtabs [data-rtab=orders]")).to_have_text(f"Під замовлення · {base_short + 1}")
+
+        # прихід 2 камер — позиція зникає з нестачі
+        page.goto(url + "#/op/in")
+        pick = page.locator("#picker input")
+        pick.fill("ПЛ камера")
+        pick.press("Enter")
+        page.locator(".line .qty").last.fill("2")
+        page.locator("#post").click()
+        assert "Прихід проведено" in toast_text()
+        page.goto(url + "#/shortage")
+        expect(page.locator("#list")).not_to_contain_text("Завантаження")
+        expect(page.locator(".short-card", has_text="ПЛ камера")).to_have_count(0)
+        expect(page.locator(".short-card.bad")).to_have_count(base_short)
+        # часткова видача під замовлення зменшує потребу: видано 2 камери з 5 → треба 3
+        page.goto(url + order_hash)
+        page.locator("#parts a.btn.out").click()
+        expect(page.locator(".line")).to_have_count(3)
+        page.locator(".line", has_text="ПЛ рама").locator("[data-rm]").click()
+        page.locator(".line", has_text="ПЛ мотор").locator("[data-rm]").click()
+        page.locator(".line .qty").fill("2")
+        page.locator("#post").click()
+        assert "Видаток проведено" in toast_text()
+        page.goto(url + "#/shortage")
+        page.locator("#all").check()
+        card = page.locator(".short-card", has=page.locator(".short-name", has_text="ПЛ камера"))
+        assert [card.locator(f"[data-c={c}]").inner_text() for c in ("need", "have", "lack")] == ["3", "3", "✓"]
+        expect(card.locator(".short-order .so-need")).to_have_text("треба 3")
+        page.locator("#all").uncheck()
+        page.set_viewport_size({"width": 1280, "height": 800})
+
         # --- темна тема ---
         dark = browser.new_context(viewport={"width": 400, "height": 860}, color_scheme="dark")
         dark.route(re.compile(r".*/js/config\.js$"), DEMO_CONFIG)

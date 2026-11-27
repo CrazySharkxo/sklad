@@ -13,6 +13,7 @@ import { viewUsers, viewUserEdit, viewRoles, viewRoleEdit } from './views/users.
 import { viewNotifications } from './views/settings.js';
 import { viewOutbox, outboxBannerText, startAutoFlush, OUTBOX_EVENT } from './outbox.js';
 import { viewBackups, runCloudBackup } from './backup.js';
+import { viewShortage } from './views/shortage.js';
 
 const ROUTES = [
   // [шаблон, екран, вкладка меню, чи перемальовувати при змінах від інших, потрібне право]
@@ -33,6 +34,7 @@ const ROUTES = [
   [/^\/kit-edit\/([\w-]+)$/, (c, m) => viewKitEdit(c, m[1]), 'kits', false, 'kits.edit'],
   [/^\/inventory$/, (c) => viewInventory(c), 'inventory', false, 'ops.edit'],
   [/^\/reorder$/, (c) => viewReorder(c), 'reorder', true, 'stock.view'],
+  [/^\/shortage$/, (c) => viewShortage(c), 'reorder', true, 'stock.view'],
   [/^\/labels$/, (c) => viewLabels(c), 'labels', false, 'stock.view'],
   [/^\/import$/, (c) => viewImport(c), 'import', false, 'stock.edit'],
   [/^\/users$/, (c) => viewUsers(c), 'users', false, 'admin'],

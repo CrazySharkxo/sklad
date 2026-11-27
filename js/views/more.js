@@ -1,7 +1,7 @@
 // Дозамовити, етикетки, імпорт/експорт Excel, профіль
 import { api, isDemo } from '../api.js';
 import { esc, fmtQty, parseNum, norm, toast, confirmDialog, promptDialog, downloadXlsx, readSheet, todayIso } from '../util.js';
-import { canManageUsers, canOrder, state, go, reloadData, activeItems, isLow, searchItems, hydratePhotos, thumb, myDepartment, depName, can } from '../core.js';
+import { canManageUsers, canOrder, state, go, reloadData, activeItems, isLow, shortItems, searchItems, hydratePhotos, thumb, myDepartment, depName, can } from '../core.js';
 import { restSections, navOrdering, setNavOrdering, mountNavOrder, wide } from '../nav.js';
 import { ICON_GRIP } from '../sortable.js';
 import { printLabels } from './stock.js';
@@ -9,6 +9,7 @@ import { exportJournal } from './ops.js';
 import { exportOrders } from './orders.js';
 import { pending, outboxBannerText } from '../outbox.js';
 import { lastBackupText } from './settings.js';
+import { reorderTabs } from './shortage.js';
 
 // Розділи на сторінці «Ще»: повна назва і підпис. Сюди потрапляють ті, яким не вистачило
 // місця на нижній панелі телефона (на широкому екрані всі розділи — у бічному меню).
@@ -17,7 +18,11 @@ const SECTION_INFO = {
   notifications: ['Сповіщення Telegram', () => 'нові замовлення, передачі, мало на складі, прострочені'],
   backups: ['Резервні копії', () => (isDemo ? 'завантажити копію даних' : esc(lastBackupText(state.settings?.backup_at)))],
   departments: ['Відділи', () => { const dep = myDepartment(); return dep ? `мій відділ: ${esc(depName(dep))}` : 'свій відділ ще не вибрано'; }],
-  reorder: ['Дозамовити', () => { const low = activeItems().filter(isLow).length; return low ? `${low} позицій нижче мінімуму` : 'усе в нормі'; }],
+  reorder: ['Дозамовити', () => {
+    const low = activeItems().filter(isLow).length;
+    const short = shortItems().length;
+    return [low ? `${low} позицій нижче мінімуму` : '', short ? `не вистачає під замовлення: ${short}` : ''].filter(Boolean).join(' · ') || 'усе в нормі';
+  }],
   inventory: ['Інвентаризація', () => 'перерахунок фактичної кількості'],
   labels: ['Етикетки з QR-кодом', () => 'друк наліпок для полиць і коробок'],
   import: ['Імпорт з Excel', () => 'завантажити список позицій і залишків'],
@@ -99,13 +104,13 @@ export function exportStock() {
 export function viewReorder(ctx) {
   ctx.header({ title: 'Дозамовити', back: '#/more', actions: '<button class="btn ghost sm" data-xls>Excel</button>' });
   const list = activeItems().filter(isLow).sort((a, b) => (a.qty / a.min_qty) - (b.qty / b.min_qty));
-  ctx.main.innerHTML = list.length ? `<div class="list">${list.map((i) => `
+  ctx.main.innerHTML = reorderTabs('low') + (list.length ? `<div class="list">${list.map((i) => `
     <a class="row" href="#/item/${i.id}">${thumb(i.photo_path)}
       <div class="row-main"><div class="row-title">${esc(i.name)}</div>
         <div class="row-meta">є ${fmtQty(i.qty)} з мін. ${fmtQty(i.min_qty)} ${esc(i.unit)}${i.category ? ' · ' + esc(i.category) : ''}</div></div>
       <div class="row-qty low"><b>${fmtQty(i.min_qty - i.qty)}</b><small>${esc(i.unit)} бракує</small></div>
     </a>`).join('')}</div>`
-    : '<div class="empty-state"><p>Усі позиції вище мінімального залишку.</p><p class="muted">Мінімум задається в картці позиції → Редагувати.</p></div>';
+    : '<div class="empty-state"><p>Усі позиції вище мінімального залишку.</p><p class="muted">Мінімум задається в картці позиції → Редагувати.</p></div>');
   hydratePhotos(ctx.main);
   ctx.headerEl.querySelector('[data-xls]').addEventListener('click', () => {
     const rows = [['Назва', 'Код', 'Категорія', 'Одиниця', 'Залишок', 'Мінімум', 'Бракує'],

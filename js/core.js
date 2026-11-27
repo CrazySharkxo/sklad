@@ -228,16 +228,20 @@ export function applyNavOrder(ids) {
 export const locations = () => [...new Set(state.items.map((i) => i.location).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk'));
 export const units = () => [...new Set(['шт', 'м', 'кг', 'г', 'л', 'компл', 'уп', 'пара', ...state.items.map((i) => i.unit).filter(Boolean)])];
 
-// скільки комплектів можна видати з поточних залишків
-export function kitCapacity(kit) {
-  if (!kit.components.length) return 0;
-  let n = Infinity;
-  for (const c of kit.components) {
-    const it = state.byId.get(c.item_id);
-    n = Math.min(n, it ? Math.floor(round(it.qty / c.qty)) : 0);
-  }
-  return Math.max(0, n === Infinity ? 0 : n);
+// на скільки комплектів вистачає одного компонента; free — рахувати від вільного (без резерву під замовлення)
+export function componentCapacity(c, free = false) {
+  const it = state.byId.get(c.item_id);
+  if (!it || !(c.qty > 0)) return 0;
+  return Math.max(0, Math.floor(round((free ? freeQty(it) : it.qty) / c.qty)));
 }
+// скільки комплектів можна видати з поточних залишків (free — з вільного, без резерву під замовлення)
+export function kitCapacity(kit, free = false) {
+  if (!kit.components.length) return 0;
+  return Math.min(...kit.components.map((c) => componentCapacity(c, free)));
+}
+// позиції, яких на складі менше, ніж обіцяно активним замовленням (резерв рахує сервер — за всіма відділами)
+export const shortOf = (i) => Math.max(0, round(reservedOf(i) - (i?.qty || 0)));
+export const shortItems = () => state.items.filter((i) => shortOf(i) > 0);
 
 // пошук: всі слова запиту мають знайтися в назві / коді / категорії / місці
 export function searchItems(query, list = activeItems()) {

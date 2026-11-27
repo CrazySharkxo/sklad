@@ -298,6 +298,17 @@ class SupaApi {
     const ops = await this.q(this.sb.from('operations').select('type, cancelled_at, movements(item_id, qty)').eq('order_id', orderId));
     return issuedMap(ops);
   }
+  // видане під кілька замовлень одразу: { id замовлення: { id позиції: кількість } }
+  async ordersIssued(ids) {
+    const out = {};
+    for (let i = 0; i < ids.length; i += 40) {
+      const part = ids.slice(i, i + 40);
+      const ops = await this.all(() => this.sb.from('operations')
+        .select('id, order_id, type, cancelled_at, movements(item_id, qty)').in('order_id', part).order('id'));
+      for (const id of part) out[id] = issuedMap(ops.filter((o) => o.order_id === id));
+    }
+    return out;
+  }
 
   // ---------- позиції ----------
   async items() {
@@ -817,6 +828,10 @@ class LocalApi {
   }
   async orderIssued(orderId) {
     return issuedMap(this.filterOps(this.load()).filter((o) => o.order_id === orderId));
+  }
+  async ordersIssued(ids) {
+    const ops = this.filterOps(this.load());
+    return Object.fromEntries(ids.map((id) => [id, issuedMap(ops.filter((o) => o.order_id === id))]));
   }
 
   async items() {

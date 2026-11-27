@@ -1,7 +1,8 @@
 // Комплекти (специфікації): «1 виріб = N компонентів», видача списує все разом
 import { api } from '../api.js';
-import { esc, fmtQty, parseNum, round, toast, confirmDialog, compressImage } from '../util.js';
-import { state, go, reloadData, itemPicker, kitCapacity, hydratePhotos, thumb, ICON_PLUS, can } from '../core.js';
+import { esc, fmtQty, parseNum, round, toast, confirmDialog, compressImage, downloadXlsx, todayIso } from '../util.js';
+import { state, go, reloadData, itemPicker, kitCapacity, componentCapacity, freeQty, hydratePhotos, thumb, ICON_PLUS, can } from '../core.js';
+import { printTable } from '../print.js';
 import { postOrQueue } from '../outbox.js';
 
 export function viewKits(ctx) {
@@ -22,44 +23,83 @@ export function viewKits(ctx) {
   hydratePhotos(ctx.main);
 }
 
+// «Скільки зібрати?» — останнє значення для кожного комплекту, доки програму не закрили
+const planQty = new Map();
+
 export function viewKit(ctx, id) {
   const kit = state.kits.find((k) => k.id === id);
   if (!kit) { ctx.notFound(); return; }
   ctx.header({ title: kit.name, back: '#/kits', actions: can('kits.edit') ? `<a class="btn ghost sm" href="#/kit-edit/${id}">Редагувати</a>` : '' });
-  const cap = kitCapacity(kit);
+  const cap = kitCapacity(kit);            // з усього, що лежить на складі
+  const capFree = kitCapacity(kit, true);  // без того, що зарезервовано під активні замовлення
 
   ctx.main.innerHTML = `
     ${kit.photo_path || kit.note ? `<div class="card item-card">${kit.photo_path ? `<div class="item-photo">${thumb(kit.photo_path, 'photo')}</div>` : ''}
       ${kit.note ? `<p class="note">${esc(kit.note)}</p>` : ''}</div>` : ''}
     <div class="card">
       <div class="kit-issue">
-        <div>Із залишків можна видати: <b class="${cap ? 'pos' : 'neg'}">${cap}</b></div>
+        <div>Із залишків можна видати: <b class="${cap ? 'pos' : 'neg'}">${cap}</b>${capFree !== cap
+    ? ` <span class="muted" id="capfree">· з урахуванням резерву під замовлення: <b class="${capFree ? 'pos' : 'neg'}">${capFree}</b></span>` : ''}</div>
         <form id="issue" class="issue-form" autocomplete="off">
-          <input name="n" inputmode="numeric" value="1" aria-label="Скільки комплектів">
+          <label class="plan-n"><span>Скільки зібрати?</span>
+            <input name="n" inputmode="numeric" value="${esc(planQty.get(id) ?? '1')}" aria-label="Скільки комплектів"></label>
           ${can('ops.edit') ? `<input name="counterparty" placeholder="Кому / для чого">
           <button class="btn out">Видати комплекти</button>` : ''}
         </form>
       </div>
-      <table class="tbl" id="tbl"></table>
+      <div class="plan-sum" id="plansum"></div>
+      <table class="tbl plan-tbl" id="tbl"></table>
+      <div class="form-actions plan-acts"><span class="muted small">«Вільно» — на складі мінус резерв під активні замовлення.</span><span class="grow"></span>
+        <button type="button" class="btn ghost sm" data-short="print">Список нестачі</button>
+        <button type="button" class="btn ghost sm" data-short="xls">Excel</button></div>
     </div>`;
   hydratePhotos(ctx.main);
   const tbl = ctx.main.querySelector('#tbl');
+  const sum = ctx.main.querySelector('#plansum');
   const form = ctx.main.querySelector('#issue');
 
+  // рядки плану на n комплектів: потреба, залишок, вільне, нестача (відносно вільного)
+  const plan = (n) => kit.components.map((c) => {
+    const it = state.byId.get(c.item_id);
+    const need = round(c.qty * n);
+    const have = it?.qty || 0;
+    const free = Math.max(0, it ? freeQty(it) : 0);
+    return { c, it, need, have, free, lack: Math.max(0, round(need - free)), neck: componentCapacity(c, true) === capFree };
+  });
+  const curN = () => Math.max(0, parseNum(form.n.value) || 0);
   const renderTable = () => {
-    const n = Math.max(0, parseNum(form.n.value) || 0);
-    tbl.innerHTML = `<thead><tr><th>Компонент</th><th>на 1</th><th>потрібно</th><th>на складі</th></tr></thead><tbody>
-      ${kit.components.map((c) => {
-        const it = state.byId.get(c.item_id);
-        const need = round(c.qty * n);
-        const ok = it && it.qty >= need;
-        return `<tr class="${ok ? '' : 'bad'}"><td><a href="#/item/${c.item_id}">${esc(it?.name || '?')}</a></td>
-          <td>${fmtQty(c.qty)} ${esc(it?.unit || '')}</td><td>${fmtQty(need)}</td>
-          <td>${fmtQty(it?.qty || 0)}${ok ? '' : ` <small class="err-text">бракує ${fmtQty(need - (it?.qty || 0))}</small>`}</td></tr>`;
-      }).join('')}</tbody>`;
+    const n = curN();
+    const rows = plan(n);
+    const short = rows.filter((r) => r.lack > 0).length;
+    // вузьке місце позначаємо, коли воно справді щось обмежує: компоненти вистачають по-різному
+    const showNeck = rows.length > 1 && rows.some((r) => !r.neck);
+    sum.className = `plan-sum ${short ? 'bad' : 'ok'}`;
+    sum.textContent = !n ? '' : short
+      ? `Вистачає на ${Math.min(capFree, Math.floor(n))} з ${fmtQty(n)} · не вистачає ${short} ${short === 1 ? 'позиції' : 'позицій'}`
+      : `Вистачає на всі ${fmtQty(n)} з ${fmtQty(n)}`;
+    tbl.innerHTML = `<thead><tr><th>Компонент</th><th>потрібно</th><th>на складі</th><th>вільно</th><th>не вистачає</th></tr></thead><tbody>
+      ${rows.map((r) => `<tr class="${r.lack > 0 ? 'bad' : ''}" data-item="${r.c.item_id}">
+          <td><a href="#/item/${r.c.item_id}">${esc(r.it?.name || '?')}</a>
+            <small class="muted">на 1: ${fmtQty(r.c.qty)} ${esc(r.it?.unit || '')}</small>
+            ${showNeck && r.neck ? '<small class="neck" title="Цей компонент обмежує, скільки комплектів можна зібрати">вузьке місце</small>' : ''}</td>
+          <td class="num" data-c="need">${fmtQty(r.need)}</td><td class="num" data-c="have">${fmtQty(r.have)}</td>
+          <td class="num" data-c="free">${fmtQty(r.free)}</td>
+          <td class="num" data-c="lack">${r.lack > 0 ? `<b class="err-text">${fmtQty(r.lack)}</b>` : '—'}</td></tr>`).join('')}</tbody>`;
   };
   renderTable();
-  form.n.addEventListener('input', renderTable);
+  form.n.addEventListener('input', () => { planQty.set(id, form.n.value); renderTable(); });
+  ctx.main.querySelector('.plan-acts').addEventListener('click', (e) => {
+    const how = e.target.closest('[data-short]')?.dataset.short;
+    if (!how) return;
+    const n = curN();
+    const rows = plan(n).filter((r) => r.lack > 0);
+    if (!rows.length) return toast(n ? `На ${fmtQty(n)} × «${kit.name}» усього вистачає` : 'Вкажіть, скільки зібрати', n ? 'ok' : 'err');
+    const head = ['Назва', 'Код', 'Одиниця', 'Потрібно', 'На складі', 'Вільно', 'Не вистачає'];
+    const data = rows.map((r) => [r.it?.name || '?', r.it?.code || '', r.it?.unit || '', r.need, r.have, r.free, r.lack]);
+    const title = `Нестача: ${kit.name} × ${fmtQty(n)}`;
+    if (how === 'xls') downloadXlsx(`нестача_комплект_${todayIso()}.xlsx`, [{ name: 'Нестача', rows: [[title], head, ...data], widths: [36, 16, 9, 10, 10, 10, 12] }]);
+    else printTable({ title, note: '«Вільно» — на складі мінус резерв під активні замовлення; «не вистачає» — відносно вільного.', head, rows: data, num: [3, 4, 5, 6] });
+  });
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!can('ops.edit')) return;

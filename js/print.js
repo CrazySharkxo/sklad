@@ -96,6 +96,20 @@ export function printOrder(o, { issued = {}, events = [] } = {}) {
 }
 
 // ------------------------------------------------------------------
+// Простий список-таблиця (нестача під комплект / під замовлення).
+// head — назви стовпців, rows — рядки значень, num — номери числових стовпців
+// ------------------------------------------------------------------
+export function printTable({ title, note = '', head: cols, rows, num = [] }) {
+  const cell = (v, n) => `<td${num.includes(n) ? ' class="num"' : ''}>${esc(typeof v === 'number' ? fmtQty(v) : v)}</td>`;
+  printDoc(`<div class="doc-head"><div class="doc-org">${esc(orgName())}</div><h1>${esc(title)}</h1>
+      <div class="doc-no">станом на ${esc(fmtDate(new Date().toISOString()))}</div></div>
+    ${note ? `<p class="doc-text">${esc(note)}</p>` : ''}
+    <table class="doc-tbl"><thead><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead>
+      <tbody>${rows.map((r) => `<tr>${r.map(cell).join('')}</tr>`).join('')}</tbody></table>
+    <p class="doc-total">Позицій: ${rows.length}</p>`);
+}
+
+// ------------------------------------------------------------------
 // QR-етикетки виробів: скан «SN:<серійний>» відкриває замовлення
 // ------------------------------------------------------------------
 export function printUnitLabels(o, units) {

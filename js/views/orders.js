@@ -7,7 +7,7 @@ import {
 } from '../util.js';
 import {
   state, go, reloadData, itemPicker, comboInput, userName, depName, myDepartment, ACTIVE_ORDER, ICON_PLUS, ICON_SCAN,
-  trashRow, bindTrash, TRASH_EMPTY, can, isOverdue, isDueSoon, dueText, reservedOf, freeQty, resolveCode,
+  trashRow, bindTrash, TRASH_EMPTY, can, isOverdue, isDueSoon, dueText, reservedOf, freeQty, resolveCode, shortItems,
 } from '../core.js';
 import { scanCode } from '../scanner.js';
 import { printOrder, printUnitLabels } from '../print.js';
@@ -47,6 +47,15 @@ function orderRow(o) {
   </a>`;
 }
 
+// посилання на «Дозамовити → Під замовлення»: чого на складі бракує для активних замовлень
+function shortLink() {
+  if (!can('stock.view') || !state.orders.some(isActive)) return '';
+  const n = shortItems().length;
+  return n
+    ? `<a class="short-link bad" href="#/shortage"><b>Не вистачає на складі під замовлення: ${n} поз.</b><span>показати, чого і для яких замовлень ›</span></a>`
+    : '<a class="short-link" href="#/shortage"><span>Нестача під замовлення: на складі всього вистачає ›</span></a>';
+}
+
 export function viewOrders(ctx) {
   ctx.header({
     title: 'Замовлення',
@@ -63,6 +72,7 @@ export function viewOrders(ctx) {
     <div class="chips" id="chips">${FILTERS.filter(([k]) => k !== 'overdue' || counts.overdue || ui.f === 'overdue')
     .map(([k, label]) => `<button class="chip${ui.f === k ? ' on' : ''}${k === 'overdue' ? ' danger' : ''}" data-f="${k}">${label}${k !== 'archive' && counts[k] ? ` · ${counts[k]}` : ''}</button>`).join('')}
       ${can('orders.delete') && (state.trashOrders.length || ui.f === 'trash') ? `<button class="chip trash-chip${ui.f === 'trash' ? ' on' : ''}" data-f="trash">Кошик${state.trashOrders.length ? ` · ${state.trashOrders.length}` : ''}</button>` : ''}</div>
+    ${shortLink()}
     <div id="list" class="list"></div>`;
   const listEl = ctx.main.querySelector('#list');
   ctx.headerEl.querySelector('#oscan')?.addEventListener('click', async () => {
@@ -252,7 +262,8 @@ function partsHtml(o, issued) {
   }).join('');
   return `<table class="tbl"><thead><tr><th>Деталь</th><th>потрібно</th><th>видано</th><th>на складі</th></tr></thead><tbody>${rows}</tbody></table>
     <div class="form-actions">${left
-    ? `<span class="muted">${short ? `Бракує на складі: ${short} поз.` : contested ? `Є на складі, але ${contested} поз. частково зарезервовано іншими` : 'Усе потрібне є на складі'}</span><span class="grow"></span>
+    ? `<span class="muted">${short ? `Бракує на складі: ${short} поз.` : contested ? `Є на складі, але ${contested} поз. частково зарезервовано іншими` : 'Усе потрібне є на складі'}${
+      (short || contested) && can('stock.view') ? ' · <a href="#/shortage">нестача за всіма замовленнями</a>' : ''}</span><span class="grow"></span>
        ${can('ops.edit') ? `<a class="btn out" href="#/op/out?order=${o.id}">Видати зі складу</a>` : ''}`
     : '<span class="pos">Усі деталі видано</span>'}</div>`;
 }
@@ -546,8 +557,11 @@ export function viewOrderEdit(ctx, id) {
         <button type="button" class="btn ghost sm" id="addtask">Додати</button></div>
 
       <h3>Деталі зі складу <small class="muted">— на все замовлення</small></h3>
-      ${kits.length ? `<select id="kit" aria-label="Додати комплект"><option value="">＋ Додати всі деталі комплекту…</option>
-        ${kits.map((k) => `<option value="${k.id}">${esc(k.name)}</option>`).join('')}</select>` : ''}
+      ${kits.length ? `<div class="kit-add"><label class="kit-add-n"><span>Комплектів</span>
+          <input id="kitn" inputmode="decimal" aria-label="Скільки комплектів додати" placeholder="${fmtQty(o.qty)}"></label>
+        <select id="kit" aria-label="Додати комплект"><option value="">＋ Додати комплект…</option>
+        ${kits.map((k) => `<option value="${k.id}">${esc(k.name)}</option>`).join('')}</select></div>
+        <p class="muted small kit-add-hint">Комплект × кількість додає всі його деталі до списку нижче; якщо деталь уже є — кількості складаються. Порожнє поле — стільки, скільки виробів у замовленні.</p>` : ''}
       <div id="picker"></div>
       <div id="parts" class="lines"></div>
 
@@ -618,12 +632,18 @@ export function viewOrderEdit(ctx, id) {
     parts.push({ item_id: item.id, qty: '' });
     renderParts(parts.length - 1);
   }, { placeholder: 'Додати деталь: назва або код…' });
+  // кількість комплектів за замовчуванням — кількість виробів у замовленні
+  const kitN = ctx.main.querySelector('#kitn');
+  if (kitN) f.qty.addEventListener('input', () => { kitN.placeholder = parseNum(f.qty.value) > 0 ? fmtQty(parseNum(f.qty.value)) : '1'; });
   ctx.main.querySelector('#kit')?.addEventListener('change', (e) => {
     const kit = state.kits.find((k) => k.id === e.target.value);
     e.target.value = '';
     if (!kit) return;
-    const mult = parseNum(f.qty.value) > 0 ? parseNum(f.qty.value) : 1;
+    const own = parseNum(kitN.value);
+    if (kitN.value.trim() && !(own > 0)) return toast('Кількість комплектів має бути більше 0', 'err');
+    const mult = own > 0 ? own : parseNum(f.qty.value) > 0 ? parseNum(f.qty.value) : 1;
     for (const c of kit.components) if (state.byId.has(c.item_id)) addPart(c.item_id, round(c.qty * mult));
+    kitN.value = '';
     renderParts();
     toast(`Додано деталі комплекту «${kit.name}» × ${fmtQty(mult)}`);
   });

@@ -321,6 +321,52 @@ main { padding: 0 16px; max-width: 980px; }
 .tbl th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px; border-bottom: 1px solid var(--line); }
 .tbl td { padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
 .tbl tr.bad td { background: var(--out-soft); }
+.tbl td.num, .tbl th.num { text-align: right; white-space: nowrap; }
+/* планування в картці комплекту: «Скільки зібрати?» */
+.plan-n { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--muted); }
+.plan-n input { width: 110px; }
+.issue-form { align-items: flex-end; }
+.plan-sum { font-weight: 600; margin-bottom: 8px; }
+.plan-sum.ok { color: var(--in); }
+.plan-sum.bad { color: var(--err); }
+.plan-sum:empty { display: none; }
+.plan-tbl th { font-size: 12px; padding: 6px 4px; }
+.plan-tbl th:not(:first-child) { text-align: right; }
+.plan-tbl td { padding: 8px 4px; overflow-wrap: anywhere; }
+.plan-tbl td small { display: block; font-size: 12px; }
+.plan-tbl td .err-text { display: inline; }
+.plan-tbl .neck { display: inline-block; margin-top: 3px; padding: 1px 6px; border-radius: 6px; background: var(--warn-soft); color: var(--warn); font-weight: 600; }
+.plan-acts { margin-top: 10px; }
+/* нестача під замовлення */
+a.chip { text-decoration: none; }
+.short-bar { margin-bottom: 10px; }
+.short-card.bad { border-left: 4px solid var(--err); }
+.short-head { display: flex; gap: 10px; align-items: flex-start; justify-content: space-between; }
+.short-name { font-weight: 600; overflow-wrap: anywhere; }
+.short-lack { flex: none; text-align: right; display: flex; flex-direction: column; color: var(--err); }
+.short-lack b { font-size: 20px; line-height: 1.1; }
+.short-lack small { font-size: 11px; }
+.short-lack.ok { color: var(--in); }
+.short-nums { color: var(--muted); font-size: 14px; margin: 4px 0 2px; }
+.short-nums b { color: var(--text); }
+.short-orders { margin-top: 6px; }
+.short-order { display: grid; grid-template-columns: 1fr auto; gap: 0 10px; padding: 7px 0; border-top: 1px dashed var(--line); color: var(--text); font-size: 14px; }
+.short-order .so-title { overflow-wrap: anywhere; color: var(--accent); }
+.short-order .no { color: var(--muted); font-weight: 500; margin-right: 6px; }
+.short-order .so-need { text-align: right; white-space: nowrap; }
+.short-order .so-need .err-text { font-size: 12px; }
+.short-order em { grid-column: 1 / -1; font-style: normal; font-size: 12px; color: var(--muted); }
+.short-order em.soon { color: var(--warn); font-weight: 600; }
+.short-hidden { margin-top: 6px; }
+.short-link { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; padding: 8px 12px; margin-bottom: 10px; border-radius: var(--radius); border: 1px solid var(--line); background: var(--card); color: var(--muted); font-size: 13px; }
+.short-link.bad { border-color: var(--err); background: var(--out-soft); color: var(--err); font-size: 14px; }
+.short-link.bad span { color: var(--text); font-size: 13px; }
+/* «Додати комплект» у замовленні */
+.kit-add { display: flex; gap: 8px; align-items: flex-end; margin-bottom: 4px; }
+.kit-add-n { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--muted); flex: none; }
+.kit-add-n input { width: 96px; }
+.kit-add select { flex: 1; min-width: 0; }
+.kit-add-hint { margin: 0 0 8px; }
 
 /* ---------- замовлення ---------- */
 .nav a { position: relative; }
