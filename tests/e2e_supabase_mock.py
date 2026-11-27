@@ -22,6 +22,10 @@ rpc/set_nav_order з p_ids; без мережі в чергу не ставит�
 функцій ship_order …) замовлення відкриваються й передаються, як раніше, а спроба видати дає
 «Оновіть базу (schema.sql)»; на новій — ship_order / close_order_debt / cancel_order_shipment
 викликаються з тими параметрами, що оголошені в schema.sql; без мережі видача в чергу не ставиться.
+
+«Мій відділ»: на базі зі СТАРОЮ схемою (у замовлень немає dept_path / origin_department_id) вкладка
+працює, як раніше, — лише те, що зараз чекає на відділ; на новій — передане далі замовлення лишається
+в списку з підписом, де воно зараз, а людина без orders.all бачить його картку лише для перегляду.
 """
 import base64
 import datetime
@@ -75,6 +79,8 @@ def main() -> int:
     db = {"new_schema": False, "category_order": [], "owner": "absent", "nav": False, "nav_order": []}
     # ship: чи є в базі видачі замовнику й борги (order_shipments, order_debts_left, ship_order …)
     db.update(ship=False, orders=[], shipments=[], debts=[])
+    # my_dep: відділ користувача в профілі; perms: що віддає my_perms; deps2: другий відділ у списку
+    db.update(my_dep=None, perms=["admin"], deps2=False)
 
     def no_fn(route, fn, arg):  # так PostgREST відповідає про функцію, якої немає в базі
         return route.fulfill(status=404, json={
@@ -176,9 +182,10 @@ def main() -> int:
         if path.startswith(("/rest/v1/kits", "/rest/v1/operations")):
             return route.fulfill(json=[])
         if path.startswith("/rest/v1/departments"):
-            return route.fulfill(json=[{"id": "dddddddd-0000-0000-0000-000000000001", "name": "Тестування"}])
+            return route.fulfill(json=[{"id": "dddddddd-0000-0000-0000-000000000001", "name": "Тестування"}]
+                                 + ([{"id": "dddddddd-0000-0000-0000-000000000002", "name": "Виробництво"}] if db["deps2"] else []))
         if path.startswith("/rest/v1/rpc/my_perms"):
-            return route.fulfill(json=["admin"])
+            return route.fulfill(json=db["perms"])
         if path.startswith("/rest/v1/rpc/owner_id"):
             if db["owner"] == "absent":
                 return route.fulfill(status=404, json={
@@ -197,7 +204,7 @@ def main() -> int:
         if path.startswith("/rest/v1/rpc/purge_trash"):
             return route.fulfill(json=[])
         if path.startswith("/rest/v1/profiles"):
-            return route.fulfill(json=[{"id": UID, "display_name": "ivan", "department_id": None},
+            return route.fulfill(json=[{"id": UID, "display_name": "ivan", "department_id": db["my_dep"]},
                                        {"id": OTHER, "display_name": "olena", "department_id": None}])
         if path.startswith("/rest/v1/items") and req.method == "POST":
             row = json.loads(req.post_data)
@@ -575,6 +582,72 @@ def main() -> int:
         assert rpc_calls("cancel_order_shipment") == [{"p_id": db["shipments"][0]["id"]}], rpc_calls("cancel_order_shipment")
         expect(page.locator("#debts")).to_have_count(0)
         assert page.locator(".toast.err").count() == 0 or "Оновіть" not in page.locator(".toast.err").last.inner_text()
+        # ---------- «Мій відділ» ----------
+        TEST, PROD = "dddddddd-0000-0000-0000-000000000001", "dddddddd-0000-0000-0000-000000000002"
+        order = db["orders"][0]
+        db.update(deps2=True, my_dep=PROD)
+        order.update(status="in_work", department_id=PROD)
+        assert "dept_path" not in order and "origin_department_id" not in order   # стара схема: колонок немає
+
+        def my_dep_tab():
+            page.goto(url + "#/orders")
+            reload()
+            page.locator("#chips [data-f=mine]").click()
+
+        # стара схема, замовлення чекає на мій відділ: воно в списку, число на фішці й на вкладці
+        my_dep_tab()
+        expect(page.locator("#list a.order-row.waits .wait-tag")).to_have_text("чекає на вас")
+        expect(page.locator("#chips [data-f=mine]")).to_have_text("Мій відділ · 1")
+        expect(page.locator(".nav-badge")).to_have_text("1")
+        # стара схема, замовлення передали далі: як раніше — «нічого не чекає» (про шлях база ще не знає), нічого не падає
+        order.update(status="testing", department_id=TEST)
+        my_dep_tab()
+        expect(page.locator("#list .empty-state")).to_have_text("На ваш відділ зараз нічого не чекає")
+        expect(page.locator("#list a.order-row")).to_have_count(0)
+        expect(page.locator("#chips [data-f=mine]")).to_have_text("Мій відділ")
+        expect(page.locator(".nav-badge")).to_be_hidden()
+        page.locator("#chips [data-f=active]").click()
+        expect(page.locator("#list a.order-row")).to_have_count(1)
+        assert not errors, errors
+        # нова схема: база віддає причетні відділи — передане далі замовлення лишається в «Мій відділ»
+        order.update(origin_department_id=PROD, dept_path=[PROD, TEST])
+        my_dep_tab()
+        expect(page.locator("#list .empty-state")).to_have_count(0)
+        expect(page.locator("#mine-none")).to_have_text("На ваш відділ зараз нічого не чекає")
+        expect(page.locator("#list a.order-row .now-at")).to_have_text("зараз: Тестування")
+        expect(page.locator("#chips [data-f=mine]")).to_have_text("Мій відділ")     # число — лише те, що чекає
+        expect(page.locator(".nav-badge")).to_be_hidden()
+        # непричетний відділ (шлях без мого) — у «Мій відділ» його немає
+        order.update(origin_department_id=TEST, dept_path=[TEST])
+        my_dep_tab()
+        expect(page.locator("#list a.order-row")).to_have_count(0)
+        expect(page.locator("#list .empty-state")).to_have_text("Відкритих замовлень вашого відділу немає")
+        # людина без orders.all: картка переданого далі замовлення — лише перегляд, запитів на зміну немає
+        order.update(origin_department_id=PROD, dept_path=[PROD, TEST])
+        db["perms"] = ["stock.view", "ops.view", "ops.edit", "orders.view", "orders.edit", "orders.delete"]
+        my_dep_tab()
+        n_calls = len(calls)
+        page.locator("#list a.order-row").click()
+        expect(page.locator("#view-only")).to_contain_text("зараз у відділі «Тестування»")
+        expect(page.locator("#acts button")).to_have_count(0)
+        expect(page.locator("#top a[href^='#/order-edit/']")).to_have_count(0)
+        expect(page.locator("#addtask, #cmt, #ship [data-shipbtn], #parts a.btn.out")).to_have_count(0)
+        expect(page.locator("#parts table")).to_be_visible()
+        assert not [c for c in calls[n_calls:] if c[0] != "GET" and "/rpc/" not in c[1]], calls[n_calls:]   # нічого не пишемо
+        # те саме замовлення повернули в мій відділ — дії на місці
+        order.update(status="rework", department_id=PROD)
+        my_dep_tab()
+        expect(page.locator("#chips [data-f=mine]")).to_have_text("Мій відділ · 1")
+        page.locator("#list a.order-row.waits").click()
+        expect(page.locator("#view-only")).to_have_count(0)
+        expect(page.locator("#acts [data-to=testing]")).to_have_count(1)
+        db.update(perms=["admin"], my_dep=None)
+        # колонки, на які спирається клієнт, є в schema.sql, і клієнт їх не пише
+        assert re.search(r"add column dept_path uuid\[\]", sql) and "origin_department_id uuid references public.departments" in sql
+        assert "function public.can_view_order_id(p_order uuid)" in sql
+        assert "dept_path" not in re.search(r"grant insert \((.*?)\) on public\.orders", sql).group(1)
+        assert "dept_path" not in re.search(r"grant update \((.*?)\) on public\.orders", sql).group(1)
+
         # імена параметрів у api.js збігаються з SQL
         for fn in ("ship_order", "cancel_order_shipment", "close_order_debt"):
             sig5 = re.search(rf"function public\.{fn}\((.*?)\)\s*returns", sql, re.S).group(1)

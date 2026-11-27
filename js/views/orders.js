@@ -8,7 +8,7 @@ import {
 import {
   state, go, reloadData, itemPicker, comboInput, userName, depName, myDepartment, ACTIVE_ORDER, ICON_PLUS, ICON_SCAN,
   trashRow, bindTrash, TRASH_EMPTY, can, isOverdue, isDueSoon, dueText, reservedOf, freeQty, resolveCode, shortItems,
-  shippedQty, shipLeft, openDebts, hasDebt,
+  shippedQty, shipLeft, openDebts, hasDebt, involvesDep, hasDeptPath, canActOrder,
 } from '../core.js';
 import { scanCode } from '../scanner.js';
 import { printOrder, printUnitLabels } from '../print.js';
@@ -21,8 +21,13 @@ const isActive = (o) => ACTIVE_ORDER.includes(o.status);
 // ------------------------------------------------------------------
 // Список
 // ------------------------------------------------------------------
+// чекає на мій відділ просто зараз — це число на фішці й на вкладці «Замовлення»
+const waitsOnMe = (o) => isActive(o) && !!myDepartment() && o.department_id === myDepartment();
+// «Мій відділ»: усе відкрите (активне або відвантажене з боргом), що відділ створив або що через нього
+// проходило, хоч би де воно було зараз. На базі без dept_path — лише те, що чекає на відділ, як раніше.
+const inMyDep = (o) => (hasDeptPath(o) ? (isActive(o) || hasDebt(o)) && involvesDep(o, myDepartment()) : waitsOnMe(o));
 const FILTERS = [
-  ['mine', 'Мій відділ', (o) => isActive(o) && o.department_id === myDepartment()],
+  ['mine', 'Мій відділ', inMyDep],
   ['active', 'Усі активні', isActive],
   ['overdue', 'Прострочені', isOverdue],
   // борг перед замовником: видано неповним комплектом — тут і вже відвантажені, доки не довидано
@@ -34,18 +39,22 @@ const FILTERS = [
 ];
 const ui = { q: '', f: null };
 
-function orderRow(o) {
+function orderRow(o, mineTab = false) {
   const n = doneCount(o);
   const t = o.tasks.length;
   const dueCls = isOverdue(o) ? 'overdue' : isDueSoon(o) ? 'soon' : 'due';
   const shipped = shippedQty(o);
   // «видано 20/55» — лише поки замовлення відкрите і щось уже видано; борг — завжди, доки не довидано
   const ship = shipped > 0 && isActive(o) ? `<span class="ship-n" title="Видано замовнику">видано ${fmtQty(shipped)}/${fmtQty(o.qty)}</span>` : '';
+  // у «Мій відділ»: що чекає на нас — з позначкою; решта — з підписом, де воно зараз
+  const waits = mineTab && waitsOnMe(o);
+  const where = !mineTab ? esc(depName(o.department_id))
+    : waits ? '<span class="tag wait-tag">чекає на вас</span>' : `<span class="now-at">зараз: ${esc(depName(o.department_id))}</span>`;
   const debt = hasDebt(o) ? '<span class="tag debt-tag" title="Замовнику видано неповним комплектом — є що довидати">борг</span>' : '';
-  return `<a class="row order-row${isOverdue(o) ? ' is-overdue' : ''}" href="#/order/${o.id}">
+  return `<a class="row order-row${isOverdue(o) ? ' is-overdue' : ''}${waits ? ' waits' : ''}" href="#/order/${o.id}">
     <div class="row-main">
       <div class="row-title"><span class="no">№${o.number}</span>${esc(o.title)}${o.qty !== 1 ? ` <span class="muted">× ${fmtQty(o.qty)}</span>` : ''}</div>
-      <div class="row-meta">${statusTag(o.status)}${debt}${ship}${esc(depName(o.department_id))}${o.customer ? ` · ${esc(o.customer)}` : ''}</div>
+      <div class="row-meta">${statusTag(o.status)}${debt}${ship}${where}${o.customer ? ` · ${esc(o.customer)}` : ''}</div>
     </div>
     <div class="row-qty${t && n === t ? ' ok' : ''}">
       ${t ? `<b>${n}/${t}</b><small>пунктів</small>` : ''}
@@ -73,6 +82,7 @@ export function viewOrders(ctx) {
   const mine = myDepartment();
   if (!ui.f) ui.f = mine ? 'mine' : 'active';
   const counts = Object.fromEntries(FILTERS.map(([k, , fn]) => [k, state.orders.filter(fn).length]));
+  counts.mine = state.orders.filter(waitsOnMe).length;   // на фішці — скільки ЧЕКАЄ на відділ, а не скільки в списку
   ctx.main.innerHTML = `
     <div class="toolbar"><div class="search">
       <input type="search" id="q" placeholder="Пошук: номер, виріб, замовник, серійний №" value="${esc(ui.q)}" autocomplete="off"></div></div>
@@ -129,8 +139,18 @@ export function viewOrders(ctx) {
     if (ui.f !== 'archive') {
       list.sort((a, b) => (a.due_date || '9999').localeCompare(b.due_date || '9999') || b.number - a.number);
     }
-    listEl.innerHTML = list.length ? list.map(orderRow).join('')
-      : `<div class="empty-state"><p>${words.length ? 'Нічого не знайдено' : ui.f === 'mine' ? 'На ваш відділ зараз нічого не чекає'
+    if (ui.f === 'mine' && list.length) {
+      // спершу те, що чекає на відділ зараз, далі — решта причетних (передані далі, відвантажені з боргом)
+      const wait = list.filter(waitsOnMe);
+      const rest = list.filter((o) => !waitsOnMe(o));
+      const rows = (a) => a.map((o) => orderRow(o, true)).join('');
+      listEl.innerHTML = (wait.length ? rows(wait) : words.length ? '' : '<div class="list-note" id="mine-none">На ваш відділ зараз нічого не чекає</div>')
+        + (rest.length ? `<div class="list-sep" id="mine-rest">Створені вашим відділом або проходили через нього · ${rest.length}</div>${rows(rest)}` : '');
+      return;
+    }
+    listEl.innerHTML = list.length ? list.map((o) => orderRow(o)).join('')
+      : `<div class="empty-state"><p>${words.length ? 'Нічого не знайдено'
+        : ui.f === 'mine' ? (state.orders.some(hasDeptPath) ? 'Відкритих замовлень вашого відділу немає' : 'На ваш відділ зараз нічого не чекає')
         : ui.f === 'overdue' ? 'Прострочених замовлень немає' : ui.f === 'debt' ? 'Боргів перед замовниками немає' : 'Тут порожньо'}</p></div>`;
   };
   render();
@@ -176,9 +196,14 @@ const MOVE_TITLE = {
   cancelled: 'Скасувати замовлення',
 };
 
+// Причетний відділ, який уже передав замовлення далі (і людина без orders.all), картку лише дивиться:
+// сервер дозволяє дії тільки відділу, де замовлення зараз (can_see_order у schema.sql).
+let viewOnly = false;
+const mayEdit = () => can('orders.edit') && !viewOnly;
+
 function actionButtons(o) {
-  const del = can('orders.delete') ? '<button type="button" class="btn ghost sm del-btn" data-delete>Видалити</button>' : '';
-  if (!can('orders.edit')) return `<span class="grow"></span>${del}`;
+  const del = can('orders.delete') && !viewOnly ? '<button type="button" class="btn ghost sm del-btn" data-delete>Видалити</button>' : '';
+  if (!mayEdit()) return `<span class="grow"></span>${del}`;
   const main = (ACTIONS[o.status] || []).map(([to, label, cls]) => `<button type="button" class="btn ${cls}" data-to="${to}">${label}</button>`).join('')
     + (isActive(o) && shipLeft(o) > 0 ? '<button type="button" class="btn ghost" data-shipbtn>Видати замовнику</button>' : '');
   const extra = isActive(o) ? `<span class="grow"></span>
@@ -243,7 +268,7 @@ function moveDialog({ o, to, handoff, dep, warn }) {
 }
 
 const taskRow = (t) => `<label class="task${t.done ? ' done' : ''}">
-  <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''}${can('orders.edit') ? '' : ' disabled'}>
+  <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''}${mayEdit() ? '' : ' disabled'}>
   <span class="task-text"><span class="tt">${esc(t.text)}</span>${t.done ? `<small>${esc(userName(t.done_by))}, ${fmtDate(t.done_at)}</small>` : ''}</span></label>`;
 
 function partsHtml(o, issued) {
@@ -272,7 +297,7 @@ function partsHtml(o, issued) {
     <div class="form-actions">${left
     ? `<span class="muted">${short ? `Бракує на складі: ${short} поз.` : contested ? `Є на складі, але ${contested} поз. частково зарезервовано іншими` : 'Усе потрібне є на складі'}${
       (short || contested) && can('stock.view') ? ' · <a href="#/shortage">нестача за всіма замовленнями</a>' : ''}</span><span class="grow"></span>
-       ${can('ops.edit') ? `<a class="btn out" href="#/op/out?order=${o.id}">Видати зі складу</a>` : ''}`
+       ${can('ops.edit') && !viewOnly ? `<a class="btn out" href="#/op/out?order=${o.id}">Видати зі складу</a>` : ''}`
     : '<span class="pos">Усі деталі видано</span>'}</div>`;
 }
 
@@ -281,13 +306,13 @@ function partsHtml(o, issued) {
 // ------------------------------------------------------------------
 const unitRow = (u, hi) => `<div class="unit${hi ? ' hi' : ''}" data-unit="${u.id}">
   <div class="unit-sn"><b>${esc(u.serial)}</b>${u.shipment_id ? '<small class="pos">видано замовнику</small>' : ''}${u.note ? `<small class="muted">${esc(u.note)}</small>` : ''}</div>
-  <label class="unit-chk" title="Зібрано"><input type="checkbox" data-k="assembled" ${u.assembled ? 'checked' : ''}${can('orders.edit') ? '' : ' disabled'}>
+  <label class="unit-chk" title="Зібрано"><input type="checkbox" data-k="assembled" ${u.assembled ? 'checked' : ''}${mayEdit() ? '' : ' disabled'}>
     <span>Зібрано${u.assembled ? `<small>${esc(userName(u.assembled_by))} ${fmtDate(u.assembled_at, false)}</small>` : ''}</span></label>
-  <label class="unit-chk" title="Протестовано"><input type="checkbox" data-k="tested" ${u.tested ? 'checked' : ''}${can('orders.edit') ? '' : ' disabled'}>
+  <label class="unit-chk" title="Протестовано"><input type="checkbox" data-k="tested" ${u.tested ? 'checked' : ''}${mayEdit() ? '' : ' disabled'}>
     <span>Тест${u.tested ? `<small>${esc(userName(u.tested_by))} ${fmtDate(u.tested_at, false)}</small>` : ''}</span></label>
   <div class="unit-acts">
     <button type="button" class="icon-btn" data-ulabel title="Етикетка" aria-label="Етикетка">${ICON_QR}</button>
-    ${can('orders.edit') ? `<button type="button" class="icon-btn" data-uedit title="Змінити номер / примітку" aria-label="Змінити">✎</button>
+    ${mayEdit() ? `<button type="button" class="icon-btn" data-uedit title="Змінити номер / примітку" aria-label="Змінити">✎</button>
     <button type="button" class="icon-btn" data-udel title="Прибрати" aria-label="Прибрати">✕</button>` : ''}
   </div></div>`;
 const ICON_QR = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z"/></svg>';
@@ -298,12 +323,12 @@ function unitsHtml(o, hiId) {
   return `<h3>Вироби ${o.units.length ? `<span class="count${done === o.units.length ? ' pos' : ''}">${done} з ${o.units.length} протестовано</span>` : ''}</h3>
     <div class="card" id="units">
       ${o.units.length ? `<div class="units">${o.units.map((u) => unitRow(u, u.id === hiId)).join('')}</div>`
-    : `<p class="muted">Серійних номерів ще немає.${can('orders.edit') ? ` Створіть їх — по одному на кожен із ${fmtQty(o.qty)} виробів: номер друкується на QR-етикетці, а скан етикетки відкриває це замовлення.` : ''}</p>`}
+    : `<p class="muted">Серійних номерів ще немає.${mayEdit() ? ` Створіть їх — по одному на кожен із ${fmtQty(o.qty)} виробів: номер друкується на QR-етикетці, а скан етикетки відкриває це замовлення.` : ''}</p>`}
       <div class="form-actions">
         ${o.units.length ? '<button type="button" class="btn ghost sm" data-ulabels>Етикетки на всі</button>' : ''}
         <span class="grow"></span>
-        ${can('orders.edit') && missing ? `<button type="button" class="btn ghost sm" data-ugen>Створити номери${o.units.length ? ` (ще ${missing})` : ` (${missing})`}</button>` : ''}
-        ${can('orders.edit') ? '<button type="button" class="btn ghost sm" data-uadd>Додати свій номер</button>' : ''}
+        ${mayEdit() && missing ? `<button type="button" class="btn ghost sm" data-ugen>Створити номери${o.units.length ? ` (ще ${missing})` : ` (${missing})`}</button>` : ''}
+        ${mayEdit() ? '<button type="button" class="btn ghost sm" data-uadd>Додати свій номер</button>' : ''}
       </div>
     </div>`;
 }
@@ -346,7 +371,7 @@ function shipRow(o, s) {
       ${s.auto ? '<small class="muted">залишок, записаний при переведенні у «Відвантажено»</small>' : ''}
       ${lack ? `<small class="warn-text">неповним комплектом, бракувало: ${lack}</small>` : ''}
       ${s.comment ? `<small class="muted">${esc(s.comment)}</small>` : ''}</div>
-    ${can('orders.edit') ? '<button type="button" class="link-btn" data-scancel>Скасувати</button>' : ''}</div>`;
+    ${mayEdit() ? '<button type="button" class="link-btn" data-scancel>Скасувати</button>' : ''}</div>`;
 }
 
 function debtRow(d) {
@@ -360,7 +385,7 @@ function debtRow(d) {
   return `<div class="debt" data-debt="${d.id}"><div class="debt-name"><a href="#/item/${d.item_id}">${esc(it?.name || '?')}</a>
       <small>винні <b data-c="left">${fmtQty(d.left_qty)}</b> ${u}${d.closed_qty > 0 ? ` з ${fmtQty(d.qty)} (довидано ${fmtQty(d.closed_qty)})` : ''}
         · на складі <span data-c="have" class="${have < d.left_qty ? 'err-text-inline' : ''}">${fmtQty(have)}</span></small></div>
-    ${can('orders.edit') && can('ops.edit') ? '<button type="button" class="btn out sm" data-dclose>Довидати</button>' : ''}</div>`;
+    ${mayEdit() && can('ops.edit') ? '<button type="button" class="btn out sm" data-dclose>Довидати</button>' : ''}</div>`;
 }
 
 function shipHtml(o) {
@@ -380,7 +405,7 @@ function shipHtml(o) {
         ${debts.map(debtRow).join('')}</div>` : ''}
       ${o.shipments.length ? `<div class="section-title">Що вже видано</div>
         <div class="ship-list" id="ship-list">${o.shipments.slice().reverse().map((s) => shipRow(o, s)).join('')}</div>` : ''}
-      ${can('orders.edit') && !closed && left > 0 ? `<div class="form-actions"><span class="muted small">Можна видавати частинами — статус замовлення не зміниться, доки не видано все.</span>
+      ${mayEdit() && !closed && left > 0 ? `<div class="form-actions"><span class="muted small">Можна видавати частинами — статус замовлення не зміниться, доки не видано все.</span>
         <span class="grow"></span><button type="button" class="btn primary" data-shipbtn>Видати замовнику</button></div>` : ''}
     </div>`;
 }
@@ -547,10 +572,11 @@ function eventHtml(e) {
 export async function viewOrder(ctx, id, query) {
   const o = findOrder(id);
   if (!o) { ctx.notFound(); return; }
+  viewOnly = !canActOrder(o);
   const hiUnit = query?.get('unit') || null;
   ctx.header({
     title: `№${o.number} · ${o.title}`, back: '#/orders',
-    actions: `<button class="btn ghost sm" id="oprint">Друк</button>${can('orders.edit') ? `<a class="btn ghost sm" href="#/order-edit/${id}">Редагувати</a>` : ''}`,
+    actions: `<button class="btn ghost sm" id="oprint">Друк</button>${mayEdit() ? `<a class="btn ghost sm" href="#/order-edit/${id}">Редагувати</a>` : ''}`,
   });
   const n = doneCount(o);
   const mineHere = isActive(o) && o.department_id && o.department_id === myDepartment();
@@ -563,6 +589,7 @@ export async function viewOrder(ctx, id, query) {
         ${mineHere ? '<span class="badge warn">чекає на ваш відділ</span>' : ''}
         ${isOverdue(o) ? `<span class="badge danger">${dueText(o)}</span>` : isDueSoon(o) ? `<span class="badge warn">термін ${dueText(o)}</span>` : ''}
         ${hasDebt(o) ? '<span class="badge danger" id="debt-badge">є борг перед замовником</span>' : ''}</div>
+      ${viewOnly ? `<p class="muted small" id="view-only">Замовлення зараз у відділі «${esc(depName(o.department_id))}». Ви бачите його, бо ваш відділ його створив або воно через нього проходило; змінювати й передавати далі може відділ, де воно зараз.</p>` : ''}
       <dl class="props">
         <dt>Замовник</dt><dd>${esc(o.customer) || '—'}</dd>
         <dt>Кількість</dt><dd>${fmtQty(o.qty)}</dd>
@@ -571,7 +598,7 @@ export async function viewOrder(ctx, id, query) {
         <dt>Прийняв</dt><dd>${esc(userName(o.created_by))}, ${fmtDate(o.created_at)}</dd>
       </dl>
       <div class="section-title">Опис продукту</div>
-      ${o.description ? `<p class="note">${esc(o.description)}</p>` : `<p class="muted">Не заповнено${can('orders.edit') ? ` — <a href="#/order-edit/${id}">додати опис</a>` : ''}</p>`}
+      ${o.description ? `<p class="note">${esc(o.description)}</p>` : `<p class="muted">Не заповнено${mayEdit() ? ` — <a href="#/order-edit/${id}">додати опис</a>` : ''}</p>`}
       <div class="order-actions" id="acts">${actionButtons(o)}</div>
     </div>
 
@@ -579,13 +606,13 @@ export async function viewOrder(ctx, id, query) {
     <div class="card">
       ${o.tasks.length ? `<div class="progress"><i style="width:${Math.round((100 * n) / o.tasks.length)}%"></i></div>` : ''}
       <div class="tasks" id="tasks">${o.tasks.map(taskRow).join('') || '<div class="muted pad">Пунктів ще немає</div>'}</div>
-      ${can('orders.edit') ? `<form class="add-task" id="addtask" autocomplete="off">
+      ${mayEdit() ? `<form class="add-task" id="addtask" autocomplete="off">
         <input name="t" placeholder="Додати пункт…"><button class="btn ghost sm">Додати</button></form>` : ''}
     </div>
 
     <h3>Деталі зі складу</h3>
     <div class="card" id="parts">${o.parts.length ? '<div class="muted">Завантаження…</div>'
-      : `<p class="muted">Деталі не вказані.${can('orders.edit') ? ` <a href="#/order-edit/${id}">Додати</a> — тоді буде видно, чого бракує на складі, деталі зарезервуються, а видача спишеться під це замовлення.` : ''}</p>`}</div>
+      : `<p class="muted">Деталі не вказані.${mayEdit() ? ` <a href="#/order-edit/${id}">Додати</a> — тоді буде видно, чого бракує на складі, деталі зарезервуються, а видача спишеться під це замовлення.` : ''}</p>`}</div>
 
     ${unitsHtml(o, hiUnit)}
 
@@ -593,7 +620,7 @@ export async function viewOrder(ctx, id, query) {
 
     <h3>Історія</h3>
     <div class="card">
-      ${can('orders.edit') ? `<form class="comment-form" id="cmt" autocomplete="off">
+      ${mayEdit() ? `<form class="comment-form" id="cmt" autocomplete="off">
         <textarea name="t" rows="2" placeholder="Коментар до замовлення…"></textarea>
         <div class="form-actions"><span class="grow"></span><button class="btn ghost sm">Додати коментар</button></div>
       </form>` : ''}
@@ -798,6 +825,7 @@ export function viewOrderEdit(ctx, id) {
     ? { title: '', customer: '', qty: 1, due_date: '', description: '', department_id: myDepartment() || state.departments[0]?.id || null, tasks: [], parts: [] }
     : findOrder(id);
   if (!o) { ctx.notFound(); return; }
+  if (!isNew && !canActOrder(o)) { go(`#/order/${id}`); return; }   // чуже зараз замовлення — лише перегляд
   const back = isNew ? '#/orders' : `#/order/${id}`;
   ctx.header({ title: isNew ? 'Нове замовлення' : `Редагування №${o.number}`, back });
   const tasks = o.tasks.map((t) => ({ id: t.id, text: t.text, done: t.done }));

@@ -188,6 +188,53 @@ alter table public.order_events drop constraint if exists order_events_kind_chec
 alter table public.order_events add constraint order_events_kind_check
   check (kind in ('created', 'move', 'comment', 'ship', 'ship_cancel', 'debt'));
 
+-- ---------------------------------------------------------------------
+--  Причетні відділи. «Мій відділ» і видимість без orders.all — це замовлення,
+--  які відділ створив або які через нього проходили, хоч би де вони були зараз.
+--    origin_department_id — відділ, що створив: відділ автора НА МОМЕНТ створення
+--                           (автор без відділу — відділ, куди замовлення прийняли)
+--    dept_path            — усі причетні відділи: той, що створив, і кожен, де
+--                           замовлення побувало (поповнює тригер orders_path)
+--  Клієнт цих колонок не пише (немає прав на колонки) — лише тригер.
+--  Наявні замовлення заповнюються один раз, коли колонки зʼявляються: шлях — з
+--  історії (order_events: прийом і кожна передача) плюс поточний відділ; відділ,
+--  що створив, — той, куди замовлення прийняли (подія «created»). Якщо цього в
+--  історії немає — нинішній відділ автора: це наближення, бо відділ автора на
+--  час створення раніше не записувався. updated_at при цьому не змінюється.
+-- ---------------------------------------------------------------------
+do $$
+begin
+  if not exists (select 1 from information_schema.columns
+                  where table_schema = 'public' and table_name = 'orders' and column_name = 'dept_path') then
+    alter table public.orders
+      add column if not exists origin_department_id uuid references public.departments(id) on delete set null,
+      add column dept_path uuid[] not null default '{}';
+    alter table public.orders disable trigger user;
+    update public.orders o
+       set origin_department_id = s.origin,
+           dept_path = array(select q.d
+                               from (select u.d, min(u.k) as k
+                                       from unnest(array[s.origin] || s.evs || array[o.department_id]) with ordinality u(d, k)
+                                      where u.d is not null
+                                      group by u.d) q
+                              order by q.k)
+      from (select o2.id,
+                   coalesce((select e.to_department from public.order_events e
+                              where e.order_id = o2.id and e.kind = 'created' order by e.id limit 1),
+                            (select p.department_id from public.profiles p where p.id = o2.created_by),
+                            o2.department_id) as origin,
+                   array(select t.d
+                           from public.order_events e
+                          cross join lateral unnest(array[e.from_department, e.to_department]) with ordinality t(d, n)
+                          where e.order_id = o2.id and e.kind in ('created', 'move')
+                          order by e.id, t.n) as evs
+              from public.orders o2) s
+     where s.id = o.id;
+    alter table public.orders enable trigger user;
+  end if;
+end $$;
+create index if not exists orders_path_idx on public.orders using gin (dept_path);
+
 -- видача зі складу під конкретне замовлення
 alter table public.operations
   add column if not exists order_id uuid references public.orders(id) on delete set null;
@@ -1046,6 +1093,26 @@ drop trigger if exists orders_created on public.orders;
 create trigger orders_created after insert on public.orders
   for each row execute function public.order_created();
 
+-- причетні відділи: хто створив (відділ автора на цю мить) і де замовлення побувало
+create or replace function public.order_path()
+returns trigger language plpgsql set search_path = public as $$
+declare d uuid;
+begin
+  new.dept_path := coalesce(new.dept_path, '{}');
+  if tg_op = 'INSERT' then
+    new.origin_department_id := coalesce(new.origin_department_id, public.my_department(), new.department_id);
+    foreach d in array array[new.origin_department_id, new.department_id] loop
+      if d is not null and not (d = any(new.dept_path)) then new.dept_path := new.dept_path || d; end if;
+    end loop;
+  elsif new.department_id is not null and not (new.department_id = any(new.dept_path)) then
+    new.dept_path := new.dept_path || new.department_id;
+  end if;
+  return new;
+end $$;
+drop trigger if exists orders_path on public.orders;
+create trigger orders_path before insert or update of department_id on public.orders
+  for each row execute function public.order_path();
+
 -- хто й коли відмітив пункт чекліста — ставить сервер, а не клієнт
 create or replace function public.order_task_done()
 returns trigger language plpgsql as $$
@@ -1526,7 +1593,8 @@ returns uuid language sql stable security definer set search_path = public as $$
   select department_id from public.profiles where id = auth.uid()
 $$;
 
--- чи бачить людина замовлення, що лежить у відділі p_dep
+-- ДІЇ із замовленням (передати, видати, змінити чекліст/деталі/вироби, коментар, кошик):
+-- лише той, у чиєму відділі воно лежить ЗАРАЗ (p_dep), або людина з orders.all
 create or replace function public.can_see_order(p_dep uuid)
 returns boolean language sql stable security definer set search_path = public as $$
   select public.has_perm('orders.view')
@@ -1536,6 +1604,17 @@ $$;
 create or replace function public.can_see_order_id(p_order uuid)
 returns boolean language sql stable security definer set search_path = public as $$
   select coalesce((select public.can_see_order(department_id) from public.orders where id = p_order), false)
+$$;
+
+-- ПЕРЕГЛЯД замовлення і всього, що до нього належить: воно зараз у відділі людини,
+-- або її відділ його створив чи воно через нього проходило (dept_path), або є orders.all
+create or replace function public.can_view_order_id(p_order uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.has_perm('orders.view')
+     and coalesce((select public.has_perm('orders.all')
+                       or o.department_id is not distinct from public.my_department()
+                       or public.my_department() = any(o.dept_path)
+                     from public.orders o where o.id = p_order), false)
 $$;
 
 create or replace function public.perm_label(p_perm text)
@@ -1752,7 +1831,8 @@ end $$;
 --  Доступ за правами (has_perm). Анонім і заблокований не бачать нічого.
 --  Читати довідники (позиції, залишки, журнал) може кожен активний — назви
 --  потрібні всюди; розділи без права перегляду застосунок просто не показує.
---  Замовлення — лише свого відділу, якщо немає orders.all.
+--  Замовлення без orders.all: бачить — свого відділу (зараз у ньому, створені ним
+--  або ті, що через нього проходили); змінює — лише ті, що зараз у ньому.
 -- ---------------------------------------------------------------------
 alter table public.profiles       enable row level security;
 alter table public.items          enable row level security;
@@ -1831,7 +1911,8 @@ drop policy if exists orders_insert on public.orders;
 drop policy if exists orders_update on public.orders;
 create policy orders_read on public.orders for select to authenticated
   using ((select public.has_perm('orders.view'))
-         and ((select public.has_perm('orders.all')) or department_id is not distinct from (select public.my_department())));
+         and ((select public.has_perm('orders.all')) or department_id is not distinct from (select public.my_department())
+              or (select public.my_department()) = any(dept_path)));
 create policy orders_insert on public.orders for insert to authenticated
   with check (created_by = auth.uid() and (select public.has_perm('orders.edit'))
               and ((select public.has_perm('orders.all')) or department_id is not distinct from (select public.my_department())));
@@ -1843,7 +1924,7 @@ create policy orders_update on public.orders for update to authenticated
 drop policy if exists order_tasks_all   on public.order_tasks;
 drop policy if exists order_tasks_read  on public.order_tasks;
 drop policy if exists order_tasks_write on public.order_tasks;
-create policy order_tasks_read  on public.order_tasks for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_tasks_read  on public.order_tasks for select to authenticated using (public.can_view_order_id(order_id));
 create policy order_tasks_write on public.order_tasks for all to authenticated
   using ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id))
   with check ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id));
@@ -1851,7 +1932,7 @@ create policy order_tasks_write on public.order_tasks for all to authenticated
 drop policy if exists order_parts_all   on public.order_parts;
 drop policy if exists order_parts_read  on public.order_parts;
 drop policy if exists order_parts_write on public.order_parts;
-create policy order_parts_read  on public.order_parts for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_parts_read  on public.order_parts for select to authenticated using (public.can_view_order_id(order_id));
 create policy order_parts_write on public.order_parts for all to authenticated
   using ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id))
   with check ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id));
@@ -1860,7 +1941,7 @@ create policy order_parts_write on public.order_parts for all to authenticated
 alter table public.order_units enable row level security;
 drop policy if exists order_units_read  on public.order_units;
 drop policy if exists order_units_write on public.order_units;
-create policy order_units_read  on public.order_units for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_units_read  on public.order_units for select to authenticated using (public.can_view_order_id(order_id));
 create policy order_units_write on public.order_units for all to authenticated
   using ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id))
   with check ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id));
@@ -1871,8 +1952,8 @@ alter table public.order_shipments enable row level security;
 alter table public.order_debts     enable row level security;
 drop policy if exists order_shipments_read on public.order_shipments;
 drop policy if exists order_debts_read     on public.order_debts;
-create policy order_shipments_read on public.order_shipments for select to authenticated using (public.can_see_order_id(order_id));
-create policy order_debts_read     on public.order_debts     for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_shipments_read on public.order_shipments for select to authenticated using (public.can_view_order_id(order_id));
+create policy order_debts_read     on public.order_debts     for select to authenticated using (public.can_view_order_id(order_id));
 
 -- налаштування: несекретні поля читає кожен активний (шапка документів), змінює — лише адміністратор через функції
 alter table public.app_settings enable row level security;
@@ -1882,7 +1963,7 @@ create policy app_settings_read on public.app_settings for select to authenticat
 -- історію напряму можна лише доповнити власним коментарем; передачі пише move_order
 drop policy if exists order_events_read    on public.order_events;
 drop policy if exists order_events_comment on public.order_events;
-create policy order_events_read    on public.order_events for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_events_read    on public.order_events for select to authenticated using (public.can_view_order_id(order_id));
 create policy order_events_comment on public.order_events for insert to authenticated
   with check (kind = 'comment' and created_by = auth.uid() and length(trim(text)) > 0
               and (select public.has_perm('orders.edit')) and public.can_see_order_id(order_id));
@@ -1993,6 +2074,7 @@ revoke execute on function public.is_active() from public, anon;
 revoke execute on function public.my_department() from public, anon;
 revoke execute on function public.can_see_order(uuid) from public, anon;
 revoke execute on function public.can_see_order_id(uuid) from public, anon;
+revoke execute on function public.can_view_order_id(uuid) from public, anon;
 revoke execute on function public.require(text) from public, anon;
 revoke execute on function public.admin_users() from public, anon;
 revoke execute on function public.admin_create_user(text, text, text, uuid, uuid) from public, anon;
@@ -2009,6 +2091,7 @@ grant  execute on function public.is_active() to authenticated;
 grant  execute on function public.my_department() to authenticated;
 grant  execute on function public.can_see_order(uuid) to authenticated;
 grant  execute on function public.can_see_order_id(uuid) to authenticated;
+grant  execute on function public.can_view_order_id(uuid) to authenticated;
 grant  execute on function public.require(text) to authenticated;
 grant  execute on function public.admin_users() to authenticated;
 grant  execute on function public.admin_create_user(text, text, text, uuid, uuid) to authenticated;

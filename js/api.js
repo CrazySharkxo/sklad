@@ -547,6 +547,17 @@ class LocalApi {
       d.profileDeps = d.profileDeps || {};
       try { this.save(d); } catch { /* переповнене сховище — побачимо при наступному записі */ }
     }
+    // причетні відділи (orders.dept_path / origin_department_id у schema.sql): у демо-даних, збережених
+    // до їх появи, відновлюємо з історії — як заповнення наявних замовлень у schema.sql
+    if (d.orders.some((o) => !Array.isArray(o.dept_path))) {
+      for (const o of d.orders.filter((x) => !Array.isArray(x.dept_path))) {
+        const evs = d.order_events.filter((e) => e.order_id === o.id && (e.kind === 'created' || e.kind === 'move'));
+        o.origin_department_id = evs.find((e) => e.kind === 'created')?.to_department || d.profileDeps[o.created_by] || o.department_id || null;
+        o.dept_path = [...new Set([o.origin_department_id, ...evs.flatMap((e) => [e.from_department, e.to_department]), o.department_id])]
+          .filter((id) => id && d.departments.some((x) => x.id === id));
+      }
+      try { this.save(d); } catch { /* */ }
+    }
     if (!d.order_units) {
       d.order_units = [];
       d.settings = { org_name: '', app_url: '', tg_chat: '', tg_orders: true, tg_low: true, tg_overdue: true, backup_at: null };
@@ -760,6 +771,10 @@ class LocalApi {
     if (d.orders.some((o) => o.department_id === id)) throw new Error('У відділі є замовлення — його можна лише перейменувати');
     d.departments = d.departments.filter((x) => x.id !== id);
     for (const k of Object.keys(d.profileDeps)) if (d.profileDeps[k] === id) d.profileDeps[k] = null;
+    for (const o of d.orders) {
+      if (o.origin_department_id === id) o.origin_department_id = null;
+      if (Array.isArray(o.dept_path)) o.dept_path = o.dept_path.filter((x) => x !== id);
+    }
     for (const e of d.order_events) {
       if (e.from_department === id) e.from_department = null;
       if (e.to_department === id) e.to_department = null;
@@ -834,6 +849,9 @@ class LocalApi {
       const o = { customer: '', qty: 1, due_date: null, description: '', ...row, id,
         number: d.orders.reduce((m, x) => Math.max(m, x.number), 0) + 1,
         status: 'new', department_id: order.department_id || null, created_at: now, created_by: DEMO_USER, updated_at: now };
+      // відділ, що створив, — відділ автора на цю мить (тригер orders_path у schema.sql)
+      o.origin_department_id = d.profileDeps[DEMO_USER] || o.department_id;
+      o.dept_path = [...new Set([o.origin_department_id, o.department_id])].filter(Boolean);
       d.orders.push(o);
       d.order_events.push({ id: d.order_events.length + 1, order_id: id, kind: 'created', from_status: null, to_status: 'new',
         from_department: null, to_department: o.department_id, text: '', created_at: now, created_by: DEMO_USER });
@@ -879,6 +897,7 @@ class LocalApi {
     }
     this.pushEvent(d, id, 'move', txt, { from_status: o.status, to_status: status, from_department: o.department_id, to_department: dep });
     Object.assign(o, { status, department_id: dep, updated_at: now });
+    if (dep && !(o.dept_path || (o.dept_path = [])).includes(dep)) o.dept_path.push(dep);   // замовлення побувало ще в одному відділі
   }
 
   // ---------- видача замовнику, борги (ship_order / cancel_order_shipment / close_order_debt) ----------

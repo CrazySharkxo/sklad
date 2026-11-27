@@ -40,7 +40,8 @@ function fill({ items, kits, profiles, departments, orders, perms, roles, settin
   state.depOf = Object.fromEntries(profiles.map((p) => [p.id, p.department_id]));
   state.departments = departments;
   state.orders = orders.filter((o) => !o.deleted_at);
-  state.trashOrders = orders.filter((o) => inTrash(o.deleted_at));
+  // кошик — це дії (відновити / видалити назавжди): лише замовлення, з якими людина може діяти
+  state.trashOrders = orders.filter((o) => inTrash(o.deleted_at) && canActOrder(o));
   state.settings = settings || state.settings;
   state.loaded = true;
 }
@@ -90,7 +91,7 @@ export const PERM_SECTIONS = [
 ];
 export const PERM_ACTIONS = [['view', 'Перегляд'], ['edit', 'Зміна'], ['delete', 'Видалення']];
 export const PERM_EXTRA = [
-  ['orders.all', 'Замовлення всіх відділів', 'без цього людина бачить лише замовлення свого відділу'],
+  ['orders.all', 'Замовлення всіх відділів', 'без цього людина бачить лише замовлення свого відділу — ті, що він створив або що через нього проходили'],
   ['admin', 'Адміністратор', 'відділи, налаштування, копії — і всі інші права'],
 ];
 export const can = (p) => state.perms.has('admin') || state.perms.has(p);
@@ -156,6 +157,15 @@ export const waitingForMe = () => {
   const dep = myDepartment();
   return dep ? state.orders.filter((o) => o.department_id === dep && ACTIVE_ORDER.includes(o.status)) : [];
 };
+// причетність відділу: зараз у ньому, він створив, або замовлення через нього проходило
+// (orders.dept_path / origin_department_id у schema.sql). На базі, де цих колонок ще немає
+// (schema.sql не запускали), — лише «зараз у ньому», як було раніше.
+export const hasDeptPath = (o) => Array.isArray(o.dept_path);
+export const involvesDep = (o, dep) => !!dep && (o.department_id === dep
+  || (hasDeptPath(o) && (o.dept_path.includes(dep) || o.origin_department_id === dep)));
+// діяти із замовленням (передати, видати, змінити) може відділ, у якому воно зараз, або людина з orders.all —
+// те саме, що can_see_order у schema.sql; причетний відділ, який уже передав замовлення далі, лише дивиться
+export const canActOrder = (o) => can('orders.all') || (o.department_id || null) === (state.depOf[state.me] || null);
 export const activeItems = () => state.items.filter((i) => !i.archived);
 export const isLow = (i) => i.min_qty > 0 && i.qty < i.min_qty;
 // резерв під активні замовлення і вільний залишок

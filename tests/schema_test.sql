@@ -500,8 +500,17 @@ do $$ begin
     raise exception 'відділ змінено без orders.all';
   exception when raise_exception then assert sqlerrm = 'Відділ вам призначає адміністратор', sqlerrm;
   end;
-  -- замовлення: лише свого відділу
-  assert not exists (select 1 from public.orders where department_id is distinct from public.my_department()), 'видно чужий відділ';
+  -- замовлення: лише свого відділу — ті, що зараз у ньому, і ті, що через нього проходили
+  assert not exists (select 1 from public.orders where department_id is distinct from public.my_department()
+                        and not (public.my_department() = any(dept_path))), 'видно чужий відділ';
+  -- №1 побувало в «Тестуванні» і повернулось у «Прийом замовлень»: відділ Петра його бачить, але не змінює
+  assert (select d.name from public.orders o join public.departments d on d.id = o.department_id
+           where o.id = 'cccccccc-0000-0000-0000-000000000001') = 'Прийом замовлень', 'замовлення, що проходило через відділ, не видно';
+  begin
+    perform public.move_order('cccccccc-0000-0000-0000-000000000001', 'testing');
+    raise exception 'передано замовлення, що вже не у відділі';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
   begin
     insert into public.orders (title, department_id) values ('у чужий відділ', (select id from public.departments where name = 'Прийом замовлень'));
     raise exception 'замовлення в чужий відділ пройшло';
@@ -519,9 +528,15 @@ do $$ begin
     raise exception 'замовлення видалено без orders.delete';
   exception when raise_exception then assert sqlerrm = 'Немає права видаляти замовлення', sqlerrm;
   end;
-  -- передав у чужий відділ — далі вже не бачить і не змінює
+  -- передав у чужий відділ — далі бачить (своє ж замовлення), але вже не змінює
   perform public.move_order('cccccccc-0000-0000-0000-000000000005', 'in_work', (select id from public.departments where name = 'Прийом замовлень'));
-  assert not exists (select 1 from public.orders where id = 'cccccccc-0000-0000-0000-000000000005'), 'після передачі видно';
+  assert (select count(*) from public.orders where id = 'cccccccc-0000-0000-0000-000000000005') = 1, 'після передачі власного замовлення не видно';
+  assert (select count(*) from public.order_tasks where order_id = 'cccccccc-0000-0000-0000-000000000005') = 1
+     and (select count(*) from public.order_events where order_id = 'cccccccc-0000-0000-0000-000000000005') = 2, 'після передачі не видно чекліста чи історії';
+  update public.order_tasks set done = true where order_id = 'cccccccc-0000-0000-0000-000000000005';
+  assert not (select done from public.order_tasks where order_id = 'cccccccc-0000-0000-0000-000000000005'), 'чекліст переданого замовлення змінено';
+  update public.orders set title = 'Чуже' where id = 'cccccccc-0000-0000-0000-000000000005';
+  assert (select title from public.orders where id = 'cccccccc-0000-0000-0000-000000000005') = 'Своє', 'передане замовлення змінено';
   begin
     perform public.move_order('cccccccc-0000-0000-0000-000000000005', 'testing');
     raise exception 'передано чуже замовлення';
@@ -1626,6 +1641,249 @@ select public.purge_order('cccccccc-0000-0000-0000-000000000033');
 reset role;
 
 -- realtime підключено
+-- =====================================================================
+--  Причетні відділи: «замовлення мого відділу» — ті, що відділ створив або що
+--  через нього проходили. Перегляд — причетним, дії — лише відділу, де воно зараз.
+--  Три відділи А, Б, В; у кожному людина без orders.all.
+-- =====================================================================
+reset role;
+insert into public.departments (id, name) values
+  ('dddddddd-0000-0000-0000-00000000000a', 'ВД-А'), ('dddddddd-0000-0000-0000-00000000000b', 'ВД-Б'),
+  ('dddddddd-0000-0000-0000-00000000000c', 'ВД-В'), ('dddddddd-0000-0000-0000-00000000000d', 'ВД-Г');
+insert into auth.users (id, email) values
+  ('0000000a-0000-0000-0000-00000000000a', 'dep-a@example.com'), ('0000000b-0000-0000-0000-00000000000b', 'dep-b@example.com'),
+  ('0000000c-0000-0000-0000-00000000000c', 'dep-c@example.com');
+update public.profiles set role_id = null, active = true, perms = array['orders.view', 'orders.edit', 'orders.delete', 'ops.edit'],
+       department_id = ('dddddddd-0000-0000-0000-00000000000' || right(id::text, 1))::uuid
+ where id in ('0000000a-0000-0000-0000-00000000000a', '0000000b-0000-0000-0000-00000000000b', '0000000c-0000-0000-0000-00000000000c');
+insert into public.items (id, name) values ('aaaaaaaa-0000-0000-0000-000000000061', 'ПВ деталь');
+
+-- А створює замовлення у своєму відділі: відділ-створювач і шлях ставить сервер, клієнт їх не пише
+select set_config('request.jwt.claim.sub', '0000000a-0000-0000-0000-00000000000a', false);
+set role authenticated;
+insert into public.orders (id, title, qty, department_id) values
+  ('cccccccc-0000-0000-0000-000000000061', 'ПВ замовлення', 3, 'dddddddd-0000-0000-0000-00000000000a');
+insert into public.order_tasks (order_id, position, text) values ('cccccccc-0000-0000-0000-000000000061', 0, 'пункт');
+insert into public.order_parts (order_id, item_id, qty) values ('cccccccc-0000-0000-0000-000000000061', 'aaaaaaaa-0000-0000-0000-000000000061', 3);
+insert into public.order_units (order_id, position, serial) values ('cccccccc-0000-0000-0000-000000000061', 0, 'ПВ-01');
+do $$ begin
+  assert (select origin_department_id from public.orders where id = 'cccccccc-0000-0000-0000-000000000061') = 'dddddddd-0000-0000-0000-00000000000a', 'відділ-створювач';
+  assert (select dept_path from public.orders where id = 'cccccccc-0000-0000-0000-000000000061') = array['dddddddd-0000-0000-0000-00000000000a'::uuid], 'шлях після створення';
+  begin
+    update public.orders set dept_path = '{}' where id = 'cccccccc-0000-0000-0000-000000000061';
+    raise exception 'клієнт переписав шлях';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    update public.orders set origin_department_id = null where id = 'cccccccc-0000-0000-0000-000000000061';
+    raise exception 'клієнт переписав відділ-створювач';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    insert into public.orders (title, department_id, origin_department_id, dept_path)
+      values ('підробка', 'dddddddd-0000-0000-0000-00000000000a', 'dddddddd-0000-0000-0000-00000000000b', array['dddddddd-0000-0000-0000-00000000000b'::uuid]);
+    raise exception 'клієнт вставив замовлення з чужим шляхом';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+-- А передає на тестування у відділ Б
+select public.move_order('cccccccc-0000-0000-0000-000000000061', 'testing', 'dddddddd-0000-0000-0000-00000000000b', 'на тест');
+do $$ begin
+  -- відділ-створювач БАЧИТЬ замовлення й після передачі — разом із чеклістом, деталями, виробами, історією
+  assert (select d.name from public.orders o join public.departments d on d.id = o.department_id
+           where o.id = 'cccccccc-0000-0000-0000-000000000061') = 'ВД-Б', 'створювач не бачить переданого замовлення';
+  assert (select dept_path from public.orders where id = 'cccccccc-0000-0000-0000-000000000061')
+       = array['dddddddd-0000-0000-0000-00000000000a', 'dddddddd-0000-0000-0000-00000000000b']::uuid[], 'шлях після передачі';
+  assert (select origin_department_id from public.orders where id = 'cccccccc-0000-0000-0000-000000000061') = 'dddddddd-0000-0000-0000-00000000000a';
+  assert (select count(*) from public.order_tasks where order_id = 'cccccccc-0000-0000-0000-000000000061') = 1
+     and (select count(*) from public.order_parts where order_id = 'cccccccc-0000-0000-0000-000000000061') = 1
+     and (select count(*) from public.order_units where order_id = 'cccccccc-0000-0000-0000-000000000061') = 1
+     and (select count(*) from public.order_events where order_id = 'cccccccc-0000-0000-0000-000000000061') = 2, 'створювач не бачить вмісту переданого замовлення';
+  assert public.can_view_order_id('cccccccc-0000-0000-0000-000000000061') and not public.can_see_order_id('cccccccc-0000-0000-0000-000000000061');
+  -- а ДІЇ — як були: лише відділ, де замовлення зараз
+  begin
+    perform public.move_order('cccccccc-0000-0000-0000-000000000061', 'rework', null, 'назад');
+    raise exception 'не-поточний відділ передав замовлення';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000061', 1);
+    raise exception 'не-поточний відділ видав замовнику';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+  begin
+    perform public.delete_order('cccccccc-0000-0000-0000-000000000061');
+    raise exception 'не-поточний відділ видалив замовлення';
+  exception when raise_exception then assert sqlerrm like 'Замовлення не знайдено%', sqlerrm;
+  end;
+  begin
+    perform public.post_operation('out', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000061","qty":1}]', '', '',
+                                  null, null, 'cccccccc-0000-0000-0000-000000000061');
+    raise exception 'не-поточний відділ видав деталі під замовлення';
+  exception when raise_exception then assert sqlerrm like 'Замовлення не знайдено%', sqlerrm;
+  end;
+  update public.orders set title = 'переписано' where id = 'cccccccc-0000-0000-0000-000000000061';
+  update public.order_tasks set done = true where order_id = 'cccccccc-0000-0000-0000-000000000061';
+  update public.order_units set tested = true where order_id = 'cccccccc-0000-0000-0000-000000000061';
+  delete from public.order_parts where order_id = 'cccccccc-0000-0000-0000-000000000061';
+  delete from public.order_units where order_id = 'cccccccc-0000-0000-0000-000000000061';
+  assert (select title from public.orders where id = 'cccccccc-0000-0000-0000-000000000061') = 'ПВ замовлення'
+     and not (select done from public.order_tasks where order_id = 'cccccccc-0000-0000-0000-000000000061')
+     and not (select tested from public.order_units where order_id = 'cccccccc-0000-0000-0000-000000000061')
+     and (select count(*) from public.order_parts where order_id = 'cccccccc-0000-0000-0000-000000000061') = 1, 'не-поточний відділ змінив замовлення';
+  begin
+    insert into public.order_tasks (order_id, position, text) values ('cccccccc-0000-0000-0000-000000000061', 1, 'чужий пункт');
+    raise exception 'не-поточний відділ додав пункт';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    insert into public.order_events (order_id, kind, text) values ('cccccccc-0000-0000-0000-000000000061', 'comment', 'чужий коментар');
+    raise exception 'не-поточний відділ додав коментар';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+
+-- Б (адресат): бачить і діє — видає замовнику одну штуку неповним комплектом
+select set_config('request.jwt.claim.sub', '0000000b-0000-0000-0000-00000000000b', false);
+select public.ship_order('cccccccc-0000-0000-0000-000000000061', 1, null, 'перша',
+                         '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000061","qty":2}]');
+insert into public.order_events (order_id, kind, text) values ('cccccccc-0000-0000-0000-000000000061', 'comment', 'коментар адресата');
+do $$ begin
+  assert (select count(*) from public.orders where id = 'cccccccc-0000-0000-0000-000000000061') = 1, 'адресат не бачить';
+  assert public.can_see_order_id('cccccccc-0000-0000-0000-000000000061');
+end $$;
+-- А і далі бачить видачі й борги свого замовлення
+select set_config('request.jwt.claim.sub', '0000000a-0000-0000-0000-00000000000a', false);
+do $$ begin
+  assert (select count(*) from public.order_shipments where order_id = 'cccccccc-0000-0000-0000-000000000061') = 1
+     and (select count(*) from public.order_debts where order_id = 'cccccccc-0000-0000-0000-000000000061') = 1
+     and (select left_qty from public.order_debts_left where order_id = 'cccccccc-0000-0000-0000-000000000061') = 2, 'створювач не бачить видач і боргів';
+  begin
+    perform public.close_order_debt((select id from public.order_debts where order_id = 'cccccccc-0000-0000-0000-000000000061'), 1);
+    raise exception 'не-поточний відділ довидав борг';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+  begin
+    perform public.cancel_order_shipment((select id from public.order_shipments where order_id = 'cccccccc-0000-0000-0000-000000000061'));
+    raise exception 'не-поточний відділ скасував видачу';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+end $$;
+
+-- В (третій, непричетний відділ, без orders.all): ні замовлення, ні деталей, ні подій, ні видач, ні боргів
+select set_config('request.jwt.claim.sub', '0000000c-0000-0000-0000-00000000000c', false);
+do $$ begin
+  assert (select count(*) from public.orders where id = 'cccccccc-0000-0000-0000-000000000061') = 0, 'третій відділ бачить замовлення';
+  assert (select count(*) from public.order_tasks where order_id = 'cccccccc-0000-0000-0000-000000000061') = 0
+     and (select count(*) from public.order_parts where order_id = 'cccccccc-0000-0000-0000-000000000061') = 0
+     and (select count(*) from public.order_units where order_id = 'cccccccc-0000-0000-0000-000000000061') = 0
+     and (select count(*) from public.order_events where order_id = 'cccccccc-0000-0000-0000-000000000061') = 0
+     and (select count(*) from public.order_shipments where order_id = 'cccccccc-0000-0000-0000-000000000061') = 0
+     and (select count(*) from public.order_debts where order_id = 'cccccccc-0000-0000-0000-000000000061') = 0
+     and (select count(*) from public.order_debts_left where order_id = 'cccccccc-0000-0000-0000-000000000061') = 0, 'третій відділ бачить вміст замовлення';
+  assert not public.can_view_order_id('cccccccc-0000-0000-0000-000000000061') and not public.can_see_order_id('cccccccc-0000-0000-0000-000000000061');
+  begin
+    perform public.move_order('cccccccc-0000-0000-0000-000000000061', 'done');
+    raise exception 'третій відділ передав замовлення';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+end $$;
+
+-- Б передає далі у В: тепер бачать усі три, діє лише В
+select set_config('request.jwt.claim.sub', '0000000b-0000-0000-0000-00000000000b', false);
+select public.move_order('cccccccc-0000-0000-0000-000000000061', 'testing', 'dddddddd-0000-0000-0000-00000000000c', 'далі');
+do $$ begin
+  assert (select dept_path from public.orders where id = 'cccccccc-0000-0000-0000-000000000061')
+       = array['dddddddd-0000-0000-0000-00000000000a', 'dddddddd-0000-0000-0000-00000000000b', 'dddddddd-0000-0000-0000-00000000000c']::uuid[], 'шлях після другої передачі';
+  assert public.can_view_order_id('cccccccc-0000-0000-0000-000000000061') and not public.can_see_order_id('cccccccc-0000-0000-0000-000000000061');
+end $$;
+select set_config('request.jwt.claim.sub', '0000000c-0000-0000-0000-00000000000c', false);
+select public.move_order('cccccccc-0000-0000-0000-000000000061', 'rework', 'dddddddd-0000-0000-0000-00000000000b', 'назад у Б');
+do $$ begin
+  -- повернення у відділ, де вже було: шлях не дублюється; В лишається причетним
+  assert (select cardinality(dept_path) from public.orders where id = 'cccccccc-0000-0000-0000-000000000061') = 3, 'шлях задвоївся';
+  assert public.can_view_order_id('cccccccc-0000-0000-0000-000000000061');
+end $$;
+
+-- відділ-створювач зафіксовано на момент створення: автора перевели в ВД-Г — замовлення лишилось за ВД-А,
+-- а сам він (тепер у непричетному відділі) його вже не бачить
+reset role;
+update public.profiles set department_id = 'dddddddd-0000-0000-0000-00000000000d' where id = '0000000a-0000-0000-0000-00000000000a';
+select set_config('request.jwt.claim.sub', '0000000a-0000-0000-0000-00000000000a', false);
+set role authenticated;
+do $$ begin
+  assert (select count(*) from public.orders where id = 'cccccccc-0000-0000-0000-000000000061') = 0, 'видимість пішла за автором, а не за відділом';
+end $$;
+reset role;
+do $$ begin
+  assert (select origin_department_id from public.orders where id = 'cccccccc-0000-0000-0000-000000000061') = 'dddddddd-0000-0000-0000-00000000000a', 'відділ-створювач переїхав за автором';
+end $$;
+-- людина без відділу й без orders.all: як і раніше, чужих замовлень не бачить
+update public.profiles set department_id = null where id = '0000000a-0000-0000-0000-00000000000a';
+set role authenticated;
+do $$ begin
+  assert (select count(*) from public.orders where department_id is not null) = 0, 'без відділу видно замовлення відділів';
+  assert not public.can_view_order_id('cccccccc-0000-0000-0000-000000000061');
+end $$;
+reset role;
+-- автор з orders.all (відділ ВД-А) приймає замовлення одразу в ВД-В: створив ВД-А, шлях — А і В; Б — непричетний
+update public.profiles set department_id = 'dddddddd-0000-0000-0000-00000000000a', perms = perms || array['orders.all']
+ where id = '0000000a-0000-0000-0000-00000000000a';
+set role authenticated;
+insert into public.orders (id, title, department_id) values
+  ('cccccccc-0000-0000-0000-000000000062', 'ПВ одразу у В', 'dddddddd-0000-0000-0000-00000000000c');
+reset role;
+update public.profiles set perms = array_remove(perms, 'orders.all') where id = '0000000a-0000-0000-0000-00000000000a';
+do $$ begin
+  assert (select origin_department_id from public.orders where id = 'cccccccc-0000-0000-0000-000000000062') = 'dddddddd-0000-0000-0000-00000000000a';
+  assert (select dept_path from public.orders where id = 'cccccccc-0000-0000-0000-000000000062')
+       = array['dddddddd-0000-0000-0000-00000000000a', 'dddddddd-0000-0000-0000-00000000000c']::uuid[], 'шлях: створив А, прийнято у В';
+end $$;
+set role authenticated;
+do $$ begin
+  assert (select count(*) from public.orders where id in ('cccccccc-0000-0000-0000-000000000061', 'cccccccc-0000-0000-0000-000000000062')) = 2, 'створювач бачить обидва';
+  begin
+    perform public.move_order('cccccccc-0000-0000-0000-000000000062', 'in_work');
+    raise exception 'створювач без orders.all змінив замовлення іншого відділу';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+end $$;
+select set_config('request.jwt.claim.sub', '0000000b-0000-0000-0000-00000000000b', false);
+do $$ begin
+  assert (select count(*) from public.orders where id = 'cccccccc-0000-0000-0000-000000000062') = 0, 'непричетний відділ бачить замовлення';
+  assert (select count(*) from public.order_events where order_id = 'cccccccc-0000-0000-0000-000000000062') = 0;
+end $$;
+-- без orders.view причетність нічого не дає
+reset role;
+update public.profiles set perms = array['stock.view'] where id = '0000000b-0000-0000-0000-00000000000b';
+set role authenticated;
+do $$ begin
+  assert (select count(*) from public.orders) = 0 and (select count(*) from public.order_events) = 0, 'без orders.view видно замовлення';
+  assert not public.can_view_order_id('cccccccc-0000-0000-0000-000000000061');
+end $$;
+-- anon функцію перегляду не викликає
+reset role;
+set role anon;
+do $$ begin
+  begin
+    perform public.can_view_order_id('cccccccc-0000-0000-0000-000000000061');
+    raise exception 'anon викликав can_view_order_id';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+reset role;
+-- прибираємо за собою
+delete from public.orders where id in ('cccccccc-0000-0000-0000-000000000061', 'cccccccc-0000-0000-0000-000000000062');
+delete from auth.users where email like 'dep-_@example.com';
+delete from public.departments where name like 'ВД-_';
+delete from public.items where id = 'aaaaaaaa-0000-0000-0000-000000000061';
+do $$ begin
+  assert (select count(*) from public.profiles where id::text like '0000000_-0000%') = 0;
+  -- кожне замовлення: поточний відділ завжди є в шляху, відділ-створювач — теж
+  assert not exists (select 1 from public.orders where department_id is not null and not (department_id = any(dept_path))), 'поточний відділ не в шляху';
+  assert not exists (select 1 from public.orders where origin_department_id is not null and not (origin_department_id = any(dept_path))), 'створювач не в шляху';
+end $$;
+
 do $$ begin
   assert (select count(*) from pg_publication_tables where pubname = 'supabase_realtime') = 16;
 end $$;

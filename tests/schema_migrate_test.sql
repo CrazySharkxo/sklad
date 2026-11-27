@@ -6,6 +6,9 @@
 -- І видачі замовнику з боргами: на базі без них (order_shipments, order_debts, debt_id)
 -- старі замовлення лишаються як були, нові таблиці зʼявляються порожні, повторний запуск
 -- нічого не дублює, старий клієнт працює далі.
+-- І причетні відділи (orders.origin_department_id, dept_path): на базі без них наявні
+-- замовлення отримують шлях з історії передач, updated_at не змінюється, повторний запуск
+-- заповнене не перераховує; видимість «бачить причетний відділ» починає діяти.
 \set ON_ERROR_STOP on
 
 -- стара схема: без головного адміністратора й нових ролей
@@ -98,6 +101,25 @@ begin
   values (p_id, 'move', v.status, p_status, v.department_id, v_dep, v_txt);
 end $$;
 
+-- стара схема: без причетних відділів — замовлення бачить лише відділ, де воно зараз
+drop policy orders_read on public.orders;
+create policy orders_read on public.orders for select to authenticated
+  using ((select public.has_perm('orders.view'))
+         and ((select public.has_perm('orders.all')) or department_id is not distinct from (select public.my_department())));
+drop policy order_tasks_read on public.order_tasks;
+drop policy order_parts_read on public.order_parts;
+drop policy order_units_read on public.order_units;
+drop policy order_events_read on public.order_events;
+create policy order_tasks_read  on public.order_tasks  for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_parts_read  on public.order_parts  for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_units_read  on public.order_units  for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_events_read on public.order_events for select to authenticated using (public.can_see_order_id(order_id));
+drop function public.can_view_order_id(uuid);
+drop trigger orders_path on public.orders;
+drop function public.order_path();
+drop index public.orders_path_idx;
+alter table public.orders drop column dept_path, drop column origin_department_id;
+
 -- старий клієнт на старій схемі: одне замовлення відвантажив (по-старому, без видач), друге — в роботі з деталями
 select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
 set role authenticated;
@@ -115,6 +137,12 @@ do $$ begin assert (select reserved from public.stock where id = 'aaaaaaaa-0000-
 create temp table mig_orders as
   select (select jsonb_agg(to_jsonb(o) order by o.id) from public.orders o) as orders,
          (select count(*) from public.order_events) as events, (select count(*) from public.operations) as ops;
+-- причетні відділи, наближення: у «Старого відвантаженого» в історії не лишилось відділу, куди його прийняли
+-- (напр. той відділ видалили) — тоді відділом-створювачем стає НИНІШНІЙ відділ автора (ivan → «Тестування»)
+create temp table mig_ivan as select department_id from public.profiles where id = '11111111-1111-1111-1111-111111111111';
+update public.order_events set to_department = null where order_id = 'cccccccc-0000-0000-0000-000000000041' and kind = 'created';
+update public.profiles set department_id = (select id from public.departments where name = 'Тестування')
+ where id = '11111111-1111-1111-1111-111111111111';
 
 -- старий клієнт на старій схемі додає позицію
 select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
@@ -159,12 +187,72 @@ begin
   -- старе відвантажене замовлення лишилось відвантаженим, видач йому ніхто не «домалював»
   assert (select count(*) from public.order_shipments) = 0 and (select count(*) from public.order_debts) = 0
      and (select count(*) from public.order_debts_left) = 0, 'нові таблиці не порожні';
-  assert (select jsonb_agg(to_jsonb(o) order by o.id) from public.orders o) = (select orders from mig_orders), 'міграція змінила замовлення';
+  -- (нові колонки причетних відділів — окремо нижче; решта, разом з updated_at, — рядок у рядок)
+  assert (select jsonb_agg(to_jsonb(o) - 'origin_department_id' - 'dept_path' order by o.id) from public.orders o)
+       = (select orders from mig_orders), 'міграція змінила замовлення';
   assert (select count(*) from public.order_events) = (select events from mig_orders)
      and (select count(*) from public.operations) = (select ops from mig_orders), 'міграція змінила історію чи операції';
   assert (select count(*) from public.operations where debt_id is not null) = 0 and (select count(*) from public.order_units where shipment_id is not null) = 0;
   assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000051') = 4, 'резерв після міграції';
 end $$;
+
+-- причетні відділи після міграції: шлях кожного наявного замовлення відновлено з історії
+do $$
+declare
+  v_in   uuid := (select id from public.departments where name = 'Прийом замовлень');
+  v_test uuid := (select id from public.departments where name = 'Тестування');
+begin
+  -- у шляху — кожен відділ з історії (прийом і передачі) і поточний; зайвого, крім відділу-створювача, немає
+  assert not exists (
+    select 1 from public.orders o
+     where not (o.dept_path @> array(select x.d from public.order_events e
+                                       cross join lateral (values (e.from_department), (e.to_department)) x(d)
+                                      where e.order_id = o.id and e.kind in ('created', 'move') and x.d is not null))
+        or (o.department_id is not null and not (o.department_id = any(o.dept_path)))
+        or (o.origin_department_id is not null and not (o.origin_department_id = any(o.dept_path)))
+        or exists (select 1 from unnest(o.dept_path) u(d)
+                    where u.d is distinct from o.origin_department_id and u.d is distinct from o.department_id
+                      and not exists (select 1 from public.order_events e
+                                       where e.order_id = o.id and e.kind in ('created', 'move') and u.d in (e.from_department, e.to_department)))), 'шлях не збігається з історією';
+  assert (select count(*) from public.orders where cardinality(dept_path) >= 2 and id <> 'cccccccc-0000-0000-0000-000000000041') > 0,
+    'у базі мали бути замовлення, що проходили через кілька відділів';
+  assert not exists (select 1 from public.orders o where array_position(o.dept_path, null) is not null
+                        or cardinality(o.dept_path) <> (select count(distinct d) from unnest(o.dept_path) d)), 'у шляху порожнє чи дубль';
+  -- відділ-створювач — той, куди замовлення прийняли (подія «created»)
+  assert not exists (select 1 from public.orders o join public.order_events e on e.order_id = o.id and e.kind = 'created'
+                      where e.to_department is not null and o.origin_department_id is distinct from e.to_department), 'створювач не з події прийому';
+  assert (select origin_department_id = v_in and dept_path = array[v_in] from public.orders where id = 'cccccccc-0000-0000-0000-000000000042'), 'шлях замовлення без передач';
+  -- наближення: в історії відділу прийому немає → нинішній відділ автора
+  assert (select origin_department_id = v_test and dept_path = array[v_test, v_in] from public.orders where id = 'cccccccc-0000-0000-0000-000000000041'),
+    'наближення за відділом автора';
+  assert (select count(*) from pg_trigger where tgrelid = 'public.orders'::regclass and not tgisinternal and tgenabled <> 'O') = 0, 'тригери замовлень лишились вимкненими';
+end $$;
+update public.profiles p set department_id = m.department_id from mig_ivan m where p.id = '11111111-1111-1111-1111-111111111111';
+-- людина без orders.all з «Тестування»: бачить усе, що через її відділ проходило, і нічого зайвого
+insert into auth.users (id, email) values ('0000000e-0000-0000-0000-00000000000e', 'mig-dep@example.com');
+update public.profiles set role_id = null, perms = array['orders.view', 'orders.edit'], active = true,
+       department_id = (select id from public.departments where name = 'Тестування')
+ where id = '0000000e-0000-0000-0000-00000000000e';
+create temp table mig_vis as
+  select array_agg(id order by id) as ids from public.orders
+   where (select id from public.departments where name = 'Тестування') = any(dept_path);
+grant select on mig_vis to authenticated;
+select set_config('request.jwt.claim.sub', '0000000e-0000-0000-0000-00000000000e', false);
+set role authenticated;
+do $$ begin
+  assert (select array_agg(id order by id) from public.orders) = (select ids from mig_vis), 'після міграції видно не те, що проходило через відділ';
+  assert (select count(*) from public.orders where department_id is distinct from public.my_department()) > 0, 'передані далі замовлення не видно';
+  assert (select count(*) from public.orders where id = 'cccccccc-0000-0000-0000-000000000042') = 0, 'видно замовлення непричетного відділу';
+  assert (select count(*) from public.order_events where order_id = 'cccccccc-0000-0000-0000-000000000042') = 0;
+  begin
+    perform public.move_order((select id from public.orders where department_id is distinct from public.my_department() and deleted_at is null limit 1), 'in_work');
+    raise exception 'після міграції причетний відділ змінив чуже замовлення';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+end $$;
+reset role;
+delete from auth.users where id = '0000000e-0000-0000-0000-00000000000e';
+drop table mig_vis;
 
 -- після міграції: колишній адміністратор ivan уже не керує людьми, olena — керує
 select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
@@ -240,6 +328,11 @@ do $$ begin
   assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000051') = 3, 'видача деталей старим клієнтом';
   assert (select count(*) from public.orders o left join public.order_units u on u.order_id = o.id) > 0;   -- старий select з order_units(*)
   assert (select qty || '|' || auto from public.order_shipments where order_id = 'cccccccc-0000-0000-0000-000000000043') = '2|true';
+  -- причетні відділи: передача старим клієнтом дописала відділ у шлях; нове замовлення отримало створювача
+  assert (select dept_path from public.orders where id = 'cccccccc-0000-0000-0000-000000000042')
+       = array[(select id from public.departments where name = 'Прийом замовлень'), (select id from public.departments where name = 'Тестування')], 'шлях після передачі старим клієнтом';
+  assert (select origin_department_id = coalesce(public.my_department(), department_id) and department_id = any(dept_path)
+            from public.orders where id = 'cccccccc-0000-0000-0000-000000000043'), 'створювач нового замовлення';
   -- відновлення старого відвантаженого (без видач) теж працює
   perform public.move_order('cccccccc-0000-0000-0000-000000000041', 'in_work');
   assert (select count(*) from public.order_shipments where order_id = 'cccccccc-0000-0000-0000-000000000041') = 0;
@@ -260,6 +353,13 @@ create temp table mig_ship as
          (select jsonb_agg(to_jsonb(t) order by t.id) from public.order_events t) as events,
          (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000051') as reserved;
 create temp table mig_order as select id, sort_order, updated_at from public.items;
+-- причетні відділи: повторний запуск заповнене не перераховує. Якби перерахував — «Старе відвантажене»
+-- отримало б іншого створювача (нинішній відділ автора вже не «Тестування»)
+do $$ begin
+  assert (select p.department_id is distinct from o.origin_department_id
+            from public.orders o join public.profiles p on p.id = o.created_by where o.id = 'cccccccc-0000-0000-0000-000000000041');
+end $$;
+create temp table mig_path as select id, origin_department_id, dept_path, updated_at from public.orders;
 
 -- повторний запуск на вже мігрованій базі нічого не збиває
 \ir ../supabase/schema.sql
@@ -275,6 +375,15 @@ do $$ begin
   assert not exists (select 1 from public.roles where name = 'Звичайний користувач'), 'видалена роль воскресла';
   assert (select perms from public.roles where name = 'Старший користувач') = array['stock.view'], 'змінену роль перезаписано';
   assert (select count(*) from public.roles) = (select count(*) from mig_roles) + 1, 'повторний запуск додав ролі';
+  -- причетні відділи: ті самі, updated_at замовлень не зачеплено, тригер і політики — по одному
+  assert (select count(*) from public.orders) = (select count(*) from mig_path)
+     and not exists (select 1 from public.orders o join mig_path m using (id)
+                      where o.origin_department_id is distinct from m.origin_department_id or o.dept_path <> m.dept_path
+                         or o.updated_at <> m.updated_at), 'повторний запуск змінив причетні відділи';
+  assert (select count(*) from pg_trigger where tgrelid = 'public.orders'::regclass and tgname = 'orders_path' and tgenabled = 'O') = 1;
+  assert (select count(*) from pg_policies where schemaname = 'public' and policyname like 'order%\_read'
+             and (qual like '%can_view_order_id%' or qual like '%dept_path%')) = 7, 'політики перегляду замовлень';
+  assert (select count(*) from pg_proc where proname in ('can_view_order_id', 'order_path')) = 2;
   -- видачі, борги й історія — рядок у рядок, нічого не задвоїлось і не зникло
   assert (select jsonb_agg(to_jsonb(t) order by t.id) from public.order_shipments t) = (select ships from mig_ship), 'повторний запуск змінив видачі';
   assert (select jsonb_agg(to_jsonb(t) order by t.id) from public.order_debts_left t) = (select debts from mig_ship), 'повторний запуск змінив борги';

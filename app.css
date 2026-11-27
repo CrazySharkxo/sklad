@@ -622,6 +622,13 @@ code { font-size: 13px; background: var(--bg); padding: 1px 5px; border-radius: 
 
 /* Видача замовнику (частинами) і борг перед замовником */
 .tag.debt-tag { background: var(--out-soft); color: var(--err); }
+/* «Мій відділ»: що чекає на відділ зараз — угорі з позначкою; решта причетних — з підписом, де вони зараз */
+.tag.wait-tag { background: var(--warn-soft); color: var(--warn); }
+.order-row.waits { border-left: 4px solid var(--warn); }
+.order-row.waits.is-overdue { border-left-color: var(--err); }
+.row-meta .now-at { font-weight: 600; }
+.list-sep { margin: 10px 2px 2px; font-size: 13px; font-weight: 600; color: var(--muted); }
+.list-note { padding: 10px 14px; border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); font-size: 14px; }
 .row-meta .ship-n { margin-right: 6px; color: var(--text); font-weight: 600; }
 .err-text-inline { color: var(--err); font-weight: 600; }
 .ship-sum { margin: 6px 0 0; }

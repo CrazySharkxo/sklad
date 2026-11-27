@@ -315,6 +315,21 @@ def main() -> int:
         expect(page.locator(".order-head")).to_contain_text("На тестуванні")
         expect(page.locator(".order-head")).to_contain_text("Тестування")
         expect(page.locator(".nav-badge")).to_be_hidden()  # уже не на моєму відділі
+        # «Мій відділ»: передане далі замовлення нікуди не зникає — воно в списку з підписом, де воно зараз;
+        # порожнього стану немає, а фішка й бейдж рахують лише те, що ЧЕКАЄ на відділ (зараз — нічого)
+        order1 = page.url
+        page.goto(url + "#/orders")
+        page.locator("#chips [data-f=mine]").click()
+        expect(page.locator("#chips .chip.on")).to_have_text("Мій відділ")
+        expect(page.locator(".empty-state")).to_have_count(0)
+        expect(page.locator("#mine-none")).to_have_text("На ваш відділ зараз нічого не чекає")
+        expect(page.locator("#list a.order-row")).to_have_count(1)
+        expect(page.locator("#list a.order-row .now-at")).to_have_text("зараз: Тестування")
+        expect(page.locator("#list a.order-row .wait-tag")).to_have_count(0)
+        expect(page.locator("#list a.order-row.waits")).to_have_count(0)
+        expect(page.locator(".nav-badge")).to_be_hidden()
+        page.goto(order1)
+        expect(page.locator(".order-head")).to_contain_text("На тестуванні")
 
         page.locator("#acts [data-to=rework]").click()
         expect(page.locator(".move-dialog select option:checked")).to_contain_text("Прийом замовлень")  # тому, хто передав
@@ -331,6 +346,12 @@ def main() -> int:
         page.goto(url + "#/orders")
         page.locator(".chip[data-f=mine]").click()
         expect(page.locator(".order-row")).to_have_count(1)
+        # повернулось на мій відділ: позначка «чекає на вас», число на фішці й бейджі
+        expect(page.locator(".order-row.waits .wait-tag")).to_have_text("чекає на вас")
+        expect(page.locator(".order-row .now-at")).to_have_count(0)
+        expect(page.locator("#mine-none, #mine-rest")).to_have_count(0)
+        expect(page.locator(".chip[data-f=mine]")).to_have_text("Мій відділ · 1")
+        expect(page.locator(".nav-badge")).to_have_text("1")
         page.screenshot(path=str(SHOTS / "15_orders.png"))
         page.goto(url + "#/journal")
         expect(page.locator(".op", has_text="Замовлення №1")).to_have_count(1)
@@ -1574,6 +1595,133 @@ def main() -> int:
         expect(page.locator("#units")).not_to_contain_text("видано замовнику")
         expect(page.locator("#ship-sum")).to_have_text("Замовнику ще нічого не видано — лишилось 2")
         page.set_viewport_size({"width": 1280, "height": 800})
+
+        # --- «Мій відділ»: усе, що відділ створив або що через нього проходило; що чекає на нього — угорі ---
+        DEMO_ID = "00000000-0000-0000-0000-00000000demo"
+        st = page.evaluate("""(me) => {
+            const d = JSON.parse(localStorage.getItem('sklad-demo-v1'));
+            const mine = d.departments.find((x) => x.id === d.profileDeps[me]);
+            const act = ['new', 'in_work', 'testing', 'rework', 'done'];
+            return { mine: mine ? mine.name : null, deps: d.departments.map((x) => x.name),
+                     wait: mine ? d.orders.filter((o) => !o.deleted_at && o.department_id === mine.id && act.includes(o.status)).length : 0 };
+        }""", DEMO_ID)
+        assert st["mine"] and len(st["deps"]) >= 2, st
+        mine_dep = st["mine"]
+        other_dep = next(n for n in st["deps"] if n != mine_dep)
+        wait0 = st["wait"]
+        badge = lambda n: expect(page.locator(".nav-badge")).to_have_text(str(n)) if n else expect(page.locator(".nav-badge")).to_be_hidden()
+        page.goto(url + "#/orders")
+        badge(wait0)
+
+        def new_order(title):
+            page.goto(url + "#/order-edit/new")
+            page.locator("#f [name=title]").fill(title)
+            expect(page.locator("#f [name=dep] option:checked")).to_have_text(mine_dep)   # нове — у своєму відділі
+            page.locator("#save").click()
+            expect(page.locator("#top h1")).to_contain_text(title)
+
+        new_order("МВ передане далі")
+        badge(wait0 + 1)
+        page.locator("#acts [data-to=testing]").first.click()                 # → на тестування в інший відділ
+        page.locator(".move-dialog select[name=dep]").select_option(label=other_dep)
+        page.locator(".move-dialog .modal-actions button:not([data-cancel])").click()
+        expect(page.locator(".order-head")).to_contain_text("На тестуванні")
+        expect(page.locator(".order-head")).to_contain_text(other_dep)
+        expect(page.locator(".order-head")).not_to_contain_text("чекає на ваш відділ")
+        badge(wait0)                                                          # бейдж — лише те, що чекає на мій відділ
+        new_order("МВ чекає на мене")
+        badge(wait0 + 1)
+
+        page.goto(url + "#/orders")
+        page.locator("#chips [data-f=mine]").click()
+        expect(page.locator(".empty-state")).to_have_count(0)                 # порожнього стану немає
+        expect(page.locator("#mine-none")).to_have_count(0)
+        expect(page.locator("#chips [data-f=mine]")).to_have_text(f"Мій відділ · {wait0 + 1}")   # на фішці — лише ті, що чекають
+        passed = page.locator("#list a.order-row", has_text="МВ передане далі")
+        waiting = page.locator("#list a.order-row", has_text="МВ чекає на мене")
+        expect(passed).to_have_count(1)                                       # передане далі лишилось у «Мій відділ»…
+        expect(passed.locator(".now-at")).to_have_text(f"зараз: {other_dep}")  # …з підписом, де воно зараз
+        expect(passed.locator(".wait-tag")).to_have_count(0)
+        expect(passed).not_to_have_class(re.compile(r"\bwaits\b"))
+        expect(waiting).to_have_class(re.compile(r"\bwaits\b"))               # те, що чекає на мій відділ, — позначене…
+        expect(waiting.locator(".wait-tag")).to_have_text("чекає на вас")
+        expect(waiting.locator(".now-at")).to_have_count(0)
+        expect(page.locator("#list a.order-row.waits")).to_have_count(wait0 + 1)
+        expect(page.locator("#mine-rest")).to_contain_text("проходили через нього")
+        kinds = page.eval_on_selector_all("#list > *", """els => els.map((e) => e.id === 'mine-rest' ? 'sep'
+            : e.classList.contains('waits') ? 'wait' : e.classList.contains('order-row') ? 'rest' : 'other')""")
+        n_rest = kinds.count("rest")
+        assert n_rest >= 1 and kinds == ["wait"] * (wait0 + 1) + ["sep"] + ["rest"] * n_rest, kinds   # …і стоїть вище за решту
+        expect(page.locator("#mine-rest")).to_contain_text(f"· {n_rest}")
+        # у «Мій відділ» — лише відкриті: закриті причетні замовлення мають свої фішки
+        assert page.eval_on_selector_all("#list a.order-row", """els => els.filter((e) => e.querySelector('.tag.st-closed')
+            && !e.querySelector('.debt-tag')).length""") == 0, "у «Мій відділ» є закрите замовлення без боргу"
+        badge(wait0 + 1)
+        expect(page.locator(".toast")).to_have_count(0, timeout=15000)
+        page.screenshot(path=str(SHOTS / "47_my_department.png"), full_page=True)
+        # пошук у «Мій відділ» шукає в обох групах
+        page.locator("#q").fill("МВ передане")
+        expect(page.locator("#list a.order-row")).to_have_count(1)
+        expect(page.locator("#list a.order-row .now-at")).to_have_text(f"зараз: {other_dep}")
+        page.locator("#q").fill("")
+        # «Усі активні» — як були: без позначок і підписів «зараз:»
+        page.locator("#chips [data-f=active]").click()
+        expect(page.locator("#list a.order-row", has_text="МВ передане далі")).to_have_count(1)
+        expect(page.locator("#list .wait-tag, #list .now-at, #mine-rest")).to_have_count(0)
+        # закрите (скасоване) причетне замовлення з «Мій відділ» зникає — воно в «Архіві»
+        passed_hash = "#/order/" + page.locator("#list a.order-row", has_text="МВ передане далі").get_attribute("href").split("#/order/")[1]
+        page.goto(url + passed_hash)
+        page.locator("#acts [data-to=cancelled]").click()
+        page.locator(".move-dialog textarea").fill("перевірка «Мій відділ»")
+        page.locator(".move-dialog .modal-actions button:not([data-cancel])").click()
+        expect(page.locator(".order-head")).to_contain_text("Скасовано")
+        page.goto(url + "#/orders")
+        page.locator("#chips [data-f=mine]").click()
+        expect(page.locator("#list a.order-row", has_text="МВ чекає на мене")).to_have_count(1)
+        expect(page.locator("#list a.order-row", has_text="МВ передане далі")).to_have_count(0)
+        page.locator("#chips [data-f=archive]").click()
+        expect(page.locator("#list a.order-row", has_text="МВ передане далі")).to_have_count(1)
+        page.goto(url + passed_hash)
+        page.locator("#acts [data-to=in_work]").click()                       # «Відновити» — лишається в іншому відділі
+        expect(page.locator(".move-dialog select[name=dep] option:checked")).to_have_text(f"{other_dep} (зараз тут)")
+        page.locator(".move-dialog .modal-actions button:not([data-cancel])").click()
+        expect(page.locator(".order-head")).to_contain_text("В роботі")
+        expect(page.locator(".order-head")).to_contain_text(other_dep)
+
+        # людина без «замовлень усіх відділів»: передане далі замовлення свого відділу бачить, але не змінює;
+        # і демо-дані, збережені до появи причетних відділів, відновлюють їх з історії передач
+        saved = page.evaluate("localStorage.getItem('sklad-demo-v1')")
+        page.evaluate("""(me) => {
+            const d = JSON.parse(localStorage.getItem('sklad-demo-v1'));
+            d.users[me].perms = ['stock.view', 'ops.view', 'ops.edit', 'orders.view', 'orders.edit', 'orders.delete'];
+            for (const o of d.orders) { delete o.dept_path; delete o.origin_department_id; }
+            localStorage.setItem('sklad-demo-v1', JSON.stringify(d));
+        }""", DEMO_ID)
+        page.goto(url + "#/orders")
+        page.reload()
+        page.locator("#chips [data-f=mine]").click()
+        passed = page.locator("#list a.order-row", has_text="МВ передане далі")
+        expect(passed.locator(".now-at")).to_have_text(f"зараз: {other_dep}")   # шлях відновлено з історії
+        badge(wait0 + 1)
+        passed.click()
+        expect(page.locator("#view-only")).to_contain_text(f"зараз у відділі «{other_dep}»")
+        expect(page.locator("#acts button")).to_have_count(0)                  # ні передати, ні видати, ні видалити
+        expect(page.locator("#top a[href^='#/order-edit/']")).to_have_count(0)
+        expect(page.locator("#addtask, #cmt, #ship [data-shipbtn], #units [data-uadd], #units [data-ugen]")).to_have_count(0)
+        expect(page.locator("#events .ev").first).to_be_visible()             # історію видно
+        page.goto(url + passed_hash.replace("#/order/", "#/order-edit/"))      # редагування чужого зараз замовлення — назад у картку
+        expect(page.locator("#view-only")).to_be_visible()
+        page.goto(url + "#/orders")
+        page.locator("#chips [data-f=mine]").click()
+        page.locator("#list a.order-row", has_text="МВ чекає на мене").click()
+        expect(page.locator("#view-only")).to_have_count(0)                    # своє поточне — як було
+        expect(page.locator("#acts [data-to=in_work]")).to_have_count(1)
+        expect(page.locator("#addtask, #cmt")).to_have_count(2)
+        page.evaluate("(d) => localStorage.setItem('sklad-demo-v1', d)", saved)
+        page.goto(url + "#/orders")
+        page.reload()
+        page.locator("#chips [data-f=mine]").click()
+        expect(page.locator("#list a.order-row", has_text="МВ передане далі").locator(".now-at")).to_have_text(f"зараз: {other_dep}")
 
         # --- темна тема ---
         dark = browser.new_context(viewport={"width": 400, "height": 860}, color_scheme="dark")
