@@ -41,6 +41,8 @@ async function dumpTables() {
     order_parts: state.orders.flatMap((o) => o.parts.map((p) => ({ order_id: o.id, ...p }))),
     order_events: [],
     order_units: state.orders.flatMap((o) => o.units || []),
+    order_shipments: state.orders.flatMap((o) => o.shipments || []),
+    order_debts: state.orders.flatMap((o) => o.debts || []),
     roles: state.roles,
     profiles: Object.entries(state.profiles).map(([id, display_name]) => ({ id, display_name, department_id: state.depOf[id] || null })),
     settings: state.settings || null,

@@ -21,10 +21,17 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SHOTS = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "tests" / "shots"
 
 
+class Server(socketserver.ThreadingTCPServer):
+    # сторінка тягне два десятки модулів одразу: зі стандартною чергою (5) Windows подеколи
+    # відмовляє в зʼєднанні (net::ERR_CONNECTION_REFUSED), і тест падає на рівному місці
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def serve():
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(ROOT))
     handler.log_message = lambda *a: None
-    httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
+    httpd = Server(("127.0.0.1", 0), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/"
 
@@ -1323,6 +1330,249 @@ def main() -> int:
         assert [card.locator(f"[data-c={c}]").inner_text() for c in ("need", "have", "lack")] == ["3", "3", "✓"]
         expect(card.locator(".short-order .so-need")).to_have_text("треба 3")
         page.locator("#all").uncheck()
+        page.set_viewport_size({"width": 1280, "height": 800})
+
+        # --- видача замовнику частинами, неповним комплектом (борг) і довидача ---
+        page.set_viewport_size({"width": 400, "height": 860})
+        add_item("ВЗ камера", init="7")
+        page.goto(url + "#/order-edit/new")
+        f = page.locator("#f")
+        f.locator("[name=title]").fill("МАД - аналог - фпв (CM4)")
+        f.locator("[name=customer]").fill("Замовник ВЗ")
+        f.locator("[name=qty]").fill("55")
+        pick = page.locator("#picker input")
+        pick.fill("ВЗ камера")
+        pick.press("Enter")
+        page.locator("#parts .line .qty").last.fill("55")
+        page.locator("#save").click()
+        expect(page.locator("#top h1")).to_contain_text("МАД - аналог - фпв (CM4)")
+        ship_hash = "#" + page.url.split("#")[1]
+        ship_no = re.search(r"№(\d+)", page.locator("#top h1").inner_text()).group(1)
+        expect(page.locator("#ship-sum")).to_have_text("Замовнику ще нічого не видано — лишилось 55")
+        expect(page.locator("#ship-prop")).to_have_count(0)
+        expect(page.locator("#acts [data-shipbtn]")).to_have_text("Видати замовнику")  # не плутати з «Видати зі складу» (деталі)
+
+        def ship(qty, check=None):
+            page.locator("#ship [data-shipbtn]").click()
+            dlg = page.locator(".ship-dialog")
+            if check: check(dlg)
+            dlg.locator("[name=qty]").fill(qty)
+            return dlg
+
+        # видати 20 з 55: статус не міняється, лишок 35
+        dlg = ship("20", lambda d: (expect(d.locator("[name=qty]")).to_have_value("55"),      # за замовчуванням — усе, що лишилось
+                                    expect(d.locator("[name=date]")).not_to_have_value("")))  # і сьогоднішня дата
+        dlg.locator("[name=c]").fill("накладна 17")
+        dlg.locator("#ship-ok").click()
+        assert "Видано замовнику 20 · лишилось 35" in toast_text()
+        expect(page.locator("#ship-sum")).to_have_text("Видано 20 з 55 · лишилось 35")
+        expect(page.locator("#ship-prop")).to_have_text("20 з 55 · лишилось 35")
+        expect(page.locator(".order-head")).to_contain_text("Нове")
+        expect(page.locator("#ship-list .ship-row")).to_have_count(1)
+        expect(page.locator("#ship-list .ship-row")).to_contain_text("накладна 17")
+        expect(page.locator("#events")).to_contain_text("Видано замовнику 20 — усього 20 з 55, лишилось 35")
+        expect(page.locator("#debts")).to_have_count(0)
+        page.goto(url + "#/orders")
+        page.locator("#chips [data-f=active]").click()
+        orow = page.locator("a.order-row", has_text="МАД - аналог")
+        expect(orow.locator(".ship-n")).to_have_text("видано 20/55")
+        expect(orow.locator(".debt-tag")).to_have_count(0)
+        expect(page.locator("#chips [data-f=debt]")).to_have_count(0)
+
+        # більше, ніж лишилось, — не можна
+        page.goto(url + ship_hash)
+        dlg = ship("36", lambda d: expect(d.locator("[name=qty]")).to_have_value("35"))
+        dlg.locator("#ship-ok").click()
+        expect(dlg.locator("[data-err]")).to_have_text("Не можна видати 36: лишилось видати 35")
+        # 10 неповним комплектом: бракує 10 камер — підставляється з деталей замовлення (1 камера на виріб)
+        dlg.locator("[name=qty]").fill("10")
+        expect(dlg.locator("#ship-lack")).to_be_hidden()
+        dlg.locator("[name=partial]").check()
+        expect(dlg.locator("#ship-lack")).to_be_visible()
+        dlg.locator("#ship-ok").click()
+        expect(dlg.locator("[data-err]")).to_contain_text("Додайте, чого бракує")
+        dlg.locator("[name=frompart]").select_option(label="ВЗ камера")
+        expect(dlg.locator("#slines .line")).to_have_count(1)
+        expect(dlg.locator("#slines .qty")).to_have_value("10")
+        expect(dlg.locator("[data-err]")).to_be_hidden()
+        assert no_hscroll()
+        assert dlg.evaluate("e => e.scrollWidth <= e.clientWidth"), "форма видачі ширша за екран"
+        expect(page.locator(".toast")).to_have_count(0, timeout=15000)
+        page.screenshot(path=str(SHOTS / "45_ship_form.png"))
+        dlg.locator("#ship-ok").click()
+        assert "Видано замовнику 10 · лишилось 25" in toast_text()
+        expect(page.locator("#ship-sum")).to_contain_text("Видано 30 з 55 · лишилось 25")
+        expect(page.locator("#ship-sum")).to_contain_text("є борг")
+        expect(page.locator("#debt-badge")).to_have_text("є борг перед замовником")
+        debt = page.locator("#debts .debt", has_text="ВЗ камера")
+        expect(debt.locator("[data-c=left]")).to_have_text("10")
+        expect(debt.locator("[data-c=have]")).to_have_text("7")
+        expect(page.locator("#ship-list .ship-row").first).to_contain_text("бракувало: ВЗ камера × 10")
+        expect(page.locator(".order-head")).to_contain_text("Нове")  # статус так само не змінився
+        # список: «видано 30/55» і позначка боргу; фішка «З боргом»
+        page.goto(url + "#/orders")
+        page.locator("#chips [data-f=active]").click()
+        orow = page.locator("a.order-row", has_text="МАД - аналог")
+        expect(orow.locator(".ship-n")).to_have_text("видано 30/55")
+        expect(orow.locator(".debt-tag")).to_have_text("борг")
+        expect(page.locator("#chips [data-f=debt]")).to_have_text("З боргом · 1")
+        assert no_hscroll()
+        expect(page.locator(".toast")).to_have_count(0, timeout=15000)
+        orow.scroll_into_view_if_needed()
+        page.screenshot(path=str(SHOTS / "46_orders_list_progress.png"))
+        page.locator("#chips [data-f=debt]").click()
+        expect(page.locator("#list a.order-row")).to_have_count(1)
+        # нестача: борг додається до потреби окремим рядком; «вільно» в картці позиції — те саме число
+        page.goto(url + "#/shortage")
+        card = page.locator(".short-card", has=page.locator(".short-name", has_text="ВЗ камера"))
+        assert [card.locator(f"[data-c={c}]").inner_text() for c in ("need", "have", "lack")] == ["65", "7", "58"]  # 55 на збірку + 10 борг
+        expect(card.locator(".short-order")).to_have_count(2)
+        expect(card.locator(".short-order.debt")).to_contain_text(f"борг замовнику, №{ship_no}")
+        expect(card.locator(".short-order.debt .so-need")).to_contain_text("довидати 10")
+        expect(card.locator(".short-order:not(.debt) .so-need")).to_contain_text("треба 55")
+        card.locator(".short-name").click()
+        expect(page.locator(".badge.res")).to_contain_text("Зарезервовано під замовлення: 65")
+        expect(page.locator(".big-qty .free b")).to_have_text(re.compile(r"^[−-]58$"))
+
+        # довидати 4 з 10: борг 6, склад 7 → 3; у «видано під збірку» це не рахується
+        page.goto(url + ship_hash)
+        page.locator("#debts .debt [data-dclose]").click()
+        dd = page.locator(".debt-dialog")
+        expect(dd.locator("[name=qty]")).to_have_value("7")  # не більше, ніж є на складі
+        dd.locator("[name=qty]").fill("11")
+        dd.locator("#debt-ok").click()
+        expect(dd.locator("[data-err]")).to_have_text("Борг — лише 10")
+        dd.locator("[name=qty]").fill("4")
+        dd.locator("#debt-ok").click()
+        assert "Довидано 4 · борг лишився 6" in toast_text()
+        debt = page.locator("#debts .debt", has_text="ВЗ камера")
+        expect(debt.locator("[data-c=left]")).to_have_text("6")
+        expect(debt.locator("[data-c=have]")).to_have_text("3")
+        expect(page.locator("#events")).to_contain_text("Довидано замовнику: ВЗ камера × 4 шт — борг лишився 6")
+        expect(page.locator("#parts tbody tr", has_text="ВЗ камера").locator("td").nth(2)).to_have_text("—")  # на збірку не видано нічого
+        assert no_hscroll()
+        expect(page.locator(".toast")).to_have_count(0, timeout=15000)
+        page.evaluate("window.scrollTo(0, document.querySelector('#ship').previousElementSibling.getBoundingClientRect().top + scrollY - 76)")
+        page.screenshot(path=str(SHOTS / "44_order_shipments.png"))
+        page.locator("#oprint").click()   # і в друкованій картці
+        expect(page.locator("#print-area .doc")).to_contain_text("Видано замовнику")
+        expect(page.locator("#print-area .doc")).to_contain_text("30 з 55, лишилось 25")
+        expect(page.locator("#print-area .doc")).to_contain_text("ВЗ камера × 6")
+        page.goto(url + "#/stock")
+        assert stock_qty(page, "ВЗ камера") == "3"
+        page.goto(url + "#/journal")
+        expect(page.locator("main")).to_contain_text("Довидача замовнику (борг за замовленням)")
+
+        # видати решту 25 → «Відвантажено», але борг видно: позначка, фішка, нестача
+        page.goto(url + ship_hash)
+        dlg = ship("25", lambda d: expect(d.locator("[name=qty]")).to_have_value("25"))
+        dlg.locator("#ship-ok").click()
+        assert "Видано все — замовлення відвантажено" in toast_text()
+        expect(page.locator(".order-head")).to_contain_text("Відвантажено")
+        expect(page.locator("#debt-badge")).to_be_visible()
+        expect(page.locator("#ship-sum")).to_contain_text("Видано 55 з 55 · видано все")
+        expect(page.locator("[data-shipbtn]")).to_have_count(0)
+        expect(page.locator("#events")).to_contain_text("Видано замовнику 25 — усього 55 з 55")
+        page.goto(url + "#/orders")
+        page.locator("#chips [data-f=active]").click()
+        expect(page.locator("a.order-row", has_text="МАД - аналог")).to_have_count(0)   # уже не активне…
+        page.locator("#chips [data-f=debt]").click()                                    # …але з боргом — видно тут
+        orow = page.locator("a.order-row", has_text="МАД - аналог")
+        expect(orow.locator(".debt-tag")).to_have_text("борг")
+        expect(orow.locator(".ship-n")).to_have_count(0)
+        expect(orow).to_contain_text("Відвантажено")
+        page.goto(url + "#/shortage")
+        card = page.locator(".short-card", has=page.locator(".short-name", has_text="ВЗ камера"))
+        assert [card.locator(f"[data-c={c}]").inner_text() for c in ("need", "have", "lack")] == ["6", "3", "3"]  # лишився тільки борг
+        expect(card.locator(".short-order")).to_have_count(1)
+        expect(card.locator(".short-order.debt .so-need")).to_contain_text("довидати 6")
+        expect(card.locator(".short-order.debt .so-need")).to_contain_text("не вистачить 3")
+
+        # довидати 6, а на складі 3 — зрозуміла відмова, нічого не змінилось; після приходу — борг закрито
+        page.goto(url + ship_hash)
+        page.locator("#debts .debt [data-dclose]").click()
+        dd = page.locator(".debt-dialog")
+        expect(dd.locator("[name=qty]")).to_have_value("3")
+        dd.locator("[name=qty]").fill("6")
+        dd.locator("#debt-ok").click()
+        assert "Недостатньо «ВЗ камера»: є 3, потрібно 6" in toast_text()
+        expect(page.locator("#debts .debt [data-c=left]")).to_have_text("6")
+        page.goto(url + "#/op/in")
+        pick = page.locator("#picker input")
+        pick.fill("ВЗ камера")
+        pick.press("Enter")
+        page.locator(".line .qty").last.fill("5")
+        page.locator("#post").click()
+        assert "Прихід проведено" in toast_text()
+        page.goto(url + ship_hash)
+        page.locator("#debts .debt [data-dclose]").click()
+        dd = page.locator(".debt-dialog")
+        expect(dd.locator("[name=qty]")).to_have_value("6")
+        dd.locator("#debt-ok").click()
+        assert "борг за позицією закрито" in toast_text()
+        expect(page.locator("#debt-badge")).to_have_count(0)
+        expect(page.locator("#debts .debt.done")).to_contain_text("довидано 10 шт — борг закрито")
+        expect(page.locator("#debts [data-dclose]")).to_have_count(0)
+        page.goto(url + "#/stock")
+        assert stock_qty(page, "ВЗ камера") == "2"
+        page.goto(url + "#/orders")
+        expect(page.locator("#list")).to_contain_text("Боргів перед замовниками немає")  # фільтр ще вибраний, але порожній
+        page.locator("#chips [data-f=active]").click()
+        page.goto(url + "#/shortage")
+        page.locator("#all").check()
+        expect(page.locator(".short-card", has=page.locator(".short-name", has_text="ВЗ камера"))).to_have_count(0)
+        page.locator("#all").uncheck()
+        page.goto(url + "#/orders")
+        expect(page.locator("#chips [data-f=debt]")).to_have_count(0)  # боргів немає — фішки теж
+
+        # помилкову видачу можна скасувати: лишок повертається, а закрите цією видачею замовлення знову відкрите
+        page.goto(url + ship_hash)
+        expect(page.locator("#ship-list .ship-row")).to_have_count(3)
+        page.locator("#ship-list .ship-row").first.locator("[data-scancel]").click()   # остання — 25
+        expect(page.locator(".confirm-text")).to_contain_text("Скасувати видачу замовнику 25")
+        expect(page.locator(".confirm-text")).to_contain_text("Замовлення знову стане відкритим")
+        page.locator(".modal [data-r='1']").click()
+        assert "Видачу скасовано" in toast_text()
+        expect(page.locator(".order-head")).to_contain_text("Нове")
+        expect(page.locator("#ship-sum")).to_have_text("Видано 30 з 55 · лишилось 25")
+        expect(page.locator("#ship-list .ship-row")).to_have_count(2)
+        # кількість у замовленні не можна зробити меншою за вже видане
+        page.goto(url + ship_hash.replace("#/order/", "#/order-edit/"))
+        page.locator("#f [name=qty]").fill("29")
+        page.locator("#save").click()
+        assert "Замовнику вже видано 30" in toast_text()
+        # видачу, за якою вже довидали борг, скасувати не можна
+        page.goto(url + ship_hash)
+        page.locator("#ship-list .ship-row", has_text="бракувало").locator("[data-scancel]").click()
+        page.locator(".modal [data-r='1']").click()
+        assert "вже довидано деталі" in toast_text()
+        expect(page.locator("#ship-list .ship-row")).to_have_count(2)
+        # серійні номери: при видачі можна позначити, які саме вироби пішли; скасування знімає позначку
+        page.goto(url + order_hash)
+        page.locator("[data-ugen]").click()
+        expect(page.locator("#units .unit")).to_have_count(2)
+        page.locator("#ship [data-shipbtn]").click()
+        dlg = page.locator(".ship-dialog")
+        dlg.locator("[name=qty]").fill("1")
+        dlg.locator(".ship-units summary").click()
+        expect(dlg.locator("[name=unit]")).to_have_count(2)
+        dlg.locator("[name=unit]").nth(0).check()
+        dlg.locator("[name=unit]").nth(1).check()
+        dlg.locator("#ship-ok").click()
+        expect(dlg.locator("[data-err]")).to_contain_text("Позначено виробів: 2 — більше, ніж видаєте (1)")
+        dlg.locator("[name=unit]").nth(1).uncheck()
+        dlg.locator("#ship-ok").click()
+        assert "Видано замовнику 1 · лишилось 1" in toast_text()
+        expect(page.locator("#units .unit").nth(0)).to_contain_text("видано замовнику")
+        expect(page.locator("#units .unit").nth(1)).not_to_contain_text("видано замовнику")
+        page.locator("#ship [data-shipbtn]").click()
+        expect(page.locator(".ship-dialog [name=unit]")).to_have_count(1)   # виданий виріб удруге не пропонується
+        page.locator(".ship-dialog [data-cancel]").click()
+        page.locator("#ship-list [data-scancel]").click()
+        page.locator(".modal [data-r='1']").click()
+        assert "Видачу скасовано" in toast_text()
+        expect(page.locator("#units")).not_to_contain_text("видано замовнику")
+        expect(page.locator("#ship-sum")).to_have_text("Замовнику ще нічого не видано — лишилось 2")
         page.set_viewport_size({"width": 1280, "height": 800})
 
         # --- темна тема ---

@@ -1,5 +1,5 @@
 // Спільний стан і компоненти, якими користуються всі екрани
-import { api, isDemo, TRASH_DAYS, sortItems, permuteItems } from './api.js';
+import { api, isDemo, TRASH_DAYS, sortItems, permuteItems, attachExtras } from './api.js';
 import { esc, fmtQty, fmtDate, norm, round, toast, confirmDialog } from './util.js';
 import { scanCode } from './scanner.js';
 import { applyPendingTo } from './outbox.js';
@@ -48,11 +48,13 @@ function fill({ items, kits, profiles, departments, orders, perms, roles, settin
 export async function reloadData() {
   let snap;
   try {
-    const [items, kits, profiles, departments, orders, perms, roles, settings, owner] = await Promise.all([
+    const [items, kits, profiles, departments, orders, perms, roles, settings, owner, extras] = await Promise.all([
       api.items(), api.kits(), api.profiles(), api.departments(), api.orders(), api.myPerms(), api.roles(),
       api.settings().catch(() => null),  // стара схема без app_settings — не привід падати
       api.ownerId(),                     // стара схема без головного адміністратора — undefined
+      api.orderExtras(),                 // видачі замовнику й борги; стара схема без них — null
     ]);
+    attachExtras(orders, extras);
     snap = { items, kits, profiles, departments, orders, perms, roles, settings, owner, me: state.me, at: new Date().toISOString() };
     state.offline = false;
     state.cachedAt = null;
@@ -159,8 +161,15 @@ export const isLow = (i) => i.min_qty > 0 && i.qty < i.min_qty;
 // резерв під активні замовлення і вільний залишок
 export const reservedOf = (i) => Number(i?.reserved) || 0;
 export const freeQty = (i) => round((i?.qty || 0) - reservedOf(i));
-// замовлення, що тримають резерв на позицію (для картки позиції)
-export const reservingOrders = (itemId) => state.orders.filter((o) => ACTIVE_ORDER.includes(o.status) && o.parts.some((p) => p.item_id === itemId));
+// видача готових виробів замовнику: скільки вже видано і скільки лишилось
+export const shippedQty = (o) => round((o.shipments || []).reduce((s, x) => s + x.qty, 0));
+export const shipLeft = (o) => Math.max(0, round(o.qty - shippedQty(o)));
+// борг перед замовником: видано неповним комплектом, ще не все довидано (скасоване замовлення нікому не винне)
+export const openDebts = (o) => (o.status === 'cancelled' ? [] : (o.debts || []).filter((d) => d.left_qty > 0));
+export const hasDebt = (o) => openDebts(o).length > 0;
+// замовлення, що тримають резерв на позицію (для картки позиції): деталі активних і борги замовникам
+export const reservingOrders = (itemId) => state.orders.filter((o) => (ACTIVE_ORDER.includes(o.status) && o.parts.some((p) => p.item_id === itemId))
+  || openDebts(o).some((d) => d.item_id === itemId));
 
 // терміни замовлень
 export const daysToDue = (o) => (o.due_date ? Math.round((Date.parse(`${o.due_date}T00:00:00`) - new Date().setHours(0, 0, 0, 0)) / 864e5) : null);
@@ -239,7 +248,7 @@ export function kitCapacity(kit, free = false) {
   if (!kit.components.length) return 0;
   return Math.min(...kit.components.map((c) => componentCapacity(c, free)));
 }
-// позиції, яких на складі менше, ніж обіцяно активним замовленням (резерв рахує сервер — за всіма відділами)
+// позиції, яких на складі менше, ніж обіцяно активним замовленням і замовникам у борг (резерв рахує сервер — за всіма відділами)
 export const shortOf = (i) => Math.max(0, round(reservedOf(i) - (i?.qty || 0)));
 export const shortItems = () => state.items.filter((i) => shortOf(i) > 0);
 

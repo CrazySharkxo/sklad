@@ -1,7 +1,7 @@
 // Друк документів через вікно друку браузера (там же — «Зберегти як PDF»):
 // накладні по операціях журналу, картка замовлення, QR-етикетки виробів.
 import { esc, fmtQty, fmtSigned, fmtDate, OP_TYPES, ORDER_STATUS, qrSvg } from './util.js';
-import { state, userName, depName } from './core.js';
+import { state, userName, depName, shippedQty, shipLeft, openDebts } from './core.js';
 
 const orgName = () => state.settings?.org_name || 'Склад';
 const anyOrder = (id) => (id ? state.orders.find((o) => o.id === id) || state.trashOrders.find((o) => o.id === id) : null);
@@ -70,6 +70,8 @@ export function printOrder(o, { issued = {}, events = [] } = {}) {
     ['Кількість', fmtQty(o.qty)],
     ['Термін', fmtDue(o.due_date)],
     ['Статус', ORDER_STATUS[o.status]?.label || o.status],
+    ...(shippedQty(o) > 0 ? [['Видано замовнику', `${fmtQty(shippedQty(o))} з ${fmtQty(o.qty)}${shipLeft(o) > 0 ? `, лишилось ${fmtQty(shipLeft(o))}` : ''}`]] : []),
+    ...(openDebts(o).length ? [['Борг замовнику', openDebts(o).map((d) => `${state.byId.get(d.item_id)?.name || '?'} × ${fmtQty(d.left_qty)}`).join(', ')]] : []),
     ['Відділ', depName(o.department_id)],
     ['Прийняв', who(o.created_by, o.created_at)],
   ];

@@ -17,8 +17,14 @@ category_order і функцій порядку) працює як раніше,
 а спроба його змінити дає «Оновіть базу (schema.sql)»; на новій — зберігається одним викликом
 rpc/set_nav_order з p_ids; без мережі в чергу не ставиться; кнопки порядку (меню і «Залишків»)
 бачить лише головний адміністратор.
+
+Видача замовнику й борги: на базі зі СТАРОЮ схемою (немає order_shipments / order_debts_left і
+функцій ship_order …) замовлення відкриваються й передаються, як раніше, а спроба видати дає
+«Оновіть базу (schema.sql)»; на новій — ship_order / close_order_debt / cancel_order_shipment
+викликаються з тими параметрами, що оголошені в schema.sql; без мережі видача в чергу не ставиться.
 """
 import base64
+import datetime
 import functools
 import http.server
 import json
@@ -41,9 +47,16 @@ def b64(d):
     return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
 
 
+class Server(socketserver.ThreadingTCPServer):
+    # сторінка тягне два десятки модулів одразу: зі стандартною чергою (5) Windows подеколи
+    # відмовляє в зʼєднанні (net::ERR_CONNECTION_REFUSED), і тест падає на рівному місці
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def serve():
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(ROOT))
-    httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
+    httpd = Server(("127.0.0.1", 0), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/"
 
@@ -60,6 +73,14 @@ def main() -> int:
     # owner: "absent" — у базі ще немає функції owner_id (стара схема); інакше — id головного
     # nav: чи є в базі app_settings.nav_order і set_nav_order (найновіша частина схеми)
     db = {"new_schema": False, "category_order": [], "owner": "absent", "nav": False, "nav_order": []}
+    # ship: чи є в базі видачі замовнику й борги (order_shipments, order_debts_left, ship_order …)
+    db.update(ship=False, orders=[], shipments=[], debts=[])
+
+    def no_fn(route, fn, arg):  # так PostgREST відповідає про функцію, якої немає в базі
+        return route.fulfill(status=404, json={
+            "code": "PGRST202", "hint": None,
+            "details": f"Searched for the function public.{fn} with parameter {arg} or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.",
+            "message": f"Could not find the function public.{fn}({arg}) in the schema cache"})
 
     def handle(route):
         req = route.request
@@ -111,7 +132,48 @@ def main() -> int:
                     "message": "Could not find the function public.set_nav_order(p_ids) in the schema cache"})
             db["nav_order"] = json.loads(req.post_data)["p_ids"]
             return route.fulfill(status=204, body="")
-        if path.startswith(("/rest/v1/kits", "/rest/v1/operations", "/rest/v1/orders")):
+        if path.startswith(("/rest/v1/order_shipments", "/rest/v1/order_debts_left")):
+            name = path.split("/rest/v1/")[1].split("?")[0]
+            if not db["ship"]:  # так PostgREST відповідає про таблицю, якої немає в базі
+                return route.fulfill(status=404, json={"code": "PGRST205", "details": None, "hint": None,
+                                                       "message": f"Could not find the table 'public.{name}' in the schema cache"})
+            return route.fulfill(json=[r for r in db["shipments"] if not r["cancelled_at"]] if name == "order_shipments" else db["debts"])
+        if path.startswith("/rest/v1/rpc/ship_order"):
+            if not db["ship"]:
+                return no_fn(route, "ship_order", "p_comment, p_date, p_debts, p_id, p_qty, p_units")
+            b = json.loads(req.post_data)
+            sid = f"ffffffff-0000-0000-0000-{len(db['shipments']) + 1:012d}"
+            db["shipments"].append({"id": sid, "order_id": b["p_id"], "qty": b["p_qty"], "shipped_at": b["p_date"], "comment": b["p_comment"],
+                                    "auto": False, "closed_from": None, "created_at": "2026-11-27T10:00:00Z", "created_by": UID,
+                                    "cancelled_at": None, "cancelled_by": None})
+            for n, d in enumerate(b["p_debts"]):
+                db["debts"].append({"id": f"dddddddd-1111-0000-0000-{len(db['debts']) + 1:012d}", "order_id": b["p_id"], "shipment_id": sid,
+                                    "item_id": d["item_id"], "qty": d["qty"], "closed_qty": 0, "left_qty": d["qty"],
+                                    "created_at": "2026-11-27T10:00:00Z", "created_by": UID})
+            return route.fulfill(json=sid)
+        if path.startswith("/rest/v1/rpc/close_order_debt"):
+            if not db["ship"]:
+                return no_fn(route, "close_order_debt", "p_comment, p_debt, p_qty")
+            b = json.loads(req.post_data)
+            d = next(r for r in db["debts"] if r["id"] == b["p_debt"])
+            d.update(closed_qty=d["closed_qty"] + b["p_qty"], left_qty=d["left_qty"] - b["p_qty"])
+            return route.fulfill(json="bbbbbbbb-0000-0000-0000-000000000009")
+        if path.startswith("/rest/v1/rpc/cancel_order_shipment"):
+            if not db["ship"]:
+                return no_fn(route, "cancel_order_shipment", "p_id")
+            sid = json.loads(req.post_data)["p_id"]
+            next(r for r in db["shipments"] if r["id"] == sid)["cancelled_at"] = "2026-11-27T11:00:00Z"
+            db["debts"][:] = [r for r in db["debts"] if r["shipment_id"] != sid]
+            return route.fulfill(status=204, body="")
+        if path.startswith("/rest/v1/rpc/move_order"):
+            b = json.loads(req.post_data)
+            next(o for o in db["orders"] if o["id"] == b["p_id"]).update(status=b["p_status"])
+            return route.fulfill(status=204, body="")
+        if path.startswith("/rest/v1/orders"):
+            return route.fulfill(json=db["orders"])
+        if path.startswith("/rest/v1/order_events"):
+            return route.fulfill(json=[])
+        if path.startswith(("/rest/v1/kits", "/rest/v1/operations")):
             return route.fulfill(json=[])
         if path.startswith("/rest/v1/departments"):
             return route.fulfill(json=[{"id": "dddddddd-0000-0000-0000-000000000001", "name": "Тестування"}])
@@ -421,6 +483,104 @@ def main() -> int:
         expect(page.locator("[data-order]")).to_have_count(1)
         # функції, на які спирається клієнт, є в schema.sql
         assert re.search(r"function public\.owner_id\(\)\s+returns uuid", sql), "owner_id у schema.sql"
+
+        # ---------- видача замовнику й борги ----------
+        OID = "cccccccc-0000-0000-0000-000000000002"
+        today = datetime.date.today().isoformat()
+        db["orders"].append({
+            "id": OID, "number": 2, "title": "МАД - аналог - фпв (CM4)", "customer": "Замовник", "qty": 55, "due_date": None,
+            "description": "", "status": "in_work", "department_id": "dddddddd-0000-0000-0000-000000000001",
+            "created_at": "2026-11-20T09:00:00Z", "created_by": UID, "updated_at": "2026-11-20T09:00:00Z",
+            "deleted_at": None, "deleted_by": None, "order_tasks": [], "order_units": [],
+            "order_parts": [{"item_id": motor, "qty": 55}]})
+        rpc_calls = lambda fn: [json.loads(c[2]) for c in calls if f"/rpc/{fn}" in c[1]]
+
+        def open_order():
+            calls.clear()
+            page.goto(url + "#/orders")
+            reload()
+            page.locator("#chips [data-f=active]").click()
+            expect(page.locator("a.order-row")).to_have_count(1)
+            page.locator("a.order-row").click()
+            expect(page.locator("#top h1")).to_contain_text("МАД - аналог")
+            expect(page.locator("#parts table")).to_be_visible()
+
+        # новий застосунок, база ще без видач (schema.sql не запускали): замовлення працюють, як раніше
+        assert not db["ship"]
+        open_order()
+        assert len([c for c in calls if c[1].startswith("/rest/v1/order_shipments")]) == 1, "таблицю видач питаємо один раз"
+        ops = [c[1] for c in calls if c[1].startswith("/rest/v1/operations")]
+        assert ops and not any("debt_id" in c for c in ops), ops   # колонки debt_id на старій схемі не просимо
+        expect(page.locator("#ship-sum")).to_contain_text("Замовнику ще нічого не видано — лишилось 55")
+        expect(page.locator("#ship-prop")).to_have_count(0)
+        expect(page.locator("#debts")).to_have_count(0)
+        page.locator("#ship [data-shipbtn]").click()
+        dlg = page.locator(".ship-dialog")
+        expect(dlg.locator("[name=qty]")).to_have_value("55")
+        dlg.locator("[name=qty]").fill("20")
+        dlg.locator("#ship-ok").click()
+        expect(page.locator(".toast.err").last).to_contain_text("Оновіть базу (schema.sql)")
+        assert rpc_calls("ship_order") == [{"p_id": OID, "p_qty": 20, "p_date": today, "p_comment": "", "p_debts": [], "p_units": None}], rpc_calls("ship_order")
+        expect(page.locator("#top h1")).to_contain_text("МАД - аналог")          # картка ціла
+        expect(page.locator("#ship-sum")).to_contain_text("лишилось 55")
+        page.locator("#acts [data-to=testing]").click()                           # передача працює, як раніше
+        page.locator(".move-dialog button.primary").click()
+        expect(page.locator(".order-head")).to_contain_text("На тестуванні")
+        assert rpc_calls("move_order")[0]["p_status"] == "testing"
+        page.screenshot(path=str(ROOT / "tests" / "shots" / "47_ship_old_schema.png"))
+
+        # та сама база після свіжого schema.sql
+        db["ship"] = True
+        open_order()
+        ops = [c[1] for c in calls if c[1].startswith("/rest/v1/operations")]
+        assert ops and all("debt_id" in c for c in ops), ops                      # довидачу боргу відрізняємо від видачі на збірку
+        page.locator("#ship [data-shipbtn]").click()
+        dlg = page.locator(".ship-dialog")
+        dlg.locator("[name=qty]").fill("20")
+        dlg.locator("[name=partial]").check()
+        dlg.locator("[name=frompart]").select_option(label="Мотор")
+        expect(dlg.locator("#slines .qty")).to_have_value("20")                    # 1 мотор на виріб × 20 виробів
+        dlg.locator("#slines .qty").fill("10")
+        dlg.locator("[name=c]").fill("перша партія")
+        dlg.locator("#ship-ok").click()
+        expect(page.locator("#ship-sum")).to_contain_text("Видано 20 з 55 · лишилось 35")
+        assert rpc_calls("ship_order") == [{"p_id": OID, "p_qty": 20, "p_date": today, "p_comment": "перша партія",
+                                            "p_debts": [{"item_id": motor, "qty": 10}], "p_units": None}], rpc_calls("ship_order")
+        expect(page.locator("#debts .debt [data-c=left]")).to_have_text("10")
+        expect(page.locator("#debt-badge")).to_be_visible()
+        debt_id = db["debts"][0]["id"]
+        page.locator("#debts [data-dclose]").click()
+        dd = page.locator(".debt-dialog")
+        dd.locator("[name=qty]").fill("4")
+        dd.locator("#debt-ok").click()
+        expect(page.locator("#debts .debt [data-c=left]")).to_have_text("6")
+        assert rpc_calls("close_order_debt") == [{"p_debt": debt_id, "p_qty": 4, "p_comment": ""}], rpc_calls("close_order_debt")
+        # список: «видано 20/55» і позначка боргу
+        page.locator("#top a.back").click()
+        expect(page.locator("a.order-row .ship-n")).to_have_text("видано 20/55")
+        expect(page.locator("a.order-row .debt-tag")).to_have_text("борг")
+        page.locator("a.order-row").click()
+        # без мережі видача в чергу не ставиться
+        n_ship = len(rpc_calls("ship_order"))
+        ctx.set_offline(True)
+        page.locator("#ship [data-shipbtn]").click()
+        page.locator(".ship-dialog #ship-ok").click()
+        expect(page.locator(".toast.err").last).to_contain_text("Немає мережі — видачу замовнику не записано")
+        assert len(rpc_calls("ship_order")) == n_ship
+        ctx.set_offline(False)
+        # скасування помилкової видачі
+        page.locator("#ship-list [data-scancel]").click()
+        page.locator(".modal [data-r='1']").click()
+        expect(page.locator("#ship-sum")).to_contain_text("Замовнику ще нічого не видано — лишилось 55")
+        assert rpc_calls("cancel_order_shipment") == [{"p_id": db["shipments"][0]["id"]}], rpc_calls("cancel_order_shipment")
+        expect(page.locator("#debts")).to_have_count(0)
+        assert page.locator(".toast.err").count() == 0 or "Оновіть" not in page.locator(".toast.err").last.inner_text()
+        # імена параметрів у api.js збігаються з SQL
+        for fn in ("ship_order", "cancel_order_shipment", "close_order_debt"):
+            sig5 = re.search(rf"function public\.{fn}\((.*?)\)\s*returns", sql, re.S).group(1)
+            declared5 = set(re.findall(r"\b(p_\w+)\s", sig5))
+            used5 = set(re.findall(r"\b(p_\w+):", re.search(rf"rpc\('{fn}', \{{(.*?)\}}\)", js, re.S).group(1)))
+            assert used5 == declared5 and used5 == set(rpc_calls(fn)[0].keys()), (fn, used5, declared5)
         browser.close()
     httpd.shutdown()
     if errors:

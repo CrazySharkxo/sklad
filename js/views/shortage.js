@@ -3,12 +3,12 @@
 //
 // Числа — ті самі, що й «вільно» в залишках і в картці позиції:
 //   під замовлення = резерв позиції (рахує сервер: деталі активних замовлень мінус уже видане під них,
-//                    за всіма відділами);
+//                    плюс борги замовникам — вироби видано неповним комплектом; за всіма відділами);
 //   не вистачає    = під замовлення − на складі (коли більше нуля), тобто «вільно» зі знаком мінус.
 // Перелік замовлень під позицією складається на пристрої з того, що людина бачить.
 import { api } from '../api.js';
 import { esc, fmtQty, fmtDate, round, downloadXlsx, todayIso } from '../util.js';
-import { state, can, ACTIVE_ORDER, activeItems, isLow, reservedOf, shortOf, shortItems, isOverdue, isDueSoon, dueText } from '../core.js';
+import { state, can, ACTIVE_ORDER, activeItems, isLow, reservedOf, shortOf, shortItems, isOverdue, isDueSoon, dueText, openDebts } from '../core.js';
 import { printTable } from '../print.js';
 
 const fmtDue = (d) => (d ? fmtDate(`${d}T00:00:00`, false) : '');
@@ -36,13 +36,22 @@ export function shortageRows(issued, { all = false } = {}) {
         waits.get(p.item_id).push({ o, rest, miss: 0 });
       }
     }
+    // борг замовнику (видано неповним комплектом) — теж потреба, навіть коли замовлення вже відвантажене
+    for (const o of state.orders) {
+      for (const d of openDebts(o)) {
+        if (!waits.has(d.item_id)) waits.set(d.item_id, []);
+        waits.get(d.item_id).push({ o, rest: d.left_qty, miss: 0, debt: true });
+      }
+    }
   }
   const rows = [];
   for (const item of state.items) {
     const need = reservedOf(item);
     const lack = shortOf(item);
     if (!(need > 0) || (!all && !(lack > 0))) continue;
-    const orders = (waits.get(item.id) || []).sort((a, b) => (a.o.due_date || '9999').localeCompare(b.o.due_date || '9999') || a.o.number - b.o.number);
+    // борги — першими: це вже обіцяне замовнику; далі — за терміном
+    const orders = (waits.get(item.id) || []).sort((a, b) => !!b.debt - !!a.debt
+      || (a.o.due_date || '9999').localeCompare(b.o.due_date || '9999') || a.o.number - b.o.number);
     const seen = round(orders.reduce((s, w) => s + w.rest, 0));
     // частина резерву — під замовленнями, яких ця людина не бачить (інші відділи)
     const hidden = Math.max(0, round(need - seen));
@@ -65,6 +74,12 @@ export function shortageRows(issued, { all = false } = {}) {
 function orderLine(w) {
   const { o } = w;
   const cls = isOverdue(o) ? 'overdue' : isDueSoon(o) ? 'soon' : 'due';
+  if (w.debt) {
+    return `<a class="short-order debt" href="#/order/${o.id}" data-order="${o.id}" data-debt>
+    <span class="so-title">борг замовнику, <span class="no">№${o.number}</span>${esc(o.title)}</span>
+    <span class="so-need">довидати <b>${fmtQty(w.rest)}</b>${w.miss > 0 ? ` <small class="err-text">не вистачить ${fmtQty(w.miss)}</small>` : ''}</span>
+    <em>вироби видано неповним комплектом${o.customer ? ` · ${esc(o.customer)}` : ''}</em></a>`;
+  }
   return `<a class="short-order" href="#/order/${o.id}" data-order="${o.id}">
     <span class="so-title"><span class="no">№${o.number}</span>${esc(o.title)}</span>
     <span class="so-need">треба <b>${fmtQty(w.rest)}</b>${w.miss > 0 ? ` <small class="err-text">не вистачить ${fmtQty(w.miss)}</small>` : ''}</span>
@@ -128,7 +143,7 @@ export async function viewShortage(ctx) {
     if (!how) return;
     const head = ['Назва', 'Код', 'Одиниця', 'Під замовлення', 'На складі', 'Не вистачає', 'Найближчий термін', 'Замовлення'];
     const data = rows.map((r) => [r.item.name, r.item.code || '', r.item.unit || '', r.need, r.have, r.lack, fmtDue(r.due),
-      r.orders.map((w) => `№${w.o.number} ${w.o.title} — ${fmtQty(w.rest)}`).concat(r.hidden > 0 && seeOrders ? [`інші відділи — ${fmtQty(r.hidden)}`] : []).join('; ')]);
+      r.orders.map((w) => `${w.debt ? 'борг замовнику, ' : ''}№${w.o.number} ${w.o.title} — ${fmtQty(w.rest)}`).concat(r.hidden > 0 && seeOrders ? [`інші відділи — ${fmtQty(r.hidden)}`] : []).join('; ')]);
     const title = ui.all ? 'Позиції під замовлення' : 'Нестача під замовлення';
     if (how === 'xls') downloadXlsx(`нестача_під_замовлення_${todayIso()}.xlsx`, [{ name: 'Нестача', rows: [head, ...data], widths: [36, 16, 9, 14, 10, 12, 16, 60] }]);
     else printTable({ title, head, rows: data, num: [3, 4, 5] });

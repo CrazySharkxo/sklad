@@ -3,6 +3,9 @@
 -- позиції стали за назвою, а повторний запуск збережений порядок не збиває.
 -- Так само — головний адміністратор і дві нові ролі: на базі без них головним стає
 -- найстарший активний адміністратор, ролі додаються один раз.
+-- І видачі замовнику з боргами: на базі без них (order_shipments, order_debts, debt_id)
+-- старі замовлення лишаються як були, нові таблиці зʼявляються порожні, повторний запуск
+-- нічого не дублює, старий клієнт працює далі.
 \set ON_ERROR_STOP on
 
 -- стара схема: без головного адміністратора й нових ролей
@@ -51,6 +54,68 @@ left join public.reserved_qty r on r.item_id = i.id
 group by i.id, r.reserved;
 grant select on public.stock to authenticated;
 
+-- стара схема: без видач замовнику й боргів — ні таблиць, ні функцій, ні нових видів подій,
+-- резерв і move_order — як були до них
+drop function public.ship_order(uuid, numeric, date, text, jsonb, uuid[]);
+drop function public.cancel_order_shipment(uuid);
+drop function public.close_order_debt(uuid, numeric, text);
+drop trigger orders_qty_guard on public.orders;
+drop function public.order_qty_guard();
+drop view public.order_debts_left;
+create or replace view public.reserved_qty as
+select p.item_id,
+       sum(greatest(0, p.qty - coalesce((
+         select -sum(m.qty)
+           from public.movements m
+           join public.operations op on op.id = m.operation_id
+          where op.order_id = p.order_id and op.type = 'out' and op.cancelled_at is null and m.item_id = p.item_id), 0)))::numeric as reserved
+  from public.order_parts p
+  join public.orders o on o.id = p.order_id
+ where o.deleted_at is null and o.status in ('new', 'in_work', 'testing', 'rework', 'done')
+ group by p.item_id;
+alter table public.operations drop column debt_id;
+alter table public.order_units drop column shipment_id;
+drop table public.order_debts;
+drop table public.order_shipments;
+delete from public.order_events where kind in ('ship', 'ship_cancel', 'debt');
+alter table public.order_events drop constraint order_events_kind_check;
+alter table public.order_events add constraint order_events_kind_check check (kind in ('created', 'move', 'comment'));
+create or replace function public.move_order(p_id uuid, p_status text, p_department uuid default null, p_comment text default '')
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v    public.orders%rowtype;
+  v_dep uuid;
+  v_txt text := trim(coalesce(p_comment, ''));
+begin
+  perform public.require('orders.edit');
+  select * into v from public.orders where id = p_id and deleted_at is null for update;
+  if not found or not public.can_see_order(v.department_id) then
+    raise exception 'Замовлення не знайдено';
+  end if;
+  v_dep := coalesce(p_department, v.department_id);
+  update public.orders set status = p_status, department_id = v_dep where id = p_id;
+  insert into public.order_events (order_id, kind, from_status, to_status, from_department, to_department, text)
+  values (p_id, 'move', v.status, p_status, v.department_id, v_dep, v_txt);
+end $$;
+
+-- старий клієнт на старій схемі: одне замовлення відвантажив (по-старому, без видач), друге — в роботі з деталями
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+insert into public.orders (id, title, qty, department_id) values
+  ('cccccccc-0000-0000-0000-000000000041', 'Старе відвантажене', 3, (select id from public.departments where name = 'Прийом замовлень')),
+  ('cccccccc-0000-0000-0000-000000000042', 'Старе в роботі', 5, (select id from public.departments where name = 'Прийом замовлень'));
+insert into public.order_parts values ('cccccccc-0000-0000-0000-000000000042', 'aaaaaaaa-0000-0000-0000-000000000051', 5);
+select public.move_order('cccccccc-0000-0000-0000-000000000041', 'shipped');
+select public.move_order('cccccccc-0000-0000-0000-000000000042', 'in_work');
+select public.post_operation('in', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000051","qty":5}]');
+select public.post_operation('out', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000051","qty":1}]', '', '',
+                             null, null, 'cccccccc-0000-0000-0000-000000000042');
+reset role;
+do $$ begin assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000051') = 4; end $$;
+create temp table mig_orders as
+  select (select jsonb_agg(to_jsonb(o) order by o.id) from public.orders o) as orders,
+         (select count(*) from public.order_events) as events, (select count(*) from public.operations) as ops;
+
 -- старий клієнт на старій схемі додає позицію
 select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
 set role authenticated;
@@ -90,6 +155,15 @@ begin
   -- ролі й права людей не змінились
   assert (select r.name from public.profiles p join public.roles r on r.id = p.role_id
            where p.id = '11111111-1111-1111-1111-111111111111') = 'Адміністратор';
+  -- видачі замовнику: таблиці зʼявились порожні, замовлення, історія й операції — як були;
+  -- старе відвантажене замовлення лишилось відвантаженим, видач йому ніхто не «домалював»
+  assert (select count(*) from public.order_shipments) = 0 and (select count(*) from public.order_debts) = 0
+     and (select count(*) from public.order_debts_left) = 0, 'нові таблиці не порожні';
+  assert (select jsonb_agg(to_jsonb(o) order by o.id) from public.orders o) = (select orders from mig_orders), 'міграція змінила замовлення';
+  assert (select count(*) from public.order_events) = (select events from mig_orders)
+     and (select count(*) from public.operations) = (select ops from mig_orders), 'міграція змінила історію чи операції';
+  assert (select count(*) from public.operations where debt_id is not null) = 0 and (select count(*) from public.order_units where shipment_id is not null) = 0;
+  assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000051') = 4, 'резерв після міграції';
 end $$;
 
 -- після міграції: колишній адміністратор ivan уже не керує людьми, olena — керує
@@ -150,6 +224,41 @@ begin
   assert (select id from public.items order by sort_order limit 1) = 'aaaaaaaa-0000-0000-0000-000000000041';
 end $$;
 reset role;
+
+-- видачі замовнику після міграції. Старий клієнт на новій схемі (про видачі не знає): передає, коментує,
+-- видає деталі, відвантажує по-старому — усе працює; відвантаження саме дописує видачу всієї кількості
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+insert into public.order_events (order_id, kind, text) values ('cccccccc-0000-0000-0000-000000000042', 'comment', 'старий клієнт');
+select public.move_order('cccccccc-0000-0000-0000-000000000042', 'testing', (select id from public.departments where name = 'Тестування'), 'на тест');
+select public.post_operation('out', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000051","qty":1}]', '', '',
+                             null, null, 'cccccccc-0000-0000-0000-000000000042');
+insert into public.orders (id, title, qty, department_id) values
+  ('cccccccc-0000-0000-0000-000000000043', 'Нове після міграції', 2, (select id from public.departments where name = 'Прийом замовлень'));
+select public.move_order('cccccccc-0000-0000-0000-000000000043', 'shipped');
+do $$ begin
+  assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000051') = 3, 'видача деталей старим клієнтом';
+  assert (select count(*) from public.orders o left join public.order_units u on u.order_id = o.id) > 0;   -- старий select з order_units(*)
+  assert (select qty || '|' || auto from public.order_shipments where order_id = 'cccccccc-0000-0000-0000-000000000043') = '2|true';
+  -- відновлення старого відвантаженого (без видач) теж працює
+  perform public.move_order('cccccccc-0000-0000-0000-000000000041', 'in_work');
+  assert (select count(*) from public.order_shipments where order_id = 'cccccccc-0000-0000-0000-000000000041') = 0;
+end $$;
+-- новий клієнт: часткова видача з боргом на замовленні, що було ще до міграції
+select public.ship_order('cccccccc-0000-0000-0000-000000000042', 2, null, 'після міграції',
+                         '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000051","qty":2}]');
+do $$ begin
+  assert (select status from public.orders where id = 'cccccccc-0000-0000-0000-000000000042') = 'testing';
+  assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000051') = 5, '3 на збірку + 2 боргу';
+  perform public.close_order_debt((select id from public.order_debts), 1);
+  assert (select left_qty from public.order_debts_left) = 1;
+end $$;
+reset role;
+create temp table mig_ship as
+  select (select jsonb_agg(to_jsonb(t) order by t.id) from public.order_shipments t) as ships,
+         (select jsonb_agg(to_jsonb(t) order by t.id) from public.order_debts_left t) as debts,
+         (select jsonb_agg(to_jsonb(t) order by t.id) from public.order_events t) as events,
+         (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000051') as reserved;
 create temp table mig_order as select id, sort_order, updated_at from public.items;
 
 -- повторний запуск на вже мігрованій базі нічого не збиває
@@ -166,6 +275,16 @@ do $$ begin
   assert not exists (select 1 from public.roles where name = 'Звичайний користувач'), 'видалена роль воскресла';
   assert (select perms from public.roles where name = 'Старший користувач') = array['stock.view'], 'змінену роль перезаписано';
   assert (select count(*) from public.roles) = (select count(*) from mig_roles) + 1, 'повторний запуск додав ролі';
+  -- видачі, борги й історія — рядок у рядок, нічого не задвоїлось і не зникло
+  assert (select jsonb_agg(to_jsonb(t) order by t.id) from public.order_shipments t) = (select ships from mig_ship), 'повторний запуск змінив видачі';
+  assert (select jsonb_agg(to_jsonb(t) order by t.id) from public.order_debts_left t) = (select debts from mig_ship), 'повторний запуск змінив борги';
+  assert (select jsonb_agg(to_jsonb(t) order by t.id) from public.order_events t) = (select events from mig_ship), 'повторний запуск змінив історію';
+  assert (select reserved from public.stock where id = 'aaaaaaaa-0000-0000-0000-000000000051') = (select reserved from mig_ship);
+  assert (select count(*) from pg_policies where schemaname = 'public' and tablename in ('order_shipments', 'order_debts')) = 2, 'політики видач';
+  assert (select count(*) from pg_constraint where conrelid = 'public.order_events'::regclass and contype = 'c' and conname like '%kind%') = 1, 'обмеження видів подій задвоїлось';
+  assert (select count(*) from pg_trigger where tgrelid = 'public.orders'::regclass and tgname = 'orders_qty_guard') = 1;
+  assert (select count(*) from pg_proc where proname in ('ship_order', 'cancel_order_shipment', 'close_order_debt')) = 3, 'зайві версії функцій';
+  assert (select count(*) from pg_publication_tables where pubname = 'supabase_realtime') = 16;
 end $$;
 
 -- ручна передача статусу головного (README): olena → ivan, далі керує ivan, olena — вже ні

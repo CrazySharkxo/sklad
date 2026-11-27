@@ -1,6 +1,6 @@
 // Замовлення: прийом і опис продукту, що зробити (чекліст), деталі зі складу,
 // передача між відділами з історією. Тут же — список відділів.
-import { api, TRASH_DAYS, defaultSerial } from '../api.js';
+import { api, isDemo, TRASH_DAYS, defaultSerial } from '../api.js';
 import {
   esc, fmtQty, fmtDate, parseNum, round, norm, toast, confirmDialog, promptDialog,
   statusTag, ORDER_STATUS, todayIso, downloadXlsx,
@@ -8,6 +8,7 @@ import {
 import {
   state, go, reloadData, itemPicker, comboInput, userName, depName, myDepartment, ACTIVE_ORDER, ICON_PLUS, ICON_SCAN,
   trashRow, bindTrash, TRASH_EMPTY, can, isOverdue, isDueSoon, dueText, reservedOf, freeQty, resolveCode, shortItems,
+  shippedQty, shipLeft, openDebts, hasDebt,
 } from '../core.js';
 import { scanCode } from '../scanner.js';
 import { printOrder, printUnitLabels } from '../print.js';
@@ -24,6 +25,8 @@ const FILTERS = [
   ['mine', 'Мій відділ', (o) => isActive(o) && o.department_id === myDepartment()],
   ['active', 'Усі активні', isActive],
   ['overdue', 'Прострочені', isOverdue],
+  // борг перед замовником: видано неповним комплектом — тут і вже відвантажені, доки не довидано
+  ['debt', 'З боргом', hasDebt],
   ['testing', 'На тестуванні', (o) => o.status === 'testing'],
   ['rework', 'На доопрацюванні', (o) => o.status === 'rework'],
   ['done', 'Готові', (o) => o.status === 'done'],
@@ -35,10 +38,14 @@ function orderRow(o) {
   const n = doneCount(o);
   const t = o.tasks.length;
   const dueCls = isOverdue(o) ? 'overdue' : isDueSoon(o) ? 'soon' : 'due';
+  const shipped = shippedQty(o);
+  // «видано 20/55» — лише поки замовлення відкрите і щось уже видано; борг — завжди, доки не довидано
+  const ship = shipped > 0 && isActive(o) ? `<span class="ship-n" title="Видано замовнику">видано ${fmtQty(shipped)}/${fmtQty(o.qty)}</span>` : '';
+  const debt = hasDebt(o) ? '<span class="tag debt-tag" title="Замовнику видано неповним комплектом — є що довидати">борг</span>' : '';
   return `<a class="row order-row${isOverdue(o) ? ' is-overdue' : ''}" href="#/order/${o.id}">
     <div class="row-main">
       <div class="row-title"><span class="no">№${o.number}</span>${esc(o.title)}${o.qty !== 1 ? ` <span class="muted">× ${fmtQty(o.qty)}</span>` : ''}</div>
-      <div class="row-meta">${statusTag(o.status)}${esc(depName(o.department_id))}${o.customer ? ` · ${esc(o.customer)}` : ''}</div>
+      <div class="row-meta">${statusTag(o.status)}${debt}${ship}${esc(depName(o.department_id))}${o.customer ? ` · ${esc(o.customer)}` : ''}</div>
     </div>
     <div class="row-qty${t && n === t ? ' ok' : ''}">
       ${t ? `<b>${n}/${t}</b><small>пунктів</small>` : ''}
@@ -69,7 +76,7 @@ export function viewOrders(ctx) {
   ctx.main.innerHTML = `
     <div class="toolbar"><div class="search">
       <input type="search" id="q" placeholder="Пошук: номер, виріб, замовник, серійний №" value="${esc(ui.q)}" autocomplete="off"></div></div>
-    <div class="chips" id="chips">${FILTERS.filter(([k]) => k !== 'overdue' || counts.overdue || ui.f === 'overdue')
+    <div class="chips" id="chips">${FILTERS.filter(([k]) => (k !== 'overdue' && k !== 'debt') || counts[k] || ui.f === k)
     .map(([k, label]) => `<button class="chip${ui.f === k ? ' on' : ''}${k === 'overdue' ? ' danger' : ''}" data-f="${k}">${label}${k !== 'archive' && counts[k] ? ` · ${counts[k]}` : ''}</button>`).join('')}
       ${can('orders.delete') && (state.trashOrders.length || ui.f === 'trash') ? `<button class="chip trash-chip${ui.f === 'trash' ? ' on' : ''}" data-f="trash">Кошик${state.trashOrders.length ? ` · ${state.trashOrders.length}` : ''}</button>` : ''}</div>
     ${shortLink()}
@@ -124,7 +131,7 @@ export function viewOrders(ctx) {
     }
     listEl.innerHTML = list.length ? list.map(orderRow).join('')
       : `<div class="empty-state"><p>${words.length ? 'Нічого не знайдено' : ui.f === 'mine' ? 'На ваш відділ зараз нічого не чекає'
-        : ui.f === 'overdue' ? 'Прострочених замовлень немає' : 'Тут порожньо'}</p></div>`;
+        : ui.f === 'overdue' ? 'Прострочених замовлень немає' : ui.f === 'debt' ? 'Боргів перед замовниками немає' : 'Тут порожньо'}</p></div>`;
   };
   render();
   bindTrash(listEl, {
@@ -172,7 +179,8 @@ const MOVE_TITLE = {
 function actionButtons(o) {
   const del = can('orders.delete') ? '<button type="button" class="btn ghost sm del-btn" data-delete>Видалити</button>' : '';
   if (!can('orders.edit')) return `<span class="grow"></span>${del}`;
-  const main = (ACTIONS[o.status] || []).map(([to, label, cls]) => `<button type="button" class="btn ${cls}" data-to="${to}">${label}</button>`).join('');
+  const main = (ACTIONS[o.status] || []).map(([to, label, cls]) => `<button type="button" class="btn ${cls}" data-to="${to}">${label}</button>`).join('')
+    + (isActive(o) && shipLeft(o) > 0 ? '<button type="button" class="btn ghost" data-shipbtn>Видати замовнику</button>' : '');
   const extra = isActive(o) ? `<span class="grow"></span>
     <button type="button" class="link-btn plain" data-to="${o.status}" data-handoff>Передати в інший відділ</button>
     <button type="button" class="link-btn" data-to="cancelled">Скасувати замовлення</button>`
@@ -272,7 +280,7 @@ function partsHtml(o, issued) {
 // Вироби (серійні номери)
 // ------------------------------------------------------------------
 const unitRow = (u, hi) => `<div class="unit${hi ? ' hi' : ''}" data-unit="${u.id}">
-  <div class="unit-sn"><b>${esc(u.serial)}</b>${u.note ? `<small class="muted">${esc(u.note)}</small>` : ''}</div>
+  <div class="unit-sn"><b>${esc(u.serial)}</b>${u.shipment_id ? '<small class="pos">видано замовнику</small>' : ''}${u.note ? `<small class="muted">${esc(u.note)}</small>` : ''}</div>
   <label class="unit-chk" title="Зібрано"><input type="checkbox" data-k="assembled" ${u.assembled ? 'checked' : ''}${can('orders.edit') ? '' : ' disabled'}>
     <span>Зібрано${u.assembled ? `<small>${esc(userName(u.assembled_by))} ${fmtDate(u.assembled_at, false)}</small>` : ''}</span></label>
   <label class="unit-chk" title="Протестовано"><input type="checkbox" data-k="tested" ${u.tested ? 'checked' : ''}${can('orders.edit') ? '' : ' disabled'}>
@@ -322,10 +330,209 @@ function unitDialog(title, u = { serial: '', note: '' }) {
   });
 }
 
+// ------------------------------------------------------------------
+// Видача готових виробів замовнику (частинами) і борг — те, чого бракувало в комплекті
+// ------------------------------------------------------------------
+const shipText = (o) => {
+  const left = shipLeft(o);
+  return `<b>${fmtQty(shippedQty(o))} з ${fmtQty(o.qty)}</b>${left > 0 ? ` · лишилось ${fmtQty(left)}` : ' · видано все'}`;
+};
+
+function shipRow(o, s) {
+  const lack = o.debts.filter((d) => d.shipment_id === s.id)
+    .map((d) => `${esc(state.byId.get(d.item_id)?.name || '?')} × ${fmtQty(d.qty)}`).join(', ');
+  return `<div class="ship-row" data-ship-id="${s.id}">
+    <div class="ship-main"><span><b>${fmtQty(s.qty)}</b> · ${fmtDue(s.shipped_at)} · ${esc(userName(s.created_by))}</span>
+      ${s.auto ? '<small class="muted">залишок, записаний при переведенні у «Відвантажено»</small>' : ''}
+      ${lack ? `<small class="warn-text">неповним комплектом, бракувало: ${lack}</small>` : ''}
+      ${s.comment ? `<small class="muted">${esc(s.comment)}</small>` : ''}</div>
+    ${can('orders.edit') ? '<button type="button" class="link-btn" data-scancel>Скасувати</button>' : ''}</div>`;
+}
+
+function debtRow(d) {
+  const it = state.byId.get(d.item_id);
+  const u = esc(it?.unit || '');
+  if (!(d.left_qty > 0)) {
+    return `<div class="debt done" data-debt="${d.id}"><div class="debt-name"><a href="#/item/${d.item_id}">${esc(it?.name || '?')}</a>
+      <small class="pos">довидано ${fmtQty(d.qty)} ${u} — борг закрито</small></div></div>`;
+  }
+  const have = it?.qty || 0;
+  return `<div class="debt" data-debt="${d.id}"><div class="debt-name"><a href="#/item/${d.item_id}">${esc(it?.name || '?')}</a>
+      <small>винні <b data-c="left">${fmtQty(d.left_qty)}</b> ${u}${d.closed_qty > 0 ? ` з ${fmtQty(d.qty)} (довидано ${fmtQty(d.closed_qty)})` : ''}
+        · на складі <span data-c="have" class="${have < d.left_qty ? 'err-text-inline' : ''}">${fmtQty(have)}</span></small></div>
+    ${can('orders.edit') && can('ops.edit') ? '<button type="button" class="btn out sm" data-dclose>Довидати</button>' : ''}</div>`;
+}
+
+function shipHtml(o) {
+  const closed = !isActive(o);
+  if (closed && !o.shipments.length && !o.debts.length) return '';   // закрите ще до появи видач — показувати нічого
+  const done = shippedQty(o);
+  const left = shipLeft(o);
+  const open = openDebts(o);
+  const debts = o.status === 'cancelled' ? [] : o.debts;
+  return `<h3>Видача замовнику ${done > 0 ? `<span class="count${left > 0 ? '' : ' pos'}">${fmtQty(done)} з ${fmtQty(o.qty)}</span>` : ''}</h3>
+    <div class="card" id="ship">
+      <div class="progress"><i style="width:${Math.min(100, Math.round((100 * done) / o.qty))}%"></i></div>
+      <p class="ship-sum" id="ship-sum">${done > 0 ? `Видано ${shipText(o)}` : `Замовнику ще нічого не видано — лишилось ${fmtQty(left)}`}${
+    open.length ? ' · <span class="err-text-inline">є борг</span>' : ''}</p>
+      ${debts.length ? `<div class="debts" id="debts"><div class="section-title">Довидати замовнику${open.length ? ' <span class="tag debt-tag">борг</span>' : ''}</div>
+        ${open.length ? '<p class="muted small">Вироби видано неповним комплектом. «Довидати» списує деталь зі складу й зменшує борг.</p>' : ''}
+        ${debts.map(debtRow).join('')}</div>` : ''}
+      ${o.shipments.length ? `<div class="section-title">Що вже видано</div>
+        <div class="ship-list" id="ship-list">${o.shipments.slice().reverse().map((s) => shipRow(o, s)).join('')}</div>` : ''}
+      ${can('orders.edit') && !closed && left > 0 ? `<div class="form-actions"><span class="muted small">Можна видавати частинами — статус замовлення не зміниться, доки не видано все.</span>
+        <span class="grow"></span><button type="button" class="btn primary" data-shipbtn>Видати замовнику</button></div>` : ''}
+    </div>`;
+}
+
+// форма видачі: скільки, коли, і (необовʼязково) чого бракує в комплекті та які саме вироби пішли
+function shipDialog(o) {
+  return new Promise((resolve) => {
+    const left = shipLeft(o);
+    const lack = [];   // [{ item_id, qty }] — рядки «чого бракує»
+    const free = o.units.filter((u) => !u.shipment_id);
+    const wrap = document.createElement('div');
+    wrap.className = 'modal-wrap';
+    wrap.innerHTML = `<form class="modal move-dialog ship-dialog" role="dialog" aria-modal="true" autocomplete="off">
+      <h2 class="modal-title">Видати замовнику</h2>
+      <p class="muted">№${o.number} · ${esc(o.title)}${o.customer ? ` · ${esc(o.customer)}` : ''}</p>
+      <p id="ship-state">Видано <b>${fmtQty(shippedQty(o))}</b> з <b>${fmtQty(o.qty)}</b> · лишилось <b>${fmtQty(left)}</b></p>
+      <div class="ship-grid">
+        <label class="field"><span>Скільки виробів видаєте</span><input name="qty" inputmode="decimal" value="${fmtQty(left)}"></label>
+        <label class="field"><span>Дата</span><input name="date" type="date" value="${todayIso()}"></label>
+      </div>
+      <label class="check"><input type="checkbox" name="partial"> <span>Видано неповним комплектом — чогось бракує</span></label>
+      <div class="ship-lack" id="ship-lack" hidden>
+        <p class="muted small">Вкажіть, чого й скільки замовнику недодано. Це запишеться як борг: зʼявиться в «Довидати замовнику» і в нестачі на складі.</p>
+        ${o.parts.length ? `<select name="frompart" aria-label="Додати з деталей замовлення"><option value="">＋ З деталей замовлення…</option>
+          ${o.parts.map((p) => `<option value="${p.item_id}">${esc(state.byId.get(p.item_id)?.name || '?')}</option>`).join('')}</select>` : ''}
+        <div id="spick"></div>
+        <div class="lines" id="slines"></div>
+      </div>
+      ${free.length ? `<details class="ship-units"><summary>Які саме вироби видаєте (необовʼязково)</summary>
+        <div class="ship-unit-list">${free.map((u) => `<label class="check"><input type="checkbox" name="unit" value="${u.id}"> <span>${esc(u.serial)}</span></label>`).join('')}</div></details>` : ''}
+      <label class="field"><span>Коментар</span><textarea name="c" rows="2" placeholder="Кому передано, номер накладної…"></textarea></label>
+      <p class="err-text" data-err hidden></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-cancel>Назад</button>
+        <button class="btn primary" id="ship-ok">Видати</button>
+      </div></form>`;
+    const form = wrap.querySelector('form');
+    const linesEl = form.querySelector('#slines');
+    const lackEl = form.querySelector('#ship-lack');
+    const err = form.querySelector('[data-err]');
+    const done = (v) => { wrap.remove(); document.removeEventListener('keydown', onKey); resolve(v); };
+    const onKey = (e) => { if (e.key === 'Escape') done(null); };
+    const fail = (msg, el) => { err.textContent = msg; err.hidden = false; el?.focus(); };
+    const renderLines = (focus = -1) => {
+      err.hidden = true;
+      linesEl.innerHTML = lack.length ? lack.map((l, n) => {
+        const it = state.byId.get(l.item_id);
+        return `<div class="line" data-n="${n}"><div class="line-name"><b>${esc(it?.name || '?')}</b>
+            <small class="muted">на складі ${fmtQty(it?.qty || 0)} ${esc(it?.unit || '')}</small></div>
+          <input class="qty" inputmode="decimal" value="${esc(l.qty)}" placeholder="к-сть" aria-label="Скільки бракує">
+          <span class="unit">${esc(it?.unit || '')}</span>
+          <button type="button" class="icon-btn" data-rm aria-label="Прибрати">✕</button></div>`;
+      }).join('') : '<div class="muted pad center">Знайдіть позицію в полі вище</div>';
+      if (focus >= 0) linesEl.querySelectorAll('.qty')[focus]?.focus();
+    };
+    const addLack = (itemId, qty) => {
+      let i = lack.findIndex((l) => l.item_id === itemId);
+      if (i < 0) { lack.push({ item_id: itemId, qty }); i = lack.length - 1; }
+      renderLines(i);
+    };
+    form.partial.addEventListener('change', () => {
+      lackEl.hidden = !form.partial.checked;
+      if (form.partial.checked) renderLines();
+    });
+    itemPicker(form.querySelector('#spick'), (item) => addLack(item.id, ''), { placeholder: 'Чого бракує: назва або код…' });
+    // з деталей замовлення: за замовчуванням — скільки цієї деталі припадає на вироби, що видаються
+    form.frompart?.addEventListener('change', () => {
+      const p = o.parts.find((x) => x.item_id === form.frompart.value);
+      form.frompart.value = '';
+      if (!p) return;
+      const n = parseNum(form.qty.value) > 0 ? parseNum(form.qty.value) : left;
+      addLack(p.item_id, fmtQty(round((p.qty / o.qty) * n)));
+    });
+    linesEl.addEventListener('input', (e) => { if (e.target.classList.contains('qty')) lack[+e.target.closest('.line').dataset.n].qty = e.target.value; });
+    linesEl.addEventListener('click', (e) => { if (e.target.closest('[data-rm]')) { lack.splice(+e.target.closest('.line').dataset.n, 1); renderLines(); } });
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      err.hidden = true;
+      const qty = parseNum(form.qty.value);
+      if (!(qty > 0)) return fail('Вкажіть, скільки виробів видаєте', form.qty);
+      if (qty > left) return fail(`Не можна видати ${fmtQty(qty)}: лишилось видати ${fmtQty(left)}`, form.qty);
+      const debts = [];
+      if (form.partial.checked) {
+        if (!lack.length) return fail('Додайте, чого бракує, або зніміть позначку «неповним комплектом»');
+        for (const l of lack) {
+          const q = parseNum(l.qty);
+          if (!(q > 0)) return fail(`Вкажіть, скільки бракує: «${state.byId.get(l.item_id)?.name}»`);
+          debts.push({ item_id: l.item_id, qty: q });
+        }
+      }
+      const units = [...form.querySelectorAll('[name=unit]:checked')].map((x) => x.value);
+      if (units.length > qty) return fail(`Позначено виробів: ${units.length} — більше, ніж видаєте (${fmtQty(qty)})`);
+      done({ qty, date: form.date.value || null, comment: form.c.value.trim(), debts, units });
+    });
+    form.querySelector('[data-cancel]').addEventListener('click', () => done(null));
+    wrap.addEventListener('click', (e) => { if (e.target === wrap) done(null); });
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(wrap);
+    form.qty.focus();
+    form.qty.select();
+  });
+}
+
+// довидати борг: скільки (можна частину) — стільки ж спишеться зі складу
+function debtDialog(o, d) {
+  return new Promise((resolve) => {
+    const it = state.byId.get(d.item_id);
+    const u = esc(it?.unit || '');
+    const have = it?.qty || 0;
+    const wrap = document.createElement('div');
+    wrap.className = 'modal-wrap';
+    wrap.innerHTML = `<form class="modal small move-dialog debt-dialog" role="dialog" aria-modal="true" autocomplete="off">
+      <h2 class="modal-title">Довидати замовнику</h2>
+      <p class="muted">№${o.number} · ${esc(o.title)}</p>
+      <p><b>${esc(it?.name || '?')}</b><br>борг ${fmtQty(d.left_qty)} ${u} · на складі ${fmtQty(have)} ${u}</p>
+      ${have < d.left_qty ? `<p class="badge warn">На складі менше, ніж винні — можна довидати частину${have > 0 ? ` (до ${fmtQty(have)})` : ', коли приїде'}.</p>` : ''}
+      <label class="field"><span>Скільки довидаєте</span><input name="qty" inputmode="decimal" value="${fmtQty(Math.min(d.left_qty, Math.max(have, 0)) || d.left_qty)}"></label>
+      <label class="field"><span>Коментар</span><input name="c" placeholder="необовʼязково"></label>
+      <p class="muted small">Ця кількість спишеться зі складу видатком під замовлення №${o.number}.</p>
+      <p class="err-text" data-err hidden></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-cancel>Назад</button>
+        <button class="btn out" id="debt-ok">Довидати</button>
+      </div></form>`;
+    const form = wrap.querySelector('form');
+    const err = form.querySelector('[data-err]');
+    const done = (v) => { wrap.remove(); document.removeEventListener('keydown', onKey); resolve(v); };
+    const onKey = (e) => { if (e.key === 'Escape') done(null); };
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const qty = parseNum(form.qty.value);
+      const fail = (msg) => { err.textContent = msg; err.hidden = false; form.qty.focus(); };
+      if (!(qty > 0)) return fail('Вкажіть, скільки довидаєте');
+      if (qty > d.left_qty) return fail(`Борг — лише ${fmtQty(d.left_qty)}`);
+      done({ qty, comment: form.c.value.trim() });
+    });
+    form.querySelector('[data-cancel]').addEventListener('click', () => done(null));
+    wrap.addEventListener('click', (e) => { if (e.target === wrap) done(null); });
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(wrap);
+    form.qty.focus();
+    form.qty.select();
+  });
+}
+
 function eventHtml(e) {
   let head;
   if (e.kind === 'created') head = `<b>Замовлення прийнято</b> <span>→ ${esc(depName(e.to_department))}</span>`;
   else if (e.kind === 'comment') head = '<b>Коментар</b>';
+  else if (e.kind === 'ship') head = '<b>Видача замовнику</b>';
+  else if (e.kind === 'ship_cancel') head = '<b>Видачу замовнику скасовано</b>';
+  else if (e.kind === 'debt') head = '<b>Довидача боргу замовнику</b>';
   else {
     const st = e.from_status !== e.to_status ? `${statusTag(e.from_status)}<span>→</span>${statusTag(e.to_status)}` : '<b>Передано</b>';
     const dp = e.from_department !== e.to_department
@@ -354,10 +561,12 @@ export async function viewOrder(ctx, id, query) {
     <div class="card order-card">
       <div class="order-head">${statusTag(o.status)}<b>${esc(depName(o.department_id))}</b>
         ${mineHere ? '<span class="badge warn">чекає на ваш відділ</span>' : ''}
-        ${isOverdue(o) ? `<span class="badge danger">${dueText(o)}</span>` : isDueSoon(o) ? `<span class="badge warn">термін ${dueText(o)}</span>` : ''}</div>
+        ${isOverdue(o) ? `<span class="badge danger">${dueText(o)}</span>` : isDueSoon(o) ? `<span class="badge warn">термін ${dueText(o)}</span>` : ''}
+        ${hasDebt(o) ? '<span class="badge danger" id="debt-badge">є борг перед замовником</span>' : ''}</div>
       <dl class="props">
         <dt>Замовник</dt><dd>${esc(o.customer) || '—'}</dd>
         <dt>Кількість</dt><dd>${fmtQty(o.qty)}</dd>
+        ${shippedQty(o) > 0 ? `<dt>Видано замовнику</dt><dd id="ship-prop">${shipText(o)}</dd>` : ''}
         ${o.due_date ? `<dt>Термін</dt><dd class="${isOverdue(o) ? 'overdue' : ''}">${fmtDue(o.due_date)}${isActive(o) && dueText(o) ? ` — ${dueText(o)}` : ''}</dd>` : ''}
         <dt>Прийняв</dt><dd>${esc(userName(o.created_by))}, ${fmtDate(o.created_at)}</dd>
       </dl>
@@ -379,6 +588,8 @@ export async function viewOrder(ctx, id, query) {
       : `<p class="muted">Деталі не вказані.${can('orders.edit') ? ` <a href="#/order-edit/${id}">Додати</a> — тоді буде видно, чого бракує на складі, деталі зарезервуються, а видача спишеться під це замовлення.` : ''}</p>`}</div>
 
     ${unitsHtml(o, hiUnit)}
+
+    ${shipHtml(o)}
 
     <h3>Історія</h3>
     <div class="card">
@@ -449,7 +660,60 @@ export async function viewOrder(ctx, id, query) {
     } catch (err) { toast(err.message, 'err', 6000); }
   });
 
+  // ---- видача замовнику, борги ----
+  // без мережі такі записи в чергу не ставляться: залежать від того, скільки вже видано
+  const netOk = () => {
+    if (isDemo || (navigator.onLine && !state.offline)) return true;
+    toast('Немає мережі — видачу замовнику не записано. Спробуйте, коли зʼявиться інтернет', 'err', 6000);
+    return false;
+  };
+  const doShip = async () => {
+    const cur = findOrder(id) || o;
+    const r = await shipDialog(cur);
+    if (!r || !netOk()) return;
+    try {
+      await api.shipOrder(id, r);
+      const left = round(shipLeft(cur) - r.qty);
+      toast(left > 0 ? `Видано замовнику ${fmtQty(r.qty)} · лишилось ${fmtQty(left)}` : 'Видано все — замовлення відвантажено');
+      await refresh();
+    } catch (err) { toast(err.message, 'err', 8000); }
+  };
+  ctx.main.querySelector('#ship')?.addEventListener('click', async (e) => {
+    const cur = findOrder(id) || o;
+    if (e.target.closest('[data-shipbtn]')) { doShip(); return; }
+    const row = e.target.closest('[data-ship-id]');
+    if (row && e.target.closest('[data-scancel]')) {
+      const s = cur.shipments.find((x) => x.id === row.dataset.shipId);
+      if (!s) return;
+      const back = cur.status === 'shipped' ? ' Замовлення знову стане відкритим.' : '';
+      const debts = cur.debts.some((d) => d.shipment_id === s.id) ? ' Борг за цією видачею теж зникне.' : '';
+      if (!await confirmDialog(`Скасувати видачу замовнику ${fmtQty(s.qty)} від ${fmtDue(s.shipped_at)}? Ця кількість повернеться в «лишилось видати».${debts}${back}`,
+        { ok: 'Скасувати видачу', cancel: 'Назад', danger: true })) return;
+      if (!netOk()) return;
+      try {
+        await api.cancelShipment(s.id);
+        toast('Видачу скасовано');
+        await refresh();
+      } catch (err) { toast(err.message, 'err', 8000); }
+      return;
+    }
+    const drow = e.target.closest('[data-debt]');
+    if (drow && e.target.closest('[data-dclose]')) {
+      const d = cur.debts.find((x) => x.id === drow.dataset.debt);
+      if (!d) return;
+      const r = await debtDialog(cur, d);
+      if (!r || !netOk()) return;
+      try {
+        await api.closeDebt(d.id, r.qty, r.comment);
+        const left = round(d.left_qty - r.qty);
+        toast(left > 0 ? `Довидано ${fmtQty(r.qty)} · борг лишився ${fmtQty(left)}` : 'Довидано — борг за позицією закрито');
+        await refresh();
+      } catch (err) { toast(err.message, 'err', 8000); }
+    }
+  });
+
   ctx.main.querySelector('#acts').addEventListener('click', async (e) => {
+    if (e.target.closest('[data-shipbtn]')) { doShip(); return; }
     if (e.target.closest('[data-delete]')) {
       const parts = Object.values(issued).some((q) => q > 0)
         ? ' Видані під нього деталі лишаться списаними — щоб повернути їх на склад, видаліть видачу в журналі.' : '';
@@ -470,6 +734,10 @@ export async function viewOrder(ctx, id, query) {
     let warn = '';
     if (to === 'testing' && o.tasks.length && n < o.tasks.length) warn = `Виконано ${n} з ${o.tasks.length} пунктів чекліста.`;
     if (to === 'shipped' && o.parts.some((p) => (issued[p.item_id] || 0) < p.qty)) warn = 'Не всі деталі видано зі складу.';
+    if (to === 'shipped' && shipLeft(o) > 0) {
+      warn += `${warn ? ' ' : ''}${shippedQty(o) > 0 ? `Замовнику видано ${fmtQty(shippedQty(o))} з ${fmtQty(o.qty)}. Решту — ${fmtQty(shipLeft(o))} —` : `Усі ${fmtQty(o.qty)}`} буде записано як видані замовнику сьогодні.`;
+    }
+    if (to === 'shipped' && hasDebt(o)) warn += `${warn ? ' ' : ''}Борг перед замовником лишиться в замовленні, доки його не довидано.`;
     const dep = handoff ? state.departments.find((d) => d.id !== o.department_id)?.id : defaultDept(o, to, events);
     const r = await moveDialog({ o, to, handoff, dep, warn });
     if (!r) return;

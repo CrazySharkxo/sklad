@@ -1222,9 +1222,412 @@ do $$ begin
 end $$;
 reset role;
 
+-- =====================================================================
+--  Видача замовнику частинами, борг (неповний комплект) і довидача
+-- =====================================================================
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+insert into public.items (id, name) values ('aaaaaaaa-0000-0000-0000-000000000051', 'ВЗ камера'),
+                                           ('aaaaaaaa-0000-0000-0000-000000000052', 'ВЗ кабель');
+select public.post_operation('in', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000051","qty":7}]');
+insert into public.orders (id, title, customer, qty, department_id) values
+  ('cccccccc-0000-0000-0000-000000000031', 'МАД - аналог - фпв (CM4)', 'Замовник ВЗ', 55,
+   (select id from public.departments where name = 'Прийом замовлень'));
+insert into public.order_parts values ('cccccccc-0000-0000-0000-000000000031', 'aaaaaaaa-0000-0000-0000-000000000051', 55);
+do $$ begin assert (select reserved from public.stock where name = 'ВЗ камера') = 55; end $$;
+
+-- часткова видача: лишок, статус не міняється, подія ship
+select public.ship_order('cccccccc-0000-0000-0000-000000000031', 20, '2026-11-20', 'накладна 17');
+do $$ begin
+  assert (select status from public.orders where id = 'cccccccc-0000-0000-0000-000000000031') = 'new', 'часткова видача змінила статус';
+  assert (select sum(qty) from public.order_shipments where order_id = 'cccccccc-0000-0000-0000-000000000031') = 20;
+  assert (select shipped_at::text || '|' || comment || '|' || created_by from public.order_shipments)
+       = '2026-11-20|накладна 17|11111111-1111-1111-1111-111111111111', 'поля видачі';
+  assert (select text from public.order_events where kind = 'ship')
+       = E'Видано замовнику 20 — усього 20 з 55, лишилось 35\nнакладна 17', (select text from public.order_events where kind = 'ship');
+  -- понад лишок, нуль — відмова; нічого не записалось
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000031', 36);
+    raise exception 'видано понад лишок';
+  exception when raise_exception then assert sqlerrm = 'Не можна видати 36: лишилось видати 35 з 55', sqlerrm;
+  end;
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000031', 0);
+    raise exception 'нульова видача пройшла';
+  exception when raise_exception then assert sqlerrm = 'Вкажіть, скільки виробів видано', sqlerrm;
+  end;
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000031', 5, null, '', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000051","qty":0}]');
+    raise exception 'борг з нульовою кількістю пройшов';
+  exception when raise_exception then assert sqlerrm = 'Неправильна кількість для «ВЗ камера»', sqlerrm;
+  end;
+  assert (select count(*) from public.order_shipments) = 1 and (select count(*) from public.order_debts) = 0, 'невдала видача лишила слід';
+  -- напряму в таблиці не записати
+  begin
+    insert into public.order_shipments (order_id, qty) values ('cccccccc-0000-0000-0000-000000000031', 1);
+    raise exception 'прямий запис видачі пройшов';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    update public.order_debts set qty = 1;
+    raise exception 'прямий update боргу пройшов';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+
+-- видача неповним комплектом: борг 10 камер (два рядки однієї позиції зводяться), резерв росте
+select public.ship_order('cccccccc-0000-0000-0000-000000000031', 10, null, '',
+  '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000051","qty":4},{"item_id":"aaaaaaaa-0000-0000-0000-000000000051","qty":6}]');
+do $$ begin
+  assert (select count(*) from public.order_debts) = 1 and (select qty from public.order_debts) = 10, 'борг';
+  assert (select left_qty from public.order_debts_left) = 10 and (select closed_qty from public.order_debts_left) = 0;
+  assert (select shipped_at from public.order_shipments where qty = 10) = current_date, 'дата за замовчуванням — сьогодні';
+  assert (select status from public.orders where id = 'cccccccc-0000-0000-0000-000000000031') = 'new';
+  assert (select reserved from public.stock where name = 'ВЗ камера') = 65, 'борг не потрапив у резерв';
+  assert (select text from public.order_events where kind = 'ship' order by id desc limit 1)
+       = E'Видано замовнику 10 — усього 30 з 55, лишилось 25\nНеповним комплектом, бракує: ВЗ камера × 10 шт';
+  -- кількість у замовленні не може стати меншою за видане
+  begin
+    update public.orders set qty = 29 where id = 'cccccccc-0000-0000-0000-000000000031';
+    raise exception 'кількість зменшено нижче виданого';
+  exception when raise_exception then assert sqlerrm = 'Замовнику вже видано 30 — кількість у замовленні не може бути меншою', sqlerrm;
+  end;
+  update public.orders set qty = 30 where id = 'cccccccc-0000-0000-0000-000000000031';
+  update public.orders set qty = 55 where id = 'cccccccc-0000-0000-0000-000000000031';
+end $$;
+
+-- довидача: частково (списує склад, у «видане на збірку» не рахується), понад борг і понад залишок — відмова
+do $$
+declare v_op uuid;
+begin
+  begin
+    perform public.close_order_debt((select id from public.order_debts), 11);
+    raise exception 'довидано понад борг';
+  exception when raise_exception then assert sqlerrm = 'Не можна довидати 11 «ВЗ камера»: борг — 10', sqlerrm;
+  end;
+  v_op := public.close_order_debt((select id from public.order_debts), 4);
+  assert (select qty from public.stock where name = 'ВЗ камера') = 3, 'довидача не списала склад';
+  assert (select left_qty from public.order_debts_left) = 6 and (select closed_qty from public.order_debts_left) = 4;
+  assert (select type || '|' || order_id || '|' || counterparty from public.operations where id = v_op)
+       = 'out|cccccccc-0000-0000-0000-000000000031|Замовник ВЗ', 'операція довидачі';
+  assert (select debt_id from public.operations where id = v_op) = (select id from public.order_debts);
+  assert (select reserved from public.stock where name = 'ВЗ камера') = 61, 'резерв: 55 на збірку + 6 боргу';
+  assert (select text from public.order_events where kind = 'debt') = 'Довидано замовнику: ВЗ камера × 4 шт — борг лишився 6';
+  begin
+    perform public.close_order_debt((select id from public.order_debts), 6);
+    raise exception 'довидано більше, ніж є на складі';
+  exception when raise_exception then assert sqlerrm = 'Недостатньо «ВЗ камера»: є 3, потрібно 6', sqlerrm;
+  end;
+  assert (select left_qty from public.order_debts_left) = 6 and (select count(*) from public.operations where debt_id is not null) = 1, 'невдала довидача лишила слід';
+  -- видалена в журналі довидача знову відкриває борг і повертає склад; відновлена — закриває
+  perform public.cancel_operation(v_op);
+  assert (select left_qty from public.order_debts_left) = 10 and (select qty from public.stock where name = 'ВЗ камера') = 7;
+  perform public.restore_operation(v_op);
+  assert (select left_qty from public.order_debts_left) = 6 and (select qty from public.stock where name = 'ВЗ камера') = 3;
+end $$;
+
+-- права: без orders.edit — ні; чужий відділ без orders.all — не видно й не змінити; довидача — ще й ops.edit
+reset role;
+create temp table ship_olya as select id, perms, active, department_id from public.profiles
+ where id = (select id from auth.users where email = 'view@example.com');
+update public.profiles set perms = array['orders.view', 'orders.all', 'ops.edit'], active = true
+ where id = (select id from ship_olya);
+select set_config('request.jwt.claim.sub', (select id::text from ship_olya), false);
+set role authenticated;
+do $$ begin
+  assert (select count(*) from public.order_shipments) = 2 and (select count(*) from public.order_debts_left) = 1, 'з orders.view видачі видно';
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000031', 1);
+    raise exception 'видано без orders.edit';
+  exception when raise_exception then assert sqlerrm = 'Немає права змінювати замовлення', sqlerrm;
+  end;
+  begin
+    perform public.cancel_order_shipment((select id from public.order_shipments where qty = 20));
+    raise exception 'видачу скасовано без orders.edit';
+  exception when raise_exception then assert sqlerrm = 'Немає права змінювати замовлення', sqlerrm;
+  end;
+  begin
+    perform public.close_order_debt((select id from public.order_debts), 1);
+    raise exception 'довидано без orders.edit';
+  exception when raise_exception then assert sqlerrm = 'Немає права змінювати замовлення', sqlerrm;
+  end;
+end $$;
+reset role;
+update public.profiles set perms = array['orders.view', 'orders.edit', 'ops.edit'],
+       department_id = (select id from public.departments where name = 'Тестування')
+ where id = (select id from ship_olya);
+set role authenticated;
+do $$ begin
+  assert (select count(*) from public.order_shipments) = 0 and (select count(*) from public.order_debts) = 0
+     and (select count(*) from public.order_debts_left) = 0, 'видно видачі чужого відділу';
+  assert (select reserved from public.stock where name = 'ВЗ камера') = 61, 'резерв рахується за всіма відділами';
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000031', 1);
+    raise exception 'видано з чужого відділу';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+end $$;
+reset role;
+do $$
+declare v_ship uuid := (select id from public.order_shipments where qty = 20);
+        v_debt uuid := (select id from public.order_debts);
+begin
+  set local role authenticated;
+  begin
+    perform public.cancel_order_shipment(v_ship);
+    raise exception 'скасовано видачу чужого відділу';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+  begin
+    perform public.close_order_debt(v_debt, 1);
+    raise exception 'довидано борг чужого відділу';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+end $$;
+update public.profiles set perms = array['orders.view', 'orders.edit', 'orders.all'] where id = (select id from ship_olya);
+set role authenticated;
+do $$ begin
+  begin
+    perform public.close_order_debt((select id from public.order_debts), 1);
+    raise exception 'довидано без права на видаток';
+  exception when raise_exception then assert sqlerrm = 'Немає права проводити прихід і видаток', sqlerrm;
+  end;
+  assert (select left_qty from public.order_debts_left) = 6;
+end $$;
+reset role;
+update public.profiles p set perms = o.perms, active = o.active, department_id = o.department_id from ship_olya o where p.id = o.id;
+drop table ship_olya;
+set role anon;
+do $$ begin
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000031', 1);
+    raise exception 'anon викликав ship_order';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+reset role;
+
+-- видано все → «Відвантажено» тим самим move_order (подія move); борг лишається в резерві
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+select public.ship_order('cccccccc-0000-0000-0000-000000000031', 25);
+do $$ begin
+  assert (select status from public.orders where id = 'cccccccc-0000-0000-0000-000000000031') = 'shipped', 'повна видача не закрила замовлення';
+  assert (select from_status || '>' || to_status || '|' || text from public.order_events
+           where order_id = 'cccccccc-0000-0000-0000-000000000031' order by id desc limit 1)
+       = 'new>shipped|Видано замовнику 25 — усього 55 з 55';
+  assert (select count(*) from public.order_events where order_id = 'cccccccc-0000-0000-0000-000000000031' and kind = 'ship') = 2, 'остання видача — одна подія, не дві';
+  assert (select closed_from from public.order_shipments where qty = 25) = 'new';
+  assert (select count(*) from public.order_shipments where auto) = 0;
+  assert (select reserved from public.stock where name = 'ВЗ камера') = 6, 'після відвантаження в резерві лишається борг';
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000031', 1);
+    raise exception 'видано з відвантаженого';
+  exception when raise_exception then assert sqlerrm = 'Замовлення закрите (відвантажено) — видати замовнику не можна', sqlerrm;
+  end;
+end $$;
+
+-- скасування видачі, що закрила замовлення: лишок і статус повертаються
+select public.cancel_order_shipment((select id from public.order_shipments where qty = 25));
+do $$ begin
+  assert (select status from public.orders where id = 'cccccccc-0000-0000-0000-000000000031') = 'new', 'статус не повернувся';
+  assert (select sum(qty) from public.order_shipments where cancelled_at is null) = 30;
+  assert (select cancelled_by from public.order_shipments where qty = 25) = '11111111-1111-1111-1111-111111111111';
+  assert (select from_status || '>' || to_status from public.order_events
+           where order_id = 'cccccccc-0000-0000-0000-000000000031' order by id desc limit 1) = 'shipped>new';
+  assert (select reserved from public.stock where name = 'ВЗ камера') = 61;
+  begin
+    perform public.cancel_order_shipment((select id from public.order_shipments where qty = 25));
+    raise exception 'повторне скасування пройшло';
+  exception when raise_exception then assert sqlerrm = 'Видачу не знайдено або її вже скасовано', sqlerrm;
+  end;
+  -- за видачею з боргом уже довидано 4 — її не скасувати
+  begin
+    perform public.cancel_order_shipment((select id from public.order_shipments where qty = 10));
+    raise exception 'скасовано видачу з довиданим боргом';
+  exception when raise_exception then assert sqlerrm like 'За цією видачею вже довидано деталі%', sqlerrm;
+  end;
+  assert (select count(*) from public.order_debts) = 1;
+end $$;
+
+-- ручне «Відвантажено» на частково виданому: залишок дописується сам; «Відновити» його знімає
+select public.move_order('cccccccc-0000-0000-0000-000000000031', 'in_work');
+select public.move_order('cccccccc-0000-0000-0000-000000000031', 'shipped');
+do $$ begin
+  assert (select qty || '|' || closed_from from public.order_shipments where auto and cancelled_at is null) = '25|in_work', 'залишок не дописано';
+  assert (select sum(qty) from public.order_shipments where cancelled_at is null) = 55;
+end $$;
+select public.move_order('cccccccc-0000-0000-0000-000000000031', 'in_work');
+do $$ begin
+  assert (select sum(qty) from public.order_shipments where cancelled_at is null) = 30, '«Відновити» не зняло дописаний залишок';
+  assert (select count(*) from public.order_shipments where closed_from is not null) = 0;
+end $$;
+-- те саме, але скасовують сам дописаний залишок: замовлення повертається туди, звідки закрилось
+select public.move_order('cccccccc-0000-0000-0000-000000000031', 'shipped');
+select public.cancel_order_shipment((select id from public.order_shipments where auto and cancelled_at is null));
+do $$ begin
+  assert (select status from public.orders where id = 'cccccccc-0000-0000-0000-000000000031') = 'in_work';
+  assert (select sum(qty) from public.order_shipments where cancelled_at is null) = 30;
+end $$;
+
+-- серійні номери: які саме вироби пішли (необовʼязково); скасування видачі знімає позначку
+insert into public.order_units (id, order_id, position, serial) values
+  ('eeeeeeee-0000-0000-0000-000000000031', 'cccccccc-0000-0000-0000-000000000031', 0, 'VZ-01'),
+  ('eeeeeeee-0000-0000-0000-000000000032', 'cccccccc-0000-0000-0000-000000000031', 1, 'VZ-02'),
+  ('eeeeeeee-0000-0000-0000-000000000033', 'cccccccc-0000-0000-0000-000000000031', 2, 'VZ-03');
+do $$
+declare v uuid;
+begin
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000031', 1, null, '', '[]',
+      array['eeeeeeee-0000-0000-0000-000000000031', 'eeeeeeee-0000-0000-0000-000000000032']::uuid[]);
+    raise exception 'виробів більше, ніж видано';
+  exception when raise_exception then assert sqlerrm = 'Вибрано виробів більше, ніж видається', sqlerrm;
+  end;
+  begin
+    update public.order_units set shipment_id = (select id from public.order_shipments limit 1);
+    raise exception 'позначку «видано» поставлено напряму';
+  exception when insufficient_privilege then null;
+  end;
+  v := public.ship_order('cccccccc-0000-0000-0000-000000000031', 2, null, '', '[]',
+    array['eeeeeeee-0000-0000-0000-000000000031', 'eeeeeeee-0000-0000-0000-000000000032']::uuid[]);
+  assert (select count(*) from public.order_units where shipment_id = v) = 2;
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000031', 1, null, '', '[]', array['eeeeeeee-0000-0000-0000-000000000031']::uuid[]);
+    raise exception 'виріб видано двічі';
+  exception when raise_exception then assert sqlerrm = 'Серед вибраних виробів є чужий або вже виданий', sqlerrm;
+  end;
+  perform public.cancel_order_shipment(v);
+  assert (select count(*) from public.order_units where shipment_id is not null) = 0, 'скасування не зняло позначку з виробів';
+  assert (select text from public.order_events where kind = 'ship_cancel' order by id desc limit 1)
+       = format('Скасовано видачу замовнику 2 від %s — видано 30 з 55', to_char(current_date, 'DD.MM.YYYY'));
+end $$;
+delete from public.order_units where order_id = 'cccccccc-0000-0000-0000-000000000031';
+
+-- видача з боргом, за яким ще нічого не довидано, скасовується разом із боргом
+do $$
+declare v uuid;
+begin
+  v := public.ship_order('cccccccc-0000-0000-0000-000000000031', 3, null, '', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000052","qty":2}]');
+  assert (select reserved from public.stock where name = 'ВЗ кабель') = 2;
+  -- позицію, що є в боргу, остаточно не видалити
+  perform public.trash_item('aaaaaaaa-0000-0000-0000-000000000052');
+  begin
+    perform public.purge_item('aaaaaaaa-0000-0000-0000-000000000052');
+    raise exception 'позицію з боргу видалено назавжди';
+  exception when raise_exception then assert sqlerrm like 'Позиція має історію руху%', sqlerrm;
+  end;
+  perform public.restore_item('aaaaaaaa-0000-0000-0000-000000000052');
+  perform public.cancel_order_shipment(v);
+  assert (select count(*) from public.order_debts) = 1 and (select reserved from public.stock where name = 'ВЗ кабель') = 0, 'борг скасованої видачі лишився';
+end $$;
+
+-- борг закривається повністю; у кошику замовлення не резервує; остаточне видалення прибирає видачі й борги
+select public.post_operation('in', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000051","qty":5}]');
+do $$
+declare v_op uuid;
+begin
+  v_op := public.close_order_debt((select id from public.order_debts), 5, 'довезли');
+  assert (select left_qty from public.order_debts_left) = 1 and (select qty from public.stock where name = 'ВЗ камера') = 3;
+  assert (select comment from public.operations where id = v_op) = 'довезли';
+  assert (select reserved from public.stock where name = 'ВЗ камера') = 56;   -- замовлення в роботі: 55 на збірку + 1 боргу
+  perform public.delete_order('cccccccc-0000-0000-0000-000000000031');
+  assert (select reserved from public.stock where name = 'ВЗ камера') = 0, 'замовлення в кошику тримає резерв';
+  begin
+    perform public.ship_order('cccccccc-0000-0000-0000-000000000031', 1);
+    raise exception 'видано з кошика';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+  begin
+    perform public.close_order_debt((select id from public.order_debts), 1);
+    raise exception 'довидано борг замовлення з кошика';
+  exception when raise_exception then assert sqlerrm = 'Замовлення не знайдено', sqlerrm;
+  end;
+  perform public.restore_order('cccccccc-0000-0000-0000-000000000031');
+  assert (select reserved from public.stock where name = 'ВЗ камера') = 56;
+  perform public.close_order_debt((select id from public.order_debts), 1);
+  assert (select left_qty from public.order_debts_left) = 0 and (select closed_qty from public.order_debts_left) = 10;
+  assert (select qty from public.stock where name = 'ВЗ камера') = 2;
+  assert (select reserved from public.stock where name = 'ВЗ камера') = 55, 'закритий борг лишився в резерві';
+  assert (select text from public.order_events where kind = 'debt' order by id desc limit 1) = 'Довидано замовнику: ВЗ камера × 1 шт — борг закрито';
+  begin
+    perform public.close_order_debt((select id from public.order_debts), 1);
+    raise exception 'довидано за закритим боргом';
+  exception when raise_exception then assert sqlerrm = 'Не можна довидати 1 «ВЗ камера»: борг — 0', sqlerrm;
+  end;
+end $$;
+do $$
+declare d jsonb := public.admin_dump();
+begin
+  assert jsonb_array_length(d -> 'order_shipments') = (select count(*) from public.order_shipments) and jsonb_array_length(d -> 'order_shipments') >= 5, 'dump: видачі';
+  assert jsonb_array_length(d -> 'order_debts') = 1, 'dump: борги';
+end $$;
+select public.delete_order('cccccccc-0000-0000-0000-000000000031');
+select public.purge_order('cccccccc-0000-0000-0000-000000000031');
+do $$ begin
+  assert (select count(*) from public.order_shipments) = 0 and (select count(*) from public.order_debts) = 0, 'видачі чи борги видаленого замовлення лишились';
+  assert (select count(*) from public.operations where debt_id is not null or order_id = 'cccccccc-0000-0000-0000-000000000031') = 0;
+  assert (select qty from public.stock where name = 'ВЗ камера') = 2, 'довидане лишається списаним';
+  assert (select reserved from public.stock where name = 'ВЗ камера') = 0;
+end $$;
+-- purge_trash: старе замовлення з кошика зникає разом із видачами
+insert into public.orders (id, title, qty, department_id) values
+  ('cccccccc-0000-0000-0000-000000000032', 'ВЗ старе', 4, (select id from public.departments where name = 'Прийом замовлень'));
+select public.ship_order('cccccccc-0000-0000-0000-000000000032', 1, null, '', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000052","qty":1}]');
+select public.delete_order('cccccccc-0000-0000-0000-000000000032');
+reset role;
+update public.orders set deleted_at = now() - interval '31 days' where id = 'cccccccc-0000-0000-0000-000000000032';
+set role authenticated;
+select public.purge_trash();
+do $$ begin
+  assert (select count(*) from public.order_shipments) = 0 and (select count(*) from public.order_debts) = 0, 'purge_trash лишив видачі';
+end $$;
+reset role;
+
+-- сповіщення Telegram про видачу, довидачу й скасування: tg_notify на час перевірки складає тексти в таблицю
+select pg_get_functiondef('public.tg_notify(text, uuid)'::regprocedure) as tg_notify_def \gset
+create table public.tg_seen (n serial, txt text);
+create or replace function public.tg_notify(p_text text, p_department uuid default null)
+returns void language sql security definer set search_path = public as $$ insert into public.tg_seen (txt) values (p_text) $$;
+create temp table tg_was as select tg_token, tg_orders, app_url from public.app_settings;
+update public.app_settings set tg_token = 'test-token', tg_orders = true, app_url = '';
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+insert into public.orders (id, title, qty, department_id) values
+  ('cccccccc-0000-0000-0000-000000000033', 'ВЗ <сповіщення>', 5, (select id from public.departments where name = 'Прийом замовлень'));
+select public.post_operation('in', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000052","qty":3}]');
+select public.ship_order('cccccccc-0000-0000-0000-000000000033', 2, null, '', '[{"item_id":"aaaaaaaa-0000-0000-0000-000000000052","qty":2}]');
+select public.close_order_debt((select id from public.order_debts), 2);
+select public.ship_order('cccccccc-0000-0000-0000-000000000033', 1);
+select public.cancel_order_shipment((select id from public.order_shipments where order_id = 'cccccccc-0000-0000-0000-000000000033' and qty = 1));
+select public.ship_order('cccccccc-0000-0000-0000-000000000033', 3);
+reset role;
+do $$
+declare v_who text := (select display_name from public.profiles where id = '11111111-1111-1111-1111-111111111111');
+        v_no  text := (select number::text from public.orders where id = 'cccccccc-0000-0000-0000-000000000033');
+begin
+  assert (select array_agg(txt order by n) from public.tg_seen where txt not like '🆕%') = array[
+    format(E'📦 <b>№%s</b> «ВЗ &lt;сповіщення&gt;» × 5: Видано замовнику 2 — усього 2 з 5, лишилось 3\nНеповним комплектом, бракує: ВЗ кабель × 2 шт\n%s', v_no, v_who),
+    format(E'🧩 <b>№%s</b> «ВЗ &lt;сповіщення&gt;» × 5: Довидано замовнику: ВЗ кабель × 2 шт — борг закрито\n%s', v_no, v_who),
+    format(E'📦 <b>№%s</b> «ВЗ &lt;сповіщення&gt;» × 5: Видано замовнику 1 — усього 3 з 5, лишилось 2\n%s', v_no, v_who),
+    format(E'↩️ <b>№%s</b> «ВЗ &lt;сповіщення&gt;» × 5: Скасовано видачу замовнику 1 від %s — видано 2 з 5\n%s', v_no, to_char(current_date, 'DD.MM.YYYY'), v_who),
+    format(E'📦 <b>№%s</b> «ВЗ &lt;сповіщення&gt;»: Нове → <b>Відвантажено</b>\n%s: Видано замовнику 3 — усього 5 з 5', v_no, v_who)
+  ], (select string_agg(txt, E'\n---\n' order by n) from public.tg_seen);
+end $$;
+update public.app_settings s set tg_token = w.tg_token, tg_orders = w.tg_orders, app_url = w.app_url from tg_was w;
+drop table tg_was;
+drop table public.tg_seen;
+:tg_notify_def;
+revoke execute on function public.tg_notify(text, uuid) from public, anon, authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+set role authenticated;
+select public.delete_order('cccccccc-0000-0000-0000-000000000033');
+select public.purge_order('cccccccc-0000-0000-0000-000000000033');
+reset role;
+
 -- realtime підключено
 do $$ begin
-  assert (select count(*) from pg_publication_tables where pubname = 'supabase_realtime') = 14;
+  assert (select count(*) from pg_publication_tables where pubname = 'supabase_realtime') = 16;
 end $$;
 
 \echo ALL SCHEMA TESTS PASSED

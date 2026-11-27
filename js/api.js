@@ -57,6 +57,8 @@ function normOrder(o) {
     tasks: (o.order_tasks || o.tasks || []).slice().sort((a, b) => a.position - b.position),
     parts: (o.order_parts || o.parts || []).map((p) => ({ item_id: p.item_id, qty: Number(p.qty) })),
     units: (o.order_units || o.units || []).slice().sort((a, b) => a.position - b.position || a.serial.localeCompare(b.serial)),
+    shipments: o.shipments || [],   // видачі замовнику і борги приходять окремо — attachExtras
+    debts: o.debts || [],
     order_tasks: undefined,
     order_parts: undefined,
     order_units: undefined,
@@ -68,11 +70,33 @@ export const defaultSerial = (orderNumber, n) => `${String(orderNumber).padStart
 
 const UNIT_FIELDS = ['position', 'serial', 'assembled', 'tested', 'note'];
 
-// скільки кожної позиції вже видано під замовлення (без скасованих операцій)
+// Видачі замовнику й борги до замовлень. extras — { shipments, debts } або null,
+// якщо база ще зі старою схемою (тоді замовлення працюють, як раніше).
+export function attachExtras(orders, extras) {
+  const by = (rows) => {
+    const m = new Map();
+    for (const r of rows || []) { if (!m.has(r.order_id)) m.set(r.order_id, []); m.get(r.order_id).push(r); }
+    return m;
+  };
+  const ships = by(extras?.shipments);
+  const debts = by(extras?.debts);
+  for (const o of orders) {
+    o.shipments = (ships.get(o.id) || []).map((s) => ({ ...s, qty: Number(s.qty) }));
+    o.debts = (debts.get(o.id) || []).map((d) => ({ ...d, qty: Number(d.qty), closed_qty: Number(d.closed_qty) || 0, left_qty: Number(d.left_qty) || 0 }));
+  }
+  return orders;
+}
+
+// число так, як його пише сервер (trim_scale): без зайвих нулів
+const nstr = (n) => String(round(Number(n)));
+const dmy = (iso) => String(iso).slice(0, 10).split('-').reverse().join('.');
+
+// скільки кожної позиції вже видано під замовлення на збірку (без скасованих операцій
+// і без довидачі боргу замовнику — та йде не на збірку)
 function issuedMap(ops) {
   const out = {};
   for (const o of ops) {
-    if (o.cancelled_at || o.type !== 'out') continue;
+    if (o.cancelled_at || o.type !== 'out' || o.debt_id) continue;
     for (const m of o.movements || []) out[m.item_id] = round((out[m.item_id] || 0) - Number(m.qty));
   }
   return out;
@@ -294,8 +318,10 @@ class SupaApi {
   async addOrderComment(orderId, text) {
     await this.q(this.sb.from('order_events').insert({ order_id: orderId, kind: 'comment', text: text.trim() }));
   }
+  // на базі зі старою схемою колонки debt_id ще немає — не просимо її
+  opCols(cols) { return this.noShip ? cols : `${cols}, debt_id`; }
   async orderIssued(orderId) {
-    const ops = await this.q(this.sb.from('operations').select('type, cancelled_at, movements(item_id, qty)').eq('order_id', orderId));
+    const ops = await this.q(this.sb.from('operations').select(this.opCols('type, cancelled_at, movements(item_id, qty)')).eq('order_id', orderId));
     return issuedMap(ops);
   }
   // видане під кілька замовлень одразу: { id замовлення: { id позиції: кількість } }
@@ -304,10 +330,40 @@ class SupaApi {
     for (let i = 0; i < ids.length; i += 40) {
       const part = ids.slice(i, i + 40);
       const ops = await this.all(() => this.sb.from('operations')
-        .select('id, order_id, type, cancelled_at, movements(item_id, qty)').in('order_id', part).order('id'));
+        .select(this.opCols('id, order_id, type, cancelled_at, movements(item_id, qty)')).in('order_id', part).order('id'));
       for (const id of part) out[id] = issuedMap(ops.filter((o) => o.order_id === id));
     }
     return out;
+  }
+
+  // ---------- видача замовнику, борги ----------
+  // { shipments, debts } для всіх видимих замовлень; null — база зі старою схемою (таблиць ще немає):
+  // запамʼятовуємо це до перезавантаження сторінки, щоб не питати щоразу
+  async orderExtras() {
+    if (this.noShip) return null;
+    try {
+      const [shipments, debts] = await Promise.all([
+        this.all(() => this.sb.from('order_shipments').select('*').is('cancelled_at', null).order('created_at')),
+        this.all(() => this.sb.from('order_debts_left').select('*').order('created_at')),
+      ]);
+      return { shipments, debts };
+    } catch (e) {
+      if (/Немає зʼєднання|Сесія застаріла/.test(e.message)) throw e;
+      this.noShip = true;
+      return null;
+    }
+  }
+  // debts: [{item_id, qty}] — чого бракує в комплекті; units: id виробів, що пішли (необовʼязково)
+  async shipOrder(id, { qty, date = null, comment = '', debts = [], units = null }) {
+    const r = await this.q(this.sb.rpc('ship_order', {
+      p_id: id, p_qty: qty, p_date: date || null, p_comment: comment, p_debts: debts, p_units: units && units.length ? units : null,
+    }));
+    this.noShip = false;   // функція є — отже базу вже оновили
+    return r;
+  }
+  async cancelShipment(id) { await this.q(this.sb.rpc('cancel_order_shipment', { p_id: id })); }
+  async closeDebt(id, qty, comment = '') {
+    return await this.q(this.sb.rpc('close_order_debt', { p_debt: id, p_qty: qty, p_comment: comment }));
   }
 
   // ---------- позиції ----------
@@ -503,15 +559,27 @@ class LocalApi {
       for (const i of d.items.filter((x) => x.sort_order == null).sort((a, b) => a.name.localeCompare(b.name, 'uk'))) i.sort_order = ++n;
       try { this.save(d); } catch { /* */ }
     }
+    // демо-дані, збережені до появи видач замовнику й боргів
+    if (!d.order_shipments) {
+      d.order_shipments = [];
+      d.order_debts = [];
+      try { this.save(d); } catch { /* */ }
+    }
     return d;
   }
-  // резерв: деталі активних замовлень мінус уже видане під них
+  // резерв: деталі активних замовлень мінус уже видане під них + борги замовникам (reserved_qty у schema.sql)
   reservedOf(d, itemId) {
-    const live = new Set(d.operations.filter((o) => !o.cancelled_at && o.type === 'out' && o.order_id).map((o) => o.id));
+    const live = new Set(d.operations.filter((o) => !o.cancelled_at && o.type === 'out' && o.order_id && !o.debt_id).map((o) => o.id));
     const opOrder = Object.fromEntries(d.operations.map((o) => [o.id, o.order_id]));
     let sum = 0;
     for (const o of d.orders) {
-      if (o.deleted_at || !['new', 'in_work', 'testing', 'rework', 'done'].includes(o.status)) continue;
+      if (o.deleted_at) continue;
+      if (o.status !== 'cancelled') {
+        for (const debt of d.order_debts) {
+          if (debt.order_id === o.id && debt.item_id === itemId) sum += Math.max(0, debt.qty - this.debtClosed(d, debt));
+        }
+      }
+      if (!['new', 'in_work', 'testing', 'rework', 'done'].includes(o.status)) continue;
       const part = d.order_parts.find((p) => p.order_id === o.id && p.item_id === itemId);
       if (!part) continue;
       const issued = d.movements.filter((m) => m.item_id === itemId && live.has(m.operation_id) && opOrder[m.operation_id] === o.id)
@@ -519,6 +587,18 @@ class LocalApi {
       sum += Math.max(0, part.qty - issued);
     }
     return round(sum);
+  }
+  // скільки за боргом уже довидано: живі видатки з debt_id (order_debts_left у schema.sql)
+  debtClosed(d, debt) {
+    const live = new Set(d.operations.filter((o) => !o.cancelled_at && o.debt_id === debt.id).map((o) => o.id));
+    return round(d.movements.filter((m) => m.item_id === debt.item_id && live.has(m.operation_id)).reduce((s, m) => s - m.qty, 0));
+  }
+  shippedOf(d, orderId) {
+    return round(d.order_shipments.filter((s) => s.order_id === orderId && !s.cancelled_at).reduce((s, x) => s + x.qty, 0));
+  }
+  pushEvent(d, orderId, kind, text, extra = {}) {
+    d.order_events.push({ id: d.order_events.length + 1, order_id: orderId, kind, from_status: null, to_status: null,
+      from_department: null, to_department: null, text, created_at: new Date().toISOString(), created_by: DEMO_USER, ...extra });
   }
   save(d) {
     try {
@@ -745,8 +825,11 @@ class LocalApi {
     if (!(row.qty > 0)) throw new Error('Кількість має бути більше 0');
     const now = new Date().toISOString();
     let id = order.id;
-    if (id) Object.assign(d.orders.find((o) => o.id === id), row, { updated_at: now });
-    else {
+    if (id) {
+      const done = this.shippedOf(d, id);
+      if (row.qty < done) throw new Error(`Замовнику вже видано ${nstr(done)} — кількість у замовленні не може бути меншою`);
+      Object.assign(d.orders.find((o) => o.id === id), row, { updated_at: now });
+    } else {
       id = crypto.randomUUID();
       const o = { customer: '', qty: 1, due_date: null, description: '', ...row, id,
         number: d.orders.reduce((m, x) => Math.max(m, x.number), 0) + 1,
@@ -766,6 +849,11 @@ class LocalApi {
   }
   async moveOrder(id, status, departmentId, comment = '') {
     const d = this.load();
+    this.moveIn(d, id, status, departmentId, comment);
+    this.save(d);
+  }
+  // те саме, що move_order у schema.sql, над уже завантаженими даними (без збереження)
+  moveIn(d, id, status, departmentId, comment = '') {
     const o = d.orders.find((x) => x.id === id && !x.deleted_at);
     if (!o) throw new Error('Замовлення не знайдено');
     const txt = String(comment || '').trim();
@@ -774,10 +862,129 @@ class LocalApi {
     if (status === 'cancelled' && !txt) throw new Error('Напишіть у коментарі причину скасування');
     if (status === o.status && dep === o.department_id) throw new Error('Нічого не змінилося');
     const now = new Date().toISOString();
-    d.order_events.push({ id: d.order_events.length + 1, order_id: id, kind: 'move', from_status: o.status, to_status: status,
-      from_department: o.department_id, to_department: dep, text: txt, created_at: now, created_by: DEMO_USER });
+    if (status === 'shipped' && o.status !== 'shipped') {
+      // «Відвантажено» вручну: решта записується як видана сьогодні
+      const done = this.shippedOf(d, id);
+      if (done < o.qty) {
+        d.order_shipments.push({ id: crypto.randomUUID(), order_id: id, qty: round(o.qty - done), shipped_at: now.slice(0, 10), comment: '',
+          auto: true, closed_from: o.status, created_at: now, created_by: DEMO_USER, cancelled_at: null, cancelled_by: null });
+      }
+    } else if (o.status === 'shipped' && status !== 'shipped') {
+      // знову відкрили: автоматично дописаний залишок знімається, справжні видачі лишаються
+      for (const s of d.order_shipments) {
+        if (s.order_id !== id) continue;
+        if (s.auto && !s.cancelled_at) Object.assign(s, { cancelled_at: now, cancelled_by: DEMO_USER });
+        s.closed_from = null;
+      }
+    }
+    this.pushEvent(d, id, 'move', txt, { from_status: o.status, to_status: status, from_department: o.department_id, to_department: dep });
     Object.assign(o, { status, department_id: dep, updated_at: now });
+  }
+
+  // ---------- видача замовнику, борги (ship_order / cancel_order_shipment / close_order_debt) ----------
+  async orderExtras() {
+    const d = this.load();
+    return {
+      shipments: d.order_shipments.filter((s) => !s.cancelled_at).sort((a, b) => a.created_at.localeCompare(b.created_at)),
+      debts: d.order_debts.map((x) => {
+        const closed = Math.min(x.qty, this.debtClosed(d, x));
+        return { ...x, closed_qty: closed, left_qty: Math.max(0, round(x.qty - closed)) };
+      }),
+    };
+  }
+  async shipOrder(id, { qty, date = null, comment = '', debts = [], units = null }) {
+    const d = this.load();
+    const o = d.orders.find((x) => x.id === id && !x.deleted_at);
+    if (!o) throw new Error('Замовлення не знайдено');
+    if (o.status === 'shipped' || o.status === 'cancelled') {
+      throw new Error(`Замовлення закрите (${o.status === 'shipped' ? 'відвантажено' : 'скасовано'}) — видати замовнику не можна`);
+    }
+    const q = Number(qty);
+    if (!(q > 0)) throw new Error('Вкажіть, скільки виробів видано');
+    const done = this.shippedOf(d, id);
+    const left = round(o.qty - done);
+    if (q > left) throw new Error(`Не можна видати ${nstr(q)}: лишилось видати ${nstr(Math.max(left, 0))} з ${nstr(o.qty)}`);
+    const now = new Date().toISOString();
+    const cmt = String(comment || '').trim();
+    const ship = { id: crypto.randomUUID(), order_id: id, qty: q, shipped_at: date || now.slice(0, 10), comment: cmt, auto: false,
+      closed_from: null, created_at: now, created_by: DEMO_USER, cancelled_at: null, cancelled_by: null };
+    d.order_shipments.push(ship);
+    const merged = new Map();
+    for (const l of debts || []) merged.set(l.item_id, round((merged.get(l.item_id) || 0) + Number(l.qty)));
+    const lack = [];
+    for (const [itemId, n] of merged) {
+      const item = d.items.find((i) => i.id === itemId);
+      if (!item) throw new Error('Позицію не знайдено');
+      if (item.deleted_at) throw new Error(`Позиція «${item.name}» у кошику — спершу відновіть її`);
+      if (!(n > 0)) throw new Error(`Неправильна кількість для «${item.name}»`);
+      d.order_debts.push({ id: crypto.randomUUID(), order_id: id, shipment_id: ship.id, item_id: itemId, qty: n, created_at: now, created_by: DEMO_USER });
+      lack.push(`${item.name} × ${nstr(n)} ${item.unit}`);
+    }
+    if (units && units.length) {
+      if (units.length > q) throw new Error('Вибрано виробів більше, ніж видається');
+      for (const uid of new Set(units)) {
+        const u = d.order_units.find((x) => x.id === uid && x.order_id === id && !x.shipment_id);
+        if (!u) throw new Error('Серед вибраних виробів є чужий або вже виданий');
+        u.shipment_id = ship.id;
+      }
+    }
+    const total = round(done + q);
+    const txt = `Видано замовнику ${nstr(q)} — усього ${nstr(total)} з ${nstr(o.qty)}`
+      + (total < o.qty ? `, лишилось ${nstr(o.qty - total)}` : '')
+      + (lack.length ? `\nНеповним комплектом, бракує: ${lack.join(', ')}` : '')
+      + (cmt ? `\n${cmt}` : '');
+    if (total >= o.qty) {
+      ship.closed_from = o.status;
+      this.moveIn(d, id, 'shipped', null, txt);
+    } else this.pushEvent(d, id, 'ship', txt);
     this.save(d);
+    return ship.id;
+  }
+  async cancelShipment(shipId) {
+    const d = this.load();
+    const s = d.order_shipments.find((x) => x.id === shipId && !x.cancelled_at);
+    if (!s) throw new Error('Видачу не знайдено або її вже скасовано');
+    const o = d.orders.find((x) => x.id === s.order_id && !x.deleted_at);
+    if (!o) throw new Error('Замовлення не знайдено');
+    if (d.order_debts.some((x) => x.shipment_id === shipId && this.debtClosed(d, x) > 0)) {
+      throw new Error('За цією видачею вже довидано деталі — спершу видаліть ту довидачу в журналі');
+    }
+    const gone = new Set(d.order_debts.filter((x) => x.shipment_id === shipId).map((x) => x.id));
+    d.order_debts = d.order_debts.filter((x) => !gone.has(x.id));
+    for (const op of d.operations) if (gone.has(op.debt_id)) op.debt_id = null;
+    for (const u of d.order_units) if (u.shipment_id === shipId) u.shipment_id = null;
+    Object.assign(s, { cancelled_at: new Date().toISOString(), cancelled_by: DEMO_USER });
+    const done = this.shippedOf(d, o.id);
+    const txt = `Скасовано видачу замовнику ${nstr(s.qty)} від ${dmy(s.shipped_at)} — видано ${nstr(done)} з ${nstr(o.qty)}`;
+    if (o.status === 'shipped' && done < o.qty) {
+      const back = d.order_shipments.filter((x) => x.order_id === o.id && x.closed_from)
+        .sort((a, b) => b.created_at.localeCompare(a.created_at))[0]?.closed_from || 'done';
+      this.moveIn(d, o.id, back, null, txt);
+    } else this.pushEvent(d, o.id, 'ship_cancel', txt);
+    this.save(d);
+  }
+  async closeDebt(debtId, qty, comment = '') {
+    let d = this.load();
+    let debt = d.order_debts.find((x) => x.id === debtId);
+    if (!debt) throw new Error('Борг не знайдено');
+    const o = d.orders.find((x) => x.id === debt.order_id && !x.deleted_at);
+    if (!o) throw new Error('Замовлення не знайдено');
+    const item = d.items.find((i) => i.id === debt.item_id);
+    const left = round(debt.qty - this.debtClosed(d, debt));
+    const q = Number(qty);
+    const cmt = String(comment || '').trim();
+    if (!(q > 0)) throw new Error('Вкажіть, скільки довидано');
+    if (q > left) throw new Error(`Не можна довидати ${nstr(q)} «${item?.name}»: борг — ${nstr(Math.max(left, 0))}`);
+    // списання — звичайним видатком під замовлення: якщо залишку не вистачає, він відмовить і нічого не зміниться
+    const opId = await this.postOperation({ type: 'out', lines: [{ item_id: debt.item_id, qty: q }],
+      comment: cmt || 'Довидача замовнику (борг за замовленням)', counterparty: o.customer || '', order_id: o.id });
+    d = this.load();
+    debt = d.order_debts.find((x) => x.id === debtId);
+    d.operations.find((x) => x.id === opId).debt_id = debtId;
+    this.pushEvent(d, o.id, 'debt', `Довидано замовнику: ${item?.name} × ${nstr(q)} ${item?.unit} — `
+      + (left - q > 0 ? `борг лишився ${nstr(left - q)}` : 'борг закрито') + (cmt ? `\n${cmt}` : ''));
+    this.save(d);
+    return opId;
   }
   async deleteOrder(id) {
     const d = this.load();
@@ -802,8 +1009,8 @@ class LocalApi {
   dropOrders(d, ids) {
     const gone = new Set(ids);
     d.orders = d.orders.filter((x) => !gone.has(x.id));
-    for (const k of ['order_tasks', 'order_parts', 'order_events', 'order_units']) d[k] = d[k].filter((x) => !gone.has(x.order_id));
-    for (const op of d.operations) if (gone.has(op.order_id)) op.order_id = null;
+    for (const k of ['order_tasks', 'order_parts', 'order_events', 'order_units', 'order_shipments', 'order_debts']) d[k] = d[k].filter((x) => !gone.has(x.order_id));
+    for (const op of d.operations) if (gone.has(op.order_id)) { op.order_id = null; op.debt_id = null; }
   }
   async addTask(orderId, text, position) {
     const d = this.load();
@@ -893,7 +1100,8 @@ class LocalApi {
     this.save(d);
   }
   hasHistory(d, id) {
-    return d.movements.some((m) => m.item_id === id) || d.kit_components.some((c) => c.item_id === id) || d.order_parts.some((p) => p.item_id === id);
+    return d.movements.some((m) => m.item_id === id) || d.kit_components.some((c) => c.item_id === id) || d.order_parts.some((p) => p.item_id === id)
+      || d.order_debts.some((p) => p.item_id === id);
   }
   async purgeItem(id) {
     const d = this.load();

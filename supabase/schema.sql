@@ -168,11 +168,12 @@ create table if not exists public.order_parts (
   primary key (order_id, item_id)
 );
 
--- історія: прийом, кожна передача між статусами/відділами, коментарі
+-- історія: прийом, кожна передача між статусами/відділами, коментарі,
+-- видача замовнику (ship), її скасування (ship_cancel), довидача боргу (debt)
 create table if not exists public.order_events (
   id               bigint generated always as identity primary key,
   order_id         uuid not null references public.orders(id) on delete cascade,
-  kind             text not null check (kind in ('created', 'move', 'comment')),
+  kind             text not null check (kind in ('created', 'move', 'comment', 'ship', 'ship_cancel', 'debt')),
   from_status      text,
   to_status        text,
   from_department  uuid references public.departments(id) on delete set null,
@@ -182,6 +183,10 @@ create table if not exists public.order_events (
   created_by       uuid default auth.uid() references auth.users(id) on delete set null
 );
 create index if not exists order_events_order_idx on public.order_events (order_id, id);
+-- нові види подій (видача замовнику, її скасування, довидача боргу) — і на базі, де таблиця вже є
+alter table public.order_events drop constraint if exists order_events_kind_check;
+alter table public.order_events add constraint order_events_kind_check
+  check (kind in ('created', 'move', 'comment', 'ship', 'ship_cancel', 'debt'));
 
 -- видача зі складу під конкретне замовлення
 alter table public.operations
@@ -280,22 +285,97 @@ create trigger order_units_stamp before insert or update on public.order_units
   for each row execute function public.order_unit_stamp();
 
 -- ---------------------------------------------------------------------
---  Резерв: скільки кожної позиції обіцяно активним замовленням (деталі
---  замовлення мінус уже видане під нього). Вільний залишок = qty − reserved.
+--  Видача готових виробів замовнику — частинами. Кожна видача — окремий
+--  рядок (ship_order); помилкову скасовують (cancel_order_shipment), рядок
+--  лишається з позначкою. Коли видано все — замовлення саме стає «Відвантажено».
+--    auto        — залишок, дописаний при ручному переведенні у «Відвантажено»
+--    closed_from — статус, з якого ця видача закрила замовлення (щоб скасування
+--                  видачі повернуло його назад)
+-- ---------------------------------------------------------------------
+create table if not exists public.order_shipments (
+  id            uuid primary key default gen_random_uuid(),
+  order_id      uuid not null references public.orders(id) on delete cascade,
+  qty           numeric not null check (qty > 0),
+  shipped_at    date not null default current_date,
+  comment       text not null default '',
+  auto          boolean not null default false,
+  closed_from   text,
+  created_at    timestamptz not null default now(),
+  created_by    uuid default auth.uid() references auth.users(id) on delete set null,
+  cancelled_at  timestamptz,
+  cancelled_by  uuid references auth.users(id) on delete set null
+);
+create index if not exists order_shipments_order_idx on public.order_shipments (order_id, created_at);
+
+-- Борг перед замовником: вироби видано неповним комплектом — чого й скільки
+-- лишилося довидати. Закривається довидачею зі складу (close_order_debt):
+-- це видаток з operations.debt_id, тож «скільки вже довидано» рахується з
+-- живих операцій — видалена в журналі довидача знову відкриває борг.
+create table if not exists public.order_debts (
+  id           uuid primary key default gen_random_uuid(),
+  order_id     uuid not null references public.orders(id) on delete cascade,
+  shipment_id  uuid references public.order_shipments(id) on delete cascade,
+  item_id      uuid not null references public.items(id) on delete restrict,
+  qty          numeric not null check (qty > 0),
+  created_at   timestamptz not null default now(),
+  created_by   uuid default auth.uid() references auth.users(id) on delete set null
+);
+create index if not exists order_debts_order_idx on public.order_debts (order_id);
+create index if not exists order_debts_item_idx  on public.order_debts (item_id);
+
+alter table public.operations
+  add column if not exists debt_id uuid references public.order_debts(id) on delete set null;
+create index if not exists operations_debt_idx on public.operations (debt_id) where debt_id is not null;
+
+-- який виріб пішов якою видачею (необовʼязково; ставить лише ship_order)
+alter table public.order_units
+  add column if not exists shipment_id uuid references public.order_shipments(id) on delete set null;
+
+-- борги разом із тим, скільки вже довидано; від імені того, хто питає (чужих відділів не видно)
+create or replace view public.order_debts_left with (security_invoker = true) as
+select d.id, d.order_id, d.shipment_id, d.item_id, d.qty, d.created_at, d.created_by,
+       least(d.qty, coalesce(c.closed, 0))::numeric        as closed_qty,
+       greatest(0, d.qty - coalesce(c.closed, 0))::numeric as left_qty
+  from public.order_debts d
+  left join lateral (
+         select -sum(m.qty) as closed
+           from public.movements m
+           join public.operations op on op.id = m.operation_id
+          where op.debt_id = d.id and op.cancelled_at is null and m.item_id = d.item_id) c on true;
+
+-- ---------------------------------------------------------------------
+--  Резерв: скільки кожної позиції обіцяно — активним замовленням (деталі
+--  замовлення мінус уже видане під нього) і замовникам у борг (видано
+--  неповним комплектом; рахується й після «Відвантажено», доки не довидано).
+--  Вільний залишок = qty − reserved.
 --  Представлення працює від імені власника, тож рахує всі відділи, навіть
 --  для людини, яка бачить лише свій.
 -- ---------------------------------------------------------------------
 create or replace view public.reserved_qty as
-select p.item_id,
-       sum(greatest(0, p.qty - coalesce((
-         select -sum(m.qty)
-           from public.movements m
-           join public.operations op on op.id = m.operation_id
-          where op.order_id = p.order_id and op.type = 'out' and op.cancelled_at is null and m.item_id = p.item_id), 0)))::numeric as reserved
-  from public.order_parts p
-  join public.orders o on o.id = p.order_id
- where o.deleted_at is null and o.status in ('new', 'in_work', 'testing', 'rework', 'done')
- group by p.item_id;
+select s.item_id, sum(s.q)::numeric as reserved
+  from (
+    select p.item_id,
+           greatest(0, p.qty - coalesce((
+             select -sum(m.qty)
+               from public.movements m
+               join public.operations op on op.id = m.operation_id
+              where op.order_id = p.order_id and op.type = 'out' and op.cancelled_at is null
+                and op.debt_id is null and m.item_id = p.item_id), 0)) as q
+      from public.order_parts p
+      join public.orders o on o.id = p.order_id
+     where o.deleted_at is null and o.status in ('new', 'in_work', 'testing', 'rework', 'done')
+    union all
+    select d.item_id,
+           greatest(0, d.qty - coalesce((
+             select -sum(m.qty)
+               from public.movements m
+               join public.operations op on op.id = m.operation_id
+              where op.debt_id = d.id and op.cancelled_at is null and m.item_id = d.item_id), 0)) as q
+      from public.order_debts d
+      join public.orders o on o.id = d.order_id
+     where o.deleted_at is null and o.status <> 'cancelled'
+  ) s
+ group by s.item_id;
 
 -- ---------------------------------------------------------------------
 --  Залишки рахуються, а не зберігаються: сума руху без скасованих операцій
@@ -429,6 +509,16 @@ begin
   select name into v_dep from public.departments where id = new.to_department;
   v_dep := coalesce(v_dep, 'без відділу');
 
+  if new.kind in ('ship', 'ship_cancel', 'debt') then
+    -- видача замовнику, її скасування, довидача боргу: текст уже склала функція
+    v_txt := format('%s <b>№%s</b> «%s»%s: ',
+                    case new.kind when 'ship' then '📦' when 'debt' then '🧩' else '↩️' end,
+                    o.number, public.tg_esc(o.title),
+                    case when o.qty <> 1 then ' × ' || trim_scale(o.qty) else '' end)
+          || public.tg_esc(new.text) || E'\n' || public.tg_esc(v_who);
+    perform public.tg_notify(v_txt || public.order_link(o.id), o.department_id);
+    return null;
+  end if;
   if new.kind = 'created' then
     v_txt := format(E'🆕 <b>Замовлення №%s</b> «%s»%s\n', o.number, public.tg_esc(o.title),
                     case when o.qty <> 1 then ' × ' || trim_scale(o.qty) else '' end)
@@ -845,7 +935,8 @@ begin
   end if;
   if exists (select 1 from public.movements where item_id = p_id)
      or exists (select 1 from public.kit_components where item_id = p_id)
-     or exists (select 1 from public.order_parts where item_id = p_id) then
+     or exists (select 1 from public.order_parts where item_id = p_id)
+     or exists (select 1 from public.order_debts where item_id = p_id) then
     raise exception 'Позиція має історію руху або є в комплекті чи замовленні — остаточно її видалити не можна. Через 30 днів вона сама зникне з кошика, а в журналі лишиться її назва';
   end if;
   delete from public.items where id = p_id returning photo_path into v_photo;
@@ -992,6 +1083,7 @@ declare
   v    public.orders%rowtype;
   v_dep uuid;
   v_txt text := trim(coalesce(p_comment, ''));
+  v_done numeric;
 begin
   perform public.require('orders.edit');
   if p_status not in ('new', 'in_work', 'testing', 'rework', 'done', 'shipped', 'cancelled') then
@@ -1012,10 +1104,241 @@ begin
     raise exception 'Нічого не змінилося';
   end if;
 
+  if p_status = 'shipped' and v.status <> 'shipped' then
+    -- «Відвантажено» вручну: усе, що ще не видано замовнику, записується як видане сьогодні
+    select coalesce(sum(qty), 0) into v_done from public.order_shipments where order_id = p_id and cancelled_at is null;
+    if v_done < v.qty then
+      insert into public.order_shipments (order_id, qty, auto, closed_from) values (p_id, v.qty - v_done, true, v.status);
+    end if;
+  elsif v.status = 'shipped' and p_status <> 'shipped' then
+    -- замовлення знову відкрили: дописаний автоматично залишок знімається, справжні видачі лишаються
+    update public.order_shipments set cancelled_at = now(), cancelled_by = auth.uid()
+     where order_id = p_id and auto and cancelled_at is null;
+    update public.order_shipments set closed_from = null where order_id = p_id and closed_from is not null;
+  end if;
+
   update public.orders set status = p_status, department_id = v_dep where id = p_id;
   insert into public.order_events (order_id, kind, from_status, to_status, from_department, to_department, text)
   values (p_id, 'move', v.status, p_status, v.department_id, v_dep, v_txt);
 end $$;
+
+-- ---------------------------------------------------------------------
+--  Видати замовнику частину (або решту) готових виробів.
+--    p_qty    — скільки виробів видано цього разу (не більше, ніж лишилось)
+--    p_date   — дата видачі (порожньо — сьогодні)
+--    p_debts  — [{"item_id": "...", "qty": 10}, ...]: видано неповним комплектом —
+--               чого бракує; це борг перед замовником (order_debts)
+--    p_units  — необовʼязково: які саме вироби (серійні номери) пішли
+--  Статус при частковій видачі не змінюється; коли видано все — замовлення
+--  стає «Відвантажено» тим самим move_order (подія, сповіщення).
+--  Працює в будь-якому статусі, крім «Відвантажено» і «Скасовано».
+-- ---------------------------------------------------------------------
+create or replace function public.ship_order(
+  p_id       uuid,
+  p_qty      numeric,
+  p_date     date default null,
+  p_comment  text default '',
+  p_debts    jsonb default '[]',
+  p_units    uuid[] default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v       public.orders%rowtype;
+  v_done  numeric;
+  v_left  numeric;
+  v_ship  uuid;
+  v_txt   text;
+  v_debt  text := '';
+  v_cmt   text := trim(coalesce(p_comment, ''));
+  v_name  text;
+  v_unit  text;
+  v_del   timestamptz;
+  r       record;
+begin
+  perform public.require('orders.edit');
+  select * into v from public.orders where id = p_id and deleted_at is null for update;
+  if not found or not public.can_see_order(v.department_id) then
+    raise exception 'Замовлення не знайдено';
+  end if;
+  if v.status in ('shipped', 'cancelled') then
+    raise exception 'Замовлення закрите (%) — видати замовнику не можна', lower(public.order_status_label(v.status));
+  end if;
+  if p_qty is null or p_qty <= 0 then
+    raise exception 'Вкажіть, скільки виробів видано';
+  end if;
+  select coalesce(sum(qty), 0) into v_done from public.order_shipments where order_id = p_id and cancelled_at is null;
+  v_left := v.qty - v_done;
+  if p_qty > v_left then
+    raise exception 'Не можна видати %: лишилось видати % з %', trim_scale(p_qty), trim_scale(greatest(v_left, 0)), trim_scale(v.qty);
+  end if;
+
+  insert into public.order_shipments (order_id, qty, shipped_at, comment)
+  values (p_id, p_qty, coalesce(p_date, current_date), v_cmt)
+  returning id into v_ship;
+
+  -- чого бракує в комплекті: однакові позиції зводимо в один рядок
+  if p_debts is not null and jsonb_typeof(p_debts) = 'array' then
+    for r in
+      select (e->>'item_id')::uuid as item_id, sum((e->>'qty')::numeric) as qty
+        from jsonb_array_elements(p_debts) e
+       group by 1
+    loop
+      select name, unit, deleted_at into v_name, v_unit, v_del from public.items where id = r.item_id;
+      if v_name is null then
+        raise exception 'Позицію не знайдено';
+      end if;
+      if v_del is not null then
+        raise exception 'Позиція «%» у кошику — спершу відновіть її', v_name;
+      end if;
+      if r.qty is null or r.qty <= 0 then
+        raise exception 'Неправильна кількість для «%»', v_name;
+      end if;
+      insert into public.order_debts (order_id, shipment_id, item_id, qty) values (p_id, v_ship, r.item_id, r.qty);
+      v_debt := v_debt || case when v_debt = '' then '' else ', ' end
+             || format('%s × %s %s', v_name, trim_scale(r.qty), v_unit);
+    end loop;
+  end if;
+
+  if p_units is not null and array_length(p_units, 1) > 0 then
+    if array_length(p_units, 1) > p_qty then
+      raise exception 'Вибрано виробів більше, ніж видається';
+    end if;
+    update public.order_units set shipment_id = v_ship
+     where id = any(p_units) and order_id = p_id and shipment_id is null;
+    if (select count(*) from public.order_units where shipment_id = v_ship) <> (select count(distinct x) from unnest(p_units) x) then
+      raise exception 'Серед вибраних виробів є чужий або вже виданий';
+    end if;
+  end if;
+
+  v_txt := format('Видано замовнику %s — усього %s з %s', trim_scale(p_qty), trim_scale(v_done + p_qty), trim_scale(v.qty))
+        || case when v_done + p_qty < v.qty then ', лишилось ' || trim_scale(v.qty - v_done - p_qty) else '' end
+        || case when v_debt <> '' then E'\nНеповним комплектом, бракує: ' || v_debt else '' end
+        || case when v_cmt <> '' then E'\n' || v_cmt else '' end;
+
+  if v_done + p_qty >= v.qty then
+    update public.order_shipments set closed_from = v.status where id = v_ship;
+    perform public.move_order(p_id, 'shipped', null, v_txt);
+  else
+    insert into public.order_events (order_id, kind, text) values (p_id, 'ship', v_txt);
+  end if;
+  return v_ship;
+end $$;
+
+-- ---------------------------------------------------------------------
+--  Скасувати помилкову видачу: лишок повертається. Якщо саме через видачі
+--  замовлення стало «Відвантажено» — воно повертається у статус, з якого
+--  закрилось. Борг цієї видачі зникає; якщо за ним уже щось довидано —
+--  спершу видаліть ту довидачу в журналі.
+-- ---------------------------------------------------------------------
+create or replace function public.cancel_order_shipment(p_id uuid)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  s       public.order_shipments%rowtype;
+  v       public.orders%rowtype;
+  v_done  numeric;
+  v_back  text;
+  v_txt   text;
+begin
+  perform public.require('orders.edit');
+  select * into s from public.order_shipments where id = p_id and cancelled_at is null;
+  if not found then
+    raise exception 'Видачу не знайдено або її вже скасовано';
+  end if;
+  select * into v from public.orders where id = s.order_id and deleted_at is null for update;
+  if not found or not public.can_see_order(v.department_id) then
+    raise exception 'Замовлення не знайдено';
+  end if;
+  perform 1 from public.order_shipments where id = p_id and cancelled_at is null for update;
+  if not found then
+    raise exception 'Видачу не знайдено або її вже скасовано';
+  end if;
+  if exists (select 1 from public.order_debts_left d where d.shipment_id = p_id and d.closed_qty > 0) then
+    raise exception 'За цією видачею вже довидано деталі — спершу видаліть ту довидачу в журналі';
+  end if;
+
+  delete from public.order_debts where shipment_id = p_id;
+  update public.order_units set shipment_id = null where shipment_id = p_id;
+  update public.order_shipments set cancelled_at = now(), cancelled_by = auth.uid() where id = p_id;
+
+  select coalesce(sum(qty), 0) into v_done from public.order_shipments where order_id = v.id and cancelled_at is null;
+  v_txt := format('Скасовано видачу замовнику %s від %s — видано %s з %s',
+                  trim_scale(s.qty), to_char(s.shipped_at, 'DD.MM.YYYY'), trim_scale(v_done), trim_scale(v.qty));
+  if v.status = 'shipped' and v_done < v.qty then
+    select closed_from into v_back from public.order_shipments
+     where order_id = v.id and closed_from is not null order by created_at desc limit 1;
+    perform public.move_order(v.id, coalesce(v_back, 'done'), null, v_txt);
+  else
+    insert into public.order_events (order_id, kind, text) values (v.id, 'ship_cancel', v_txt);
+  end if;
+end $$;
+
+-- ---------------------------------------------------------------------
+--  Довидати замовнику борг (весь або частину): деталь списується зі складу
+--  звичайним видатком під це замовлення (post_operation — тож потрібне й право
+--  проводити видаток, і залишку має вистачати), борг зменшується.
+-- ---------------------------------------------------------------------
+create or replace function public.close_order_debt(
+  p_debt     uuid,
+  p_qty      numeric,
+  p_comment  text default ''
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  d       public.order_debts%rowtype;
+  v       public.orders%rowtype;
+  v_left  numeric;
+  v_name  text;
+  v_unit  text;
+  v_op    uuid;
+  v_cmt   text := trim(coalesce(p_comment, ''));
+begin
+  perform public.require('orders.edit');
+  select * into d from public.order_debts where id = p_debt for update;
+  if not found then
+    raise exception 'Борг не знайдено';
+  end if;
+  select * into v from public.orders where id = d.order_id and deleted_at is null;
+  if not found or not public.can_see_order(v.department_id) then
+    raise exception 'Замовлення не знайдено';
+  end if;
+  select left_qty into v_left from public.order_debts_left where id = p_debt;
+  select name, unit into v_name, v_unit from public.items where id = d.item_id;
+  if p_qty is null or p_qty <= 0 then
+    raise exception 'Вкажіть, скільки довидано';
+  end if;
+  if p_qty > coalesce(v_left, 0) then
+    raise exception 'Не можна довидати % «%»: борг — %', trim_scale(p_qty), v_name, trim_scale(coalesce(v_left, 0));
+  end if;
+
+  v_op := public.post_operation('out', jsonb_build_array(jsonb_build_object('item_id', d.item_id, 'qty', p_qty)),
+                                case when v_cmt <> '' then v_cmt else 'Довидача замовнику (борг за замовленням)' end,
+                                v.customer, null, null, v.id, null);
+  update public.operations set debt_id = d.id where id = v_op;
+
+  insert into public.order_events (order_id, kind, text)
+  values (v.id, 'debt', format('Довидано замовнику: %s × %s %s — ', v_name, trim_scale(p_qty), v_unit)
+                        || case when v_left - p_qty > 0 then 'борг лишився ' || trim_scale(v_left - p_qty) else 'борг закрито' end
+                        || case when v_cmt <> '' then E'\n' || v_cmt else '' end);
+  return v_op;
+end $$;
+
+-- кількість у замовленні не може стати меншою за вже видане замовнику
+create or replace function public.order_qty_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare v_done numeric;
+begin
+  if new.qty < old.qty then
+    select coalesce(sum(qty), 0) into v_done from public.order_shipments where order_id = new.id and cancelled_at is null;
+    if new.qty < v_done then
+      raise exception 'Замовнику вже видано % — кількість у замовленні не може бути меншою', trim_scale(v_done);
+    end if;
+  end if;
+  return new;
+end $$;
+drop trigger if exists orders_qty_guard on public.orders;
+create trigger orders_qty_guard before update of qty on public.orders
+  for each row execute function public.order_qty_guard();
 
 -- ---------------------------------------------------------------------
 --  Замовлення: у кошик / назад / остаточно (тоді зникають чекліст, деталі
@@ -1085,6 +1408,7 @@ begin
          and not exists (select 1 from public.movements m where m.item_id = i.id)
          and not exists (select 1 from public.kit_components k where k.item_id = i.id)
          and not exists (select 1 from public.order_parts o where o.item_id = i.id)
+         and not exists (select 1 from public.order_debts d where d.item_id = i.id)
       returning i.photo_path)
     select g.photo_path from gone g where g.photo_path is not null;
 end $$;
@@ -1541,6 +1865,15 @@ create policy order_units_write on public.order_units for all to authenticated
   using ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id))
   with check ((select public.has_perm('orders.edit')) and public.can_see_order_id(order_id));
 
+-- видачі замовнику й борги: бачить, хто бачить замовлення; змінюють лише функції
+-- (ship_order, cancel_order_shipment, close_order_debt)
+alter table public.order_shipments enable row level security;
+alter table public.order_debts     enable row level security;
+drop policy if exists order_shipments_read on public.order_shipments;
+drop policy if exists order_debts_read     on public.order_debts;
+create policy order_shipments_read on public.order_shipments for select to authenticated using (public.can_see_order_id(order_id));
+create policy order_debts_read     on public.order_debts     for select to authenticated using (public.can_see_order_id(order_id));
+
 -- налаштування: несекретні поля читає кожен активний (шапка документів), змінює — лише адміністратор через функції
 alter table public.app_settings enable row level security;
 drop policy if exists app_settings_read on public.app_settings;
@@ -1590,6 +1923,10 @@ revoke insert, update on public.order_units from authenticated;
 grant select, delete on public.order_units to authenticated;
 grant insert (id, order_id, position, serial, assembled, tested, note) on public.order_units to authenticated;
 grant update (position, serial, assembled, tested, note) on public.order_units to authenticated;
+
+-- видачі замовнику й борги — лише читання
+revoke all on public.order_shipments, public.order_debts, public.order_debts_left from anon, authenticated;
+grant select on public.order_shipments, public.order_debts, public.order_debts_left to authenticated;
 
 -- резерв і налаштування: токен бота з таблиці не читається — лише маска з admin_settings()
 revoke all on public.reserved_qty, public.app_settings from anon, authenticated;
@@ -1643,6 +1980,13 @@ grant  execute on function public.purge_trash() to authenticated;
 grant  execute on function public.set_item_order(uuid[]) to authenticated;
 grant  execute on function public.set_category_order(text[]) to authenticated;
 grant  execute on function public.set_nav_order(text[]) to authenticated;
+revoke execute on function public.ship_order(uuid, numeric, date, text, jsonb, uuid[]) from public, anon;
+revoke execute on function public.cancel_order_shipment(uuid) from public, anon;
+revoke execute on function public.close_order_debt(uuid, numeric, text) from public, anon;
+grant  execute on function public.ship_order(uuid, numeric, date, text, jsonb, uuid[]) to authenticated;
+grant  execute on function public.cancel_order_shipment(uuid) to authenticated;
+grant  execute on function public.close_order_debt(uuid, numeric, text) to authenticated;
+revoke execute on function public.order_qty_guard() from public, anon, authenticated;
 revoke execute on function public.my_perms() from public, anon;
 revoke execute on function public.has_perm(text) from public, anon;
 revoke execute on function public.is_active() from public, anon;
@@ -1747,6 +2091,8 @@ begin
     'order_parts',    (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.order_parts t),
     'order_events',   (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.order_events t),
     'order_units',    (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.order_units t),
+    'order_shipments', (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.order_shipments t),
+    'order_debts',    (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.order_debts t),
     'roles',          (select coalesce(jsonb_agg(to_jsonb(t)), '[]') from public.roles t),
     'profiles',       (select coalesce(jsonb_agg(to_jsonb(t) || jsonb_build_object('email', u.email)), '[]')
                          from public.profiles t join auth.users u on u.id = t.id),
@@ -1764,7 +2110,7 @@ begin
   if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
     foreach t in array array['items', 'kits', 'kit_components', 'operations', 'movements',
                              'departments', 'orders', 'order_tasks', 'order_parts', 'order_events', 'profiles', 'roles',
-                             'order_units', 'app_settings'] loop
+                             'order_units', 'app_settings', 'order_shipments', 'order_debts'] loop
       if not exists (select 1 from pg_publication_tables
                       where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = t) then
         execute format('alter publication supabase_realtime add table public.%I', t);

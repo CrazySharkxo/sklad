@@ -619,3 +619,31 @@ code { font-size: 13px; background: var(--bg); padding: 1px 5px; border-radius: 
 .nav-list .row-title { font-size: 14px; }
 .nav-list .icon-btn { width: 30px; height: 38px; font-size: 12px; }
 .nav-fixed { display: flex; align-items: center; gap: 12px; flex: none; height: 40px; padding: 0 12px; margin-top: 4px; color: var(--muted); font-size: 13px; }
+
+/* Видача замовнику (частинами) і борг перед замовником */
+.tag.debt-tag { background: var(--out-soft); color: var(--err); }
+.row-meta .ship-n { margin-right: 6px; color: var(--text); font-weight: 600; }
+.err-text-inline { color: var(--err); font-weight: 600; }
+.ship-sum { margin: 6px 0 0; }
+.ship-list, .debts { display: flex; flex-direction: column; }
+.ship-row, .debt { display: flex; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px dashed var(--line); }
+.ship-list .ship-row:first-child { border-top: 0; }
+.ship-main, .debt-name { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
+.ship-main small, .debt-name small { font-size: 12px; }
+.debt-name small { color: var(--muted); }
+.debt-name small b { color: var(--text); font-size: 14px; }
+.debts { margin: 8px 0; padding: 2px 12px 6px; border-radius: 10px; background: var(--out-soft); }
+.debts .section-title { margin-top: 8px; color: var(--text); }
+.debts .section-title .tag { margin: 0 0 0 6px; }
+.debts p { margin: 4px 0; }
+.ship-row .link-btn { padding: 0; flex: none; }
+.ship-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.ship-grid input { width: 100%; min-width: 0; }
+.ship-dialog .check { align-items: flex-start; }
+.ship-dialog .check input { flex: none; margin-top: 2px; }
+.ship-lack { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; }
+.ship-lack[hidden] { display: none; }
+.ship-lack .line { grid-template-columns: 1fr 76px auto 36px; background: var(--card); }
+.ship-units summary { cursor: pointer; color: var(--accent); font-size: 14px; }
+.ship-unit-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px 10px; margin-top: 8px; max-height: 180px; overflow: auto; }
+.short-order.debt .so-title { color: var(--err); }
