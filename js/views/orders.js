@@ -26,16 +26,23 @@ const waitsOnMe = (o) => isActive(o) && !!myDepartment() && o.department_id === 
 // «Мій відділ»: усе відкрите (активне або відвантажене з боргом), що відділ створив або що через нього
 // проходило, хоч би де воно було зараз. На базі без dept_path — лише те, що чекає на відділ, як раніше.
 const inMyDep = (o) => (hasDeptPath(o) ? (isActive(o) || hasDebt(o)) && involvesDep(o, myDepartment()) : waitsOnMe(o));
+// Три групи списку — кожне не видалене замовлення рівно в одній:
+//   «Готові» — статус «Готово»; «Архів» — закриті (відвантажені, скасовані) без боргу перед замовником;
+//   «Усі активні» — решта, тобто й відвантажене, доки борг не довидано (як у «Мій відділ»).
+// Це лише склад списку й число на фішці: резерв, нестача, терміни й «чекає на відділ» рахуються за ACTIVE_ORDER.
+const inDone = (o) => o.status === 'done';
+const inArchive = (o) => !isActive(o) && !hasDebt(o);
+const inActiveList = (o) => !inDone(o) && !inArchive(o);
 const FILTERS = [
   ['mine', 'Мій відділ', inMyDep],
-  ['active', 'Усі активні', isActive],
+  ['active', 'Усі активні', inActiveList],
   ['overdue', 'Прострочені', isOverdue],
   // борг перед замовником: видано неповним комплектом — тут і вже відвантажені, доки не довидано
   ['debt', 'З боргом', hasDebt],
   ['testing', 'На тестуванні', (o) => o.status === 'testing'],
   ['rework', 'На доопрацюванні', (o) => o.status === 'rework'],
-  ['done', 'Готові', (o) => o.status === 'done'],
-  ['archive', 'Архів', (o) => !isActive(o)],
+  ['done', 'Готові', inDone],
+  ['archive', 'Архів', inArchive],
 ];
 const ui = { q: '', f: null };
 

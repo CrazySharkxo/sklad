@@ -1437,6 +1437,25 @@ def main() -> int:
         expect(orow.locator(".ship-n")).to_have_text("видано 30/55")
         expect(orow.locator(".debt-tag")).to_have_text("борг")
         expect(page.locator("#chips [data-f=debt]")).to_have_text("З боргом · 1")
+
+        # три групи списку: число на «Усі активні» = рядків у списку; кожне замовлення рівно в одній із трьох
+        def chip_n(f):
+            m = re.search(r"· (\d+)$", page.locator(f"#chips [data-f={f}]").inner_text().strip())
+            return int(m.group(1)) if m else 0
+
+        def group_rows(f):
+            page.locator(f"#chips [data-f={f}]").click()
+            expect(page.locator("#chips .chip.on")).to_have_attribute("data-f", f)
+            return page.locator("#list a.order-row").count()
+
+        def groups():   # (активні, готові, архів) — за рядками списку; фільтр лишається на «Усі активні»
+            g = (group_rows("done"), group_rows("archive"), group_rows("active"))
+            assert chip_n("active") == g[2], f"«Усі активні · {chip_n('active')}», а рядків {g[2]}"
+            return g[2], g[0], g[1]
+
+        act0, done0, arch0 = groups()
+        orow = page.locator("a.order-row", has_text="МАД - аналог")
+        expect(orow).to_have_count(1)
         assert no_hscroll()
         expect(page.locator(".toast")).to_have_count(0, timeout=15000)
         orow.scroll_into_view_if_needed()
@@ -1495,9 +1514,20 @@ def main() -> int:
         expect(page.locator("[data-shipbtn]")).to_have_count(0)
         expect(page.locator("#events")).to_contain_text("Видано замовнику 25 — усього 55 з 55")
         page.goto(url + "#/orders")
-        page.locator("#chips [data-f=active]").click()
-        expect(page.locator("a.order-row", has_text="МАД - аналог")).to_have_count(0)   # уже не активне…
-        page.locator("#chips [data-f=debt]").click()                                    # …але з боргом — видно тут
+        # відвантажене з незакритим боргом лишається в «Усі активні» (з позначкою), в «Архіві» його ще немає
+        assert groups() == (act0, done0, arch0), "відвантажене з боргом має лишитись в «Усі активні», а не піти в «Архів»"
+        orow = page.locator("a.order-row", has_text="МАД - аналог")
+        expect(orow.locator(".debt-tag")).to_have_text("борг")
+        expect(orow.locator(".ship-n")).to_have_count(0)
+        expect(orow).to_contain_text("Відвантажено")
+        expect(orow).not_to_have_class(re.compile(r"is-overdue"))
+        page.locator("#chips [data-f=archive]").click()
+        expect(page.locator("#chips .chip.on")).to_have_attribute("data-f", "archive")
+        expect(page.locator("a.order-row", has_text="МАД - аналог")).to_have_count(0)
+        page.locator("#chips [data-f=done]").click()
+        expect(page.locator("#chips .chip.on")).to_have_attribute("data-f", "done")
+        expect(page.locator("a.order-row", has_text="МАД - аналог")).to_have_count(0)
+        page.locator("#chips [data-f=debt]").click()                                    # і в зрізі «З боргом»
         orow = page.locator("a.order-row", has_text="МАД - аналог")
         expect(orow.locator(".debt-tag")).to_have_text("борг")
         expect(orow.locator(".ship-n")).to_have_count(0)
@@ -1538,6 +1568,12 @@ def main() -> int:
         assert stock_qty(page, "ВЗ камера") == "2"
         page.goto(url + "#/orders")
         expect(page.locator("#list")).to_contain_text("Боргів перед замовниками немає")  # фільтр ще вибраний, але порожній
+        # борг закрито — тепер навпаки: з «Усі активні» пішло, в «Архіві» зʼявилось
+        assert groups() == (act0 - 1, done0, arch0 + 1), "після закриття боргу відвантажене має перейти в «Архів»"
+        expect(page.locator("a.order-row", has_text="МАД - аналог")).to_have_count(0)
+        page.locator("#chips [data-f=archive]").click()
+        expect(page.locator("a.order-row", has_text="МАД - аналог")).to_have_count(1)
+        expect(page.locator("a.order-row", has_text="МАД - аналог").locator(".debt-tag")).to_have_count(0)
         page.locator("#chips [data-f=active]").click()
         page.goto(url + "#/shortage")
         page.locator("#all").check()
